@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Antigravity user-guard 一键安装脚本 (Linux / macOS / WSL2)
+# Antigravity & Codex 统一工作流与双向协作安装脚本 (Linux / macOS / WSL2)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONDONTWRITEBYTECODE=1
 
-echo "[*] 启动 Antigravity user-guard 自动化安装器..."
+echo "[*] 启动 Antigravity & Codex 统一配置安装器..."
 
 if command -v python3 >/dev/null 2>&1; then
     python3 -B -X utf8 "${SCRIPT_DIR}/install.py" "$@"

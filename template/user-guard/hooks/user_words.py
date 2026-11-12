@@ -1,13 +1,14 @@
 """
-user_words.py - 反重力会话用户原话纯标准库解析与基础设施模块 (user-guard)
+user_words.py - 反重力与 Codex 双端会话用户原话纯标准库解析与基础设施模块 (user-guard)
 
 职责：
 1. 提供全平台 UTF-8 标准流自愈、原子写盘与 PLUGIN_DATA 数据目录解析基础设施；
 2. 解析 Antigravity 会话 transcript.jsonl，并在存在 truncated_fields 时以 O(N+M) 单次索引回退补全 transcript_full.jsonl；
-3. 安全提取外层 <USER_REQUEST> 原话（防内部闭合标签提前截断）、交互式 ask_question 选项回答及可选的子代理父消息；
-4. 按序格式化并原子写入会话原话归档文件 (<conversationId>_user_words.md)。
+3. 解析 Codex 会话 rollout-*.jsonl（含跨 sessions / archived_sessions 多分段接续合并、provenance 来源鉴别与 SHA-256 完整性校验）；
+4. 安全提取用户原始输入与交互式选项回答，按序格式化并原子写入会话原话归档 Markdown 文档。
 """
 
+import hashlib
 import json
 import os
 import re
@@ -404,3 +405,419 @@ def save_user_words_markdown(state_dir: Path, conversation_id: str, words: List[
     md_text = format_user_words_markdown(conversation_id, words)
     atomic_write_text(out_file, md_text)
     return out_file
+
+
+# ==============================================================================
+# Codex Rollout 会话记录解析与归档 (供 --client codex 在 compact/resume 时调用)
+# ==============================================================================
+
+CODEX_META_HEAD_BYTES = 65536
+CODEX_IDE_TAG_RE = re.compile(r"<(ide_opened_file|ide_selection|ide_diagnostics)>")
+CODEX_DROPPED_WRAPPER_PREFIXES = (
+    "# AGENTS.md instructions",
+    "<environment_context>",
+    "<codex_internal_context",
+    "<external_codex_apps_open_page>",
+    "<subagent_notification",
+    "<system-reminder>",
+    "<task-notifi",
+    "<local-command-",
+    "<command-",
+    "Stop hook feedback",
+    "Stop hook blocking error",
+    "This session is being continued from a previous conversation",
+    "[SYSTEM NOTIFICATION",
+    "[Request interrupted by user",
+)
+
+
+def strip_win_extended_prefix(path_str: str) -> str:
+    """剥离 Windows \\\\?\\ 扩展长度路径前缀，统一跨端路径比较与读取"""
+    raw = str(path_str or "").strip()
+    if raw.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + raw[8:]
+    if raw.startswith("\\\\?\\"):
+        return raw[4:]
+    return raw
+
+
+def _strip_leading_ide_tags(text: str) -> str:
+    """仅剥离块首 IDE 自动附加上下文标签，保留用户正文中自行引用的同名标签"""
+    rest = text.lstrip()
+    while True:
+        m = CODEX_IDE_TAG_RE.match(rest)
+        if not m:
+            return rest
+        closing = f"</{m.group(1)}>"
+        end = rest.find(closing, m.end())
+        if end < 0:
+            return ""
+        rest = rest[end + len(closing) :].lstrip()
+
+
+def read_codex_rollout_meta(rollout_path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """仅读取 rollout 首行元数据，区分主会话与子代理会话"""
+    try:
+        with open(rollout_path, "rb") as f:
+            first_line = f.readline(CODEX_META_HEAD_BYTES)
+        if not first_line:
+            return None, f"空会话文件: {rollout_path}"
+        if not first_line.endswith(b"\n") and not first_line.rstrip().endswith(b"}"):
+            return None, f"首行元数据未写完或超长: {rollout_path}"
+        entry = json.loads(first_line.decode("utf-8", errors="replace"))
+        payload = entry.get("payload") if isinstance(entry, dict) and entry.get("type") == "session_meta" else None
+        if not isinstance(payload, dict):
+            return None, f"首条记录非 session_meta: {rollout_path}"
+        sid = payload.get("id")
+        cwd = payload.get("cwd") or ""
+        source = payload.get("source")
+        if not isinstance(sid, str) or not sid.strip():
+            return None, f"session_meta 缺少有效 id: {rollout_path}"
+        if source == "subagent" or (isinstance(source, dict) and "subagent" in source):
+            source_kind = "subagent"
+        elif (isinstance(source, str) and source.strip()) or isinstance(source, dict):
+            source_kind = "main"
+        else:
+            source_kind = "main"
+        return {"id": sid.strip(), "cwd": str(cwd), "source_kind": source_kind}, None
+    except Exception as exc:
+        return None, f"读取 Codex 会话元数据失败 ({rollout_path}): {exc}"
+
+
+def _scan_codex_home_rollouts(codex_root: Path) -> List[Path]:
+    """扫描 <codex_root>/sessions/YYYY/MM/DD 与 archived_sessions 下的 rollout-*.jsonl"""
+    candidates: List[Path] = []
+    sessions_dir = codex_root / "sessions"
+    if sessions_dir.is_dir():
+        try:
+            for y_dir in sessions_dir.iterdir():
+                if not (y_dir.name.isdigit() and len(y_dir.name) == 4 and y_dir.is_dir()):
+                    continue
+                for m_dir in y_dir.iterdir():
+                    if not (m_dir.name.isdigit() and len(m_dir.name) == 2 and m_dir.is_dir()):
+                        continue
+                    for d_dir in m_dir.iterdir():
+                        if not (d_dir.name.isdigit() and len(d_dir.name) == 2 and d_dir.is_dir()):
+                            continue
+                        for f in d_dir.iterdir():
+                            if f.name.startswith("rollout-") and f.name.endswith(".jsonl") and f.is_file():
+                                candidates.append(f)
+        except OSError:
+            pass
+
+    archived_dir = codex_root / "archived_sessions"
+    if archived_dir.is_dir():
+        try:
+            for f in archived_dir.iterdir():
+                if f.name.startswith("rollout-") and f.name.endswith(".jsonl") and f.is_file():
+                    candidates.append(f)
+        except OSError:
+            pass
+
+    return candidates
+
+
+def _canonical_path_key(p: Path) -> str:
+    try:
+        s = str(p.resolve())
+    except OSError:
+        s = os.path.abspath(str(p))
+    return s.casefold() if os.name == "nt" else s
+
+
+def discover_codex_session_segments(
+    transcript_path_str: str,
+    session_id: Optional[str] = None,
+) -> Tuple[List[Path], Optional[str], List[str]]:
+    """发现同一 session_id 的全部主会话 rollout 分段并按时间序排列"""
+    issues: List[str] = []
+    cleaned_str = strip_win_extended_prefix(os.path.expanduser(str(transcript_path_str or "").strip()))
+    if not cleaned_str:
+        return [], session_id, ["未提供 transcript_path"]
+
+    primary = Path(cleaned_str)
+    if not primary.is_file():
+        return [], session_id, [f"transcript_path 不存在: {cleaned_str}"]
+
+    meta, err = read_codex_rollout_meta(primary)
+    if err or not meta:
+        return [], session_id, [err or f"无法识别元数据: {cleaned_str}"]
+    if meta["source_kind"] != "main":
+        return [], meta["id"], ["子代理 rollout 会话不执行主会话原话提取"]
+    if session_id and session_id.strip() and meta["id"] != session_id.strip():
+        return [], session_id.strip(), [f"session_id 不匹配: 期望 {session_id.strip()}，实际 {meta['id']}"]
+
+    sid = meta["id"]
+    seen_keys = {_canonical_path_key(primary)}
+    segments: List[Path] = [primary]
+
+    # 向上寻找所属的 sessions 或 archived_sessions 父目录以定位 codex_root
+    cur = primary.parent
+    codex_root: Optional[Path] = None
+    while cur != cur.parent:
+        if cur.name in ("sessions", "archived_sessions"):
+            codex_root = cur.parent
+            break
+        cur = cur.parent
+
+    if codex_root is not None:
+        for cand in _scan_codex_home_rollouts(codex_root):
+            if sid not in cand.name:
+                continue
+            ckey = _canonical_path_key(cand)
+            if ckey in seen_keys:
+                continue
+            c_meta, c_err = read_codex_rollout_meta(cand)
+            if c_err:
+                issues.append(c_err)
+                continue
+            if c_meta and c_meta["id"] == sid and c_meta["source_kind"] == "main":
+                seen_keys.add(ckey)
+                segments.append(cand)
+
+    segments.sort(key=lambda p: (p.name, str(p)))
+    return segments, sid, issues
+
+
+def extract_codex_entry_words(
+    entry: Dict[str, Any],
+    fallback_step: int,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """从单条 Codex rollout response_item 记录中提取用户原话与去重标识"""
+    if not isinstance(entry, dict) or entry.get("type") != "response_item":
+        return None, None
+    payload = entry.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "message" or payload.get("role") != "user":
+        return None, None
+
+    content = payload.get("content")
+    meta_pass = payload.get("internal_chat_message_metadata_passthrough")
+    raw_meta_items = meta_pass.get("content_item_metadata") if isinstance(meta_pass, dict) else None
+    origins: List[Optional[str]] = []
+    if isinstance(raw_meta_items, list):
+        for item in raw_meta_items:
+            prov = item.get("provenance") if isinstance(item, dict) else None
+            origins.append(prov.get("type") if isinstance(prov, dict) else None)
+
+    if origins and all(o in ("harness", "agents_md") for o in origins):
+        return None, None
+
+    kept_blocks: List[str] = []
+    if isinstance(content, list):
+        for idx, blk in enumerate(content):
+            if not isinstance(blk, dict) or blk.get("type") not in ("input_text", "text"):
+                continue
+            raw_txt = blk.get("text")
+            if not isinstance(raw_txt, str):
+                continue
+            origin = origins[idx] if len(origins) == len(content) else None
+            if origin in ("harness", "agents_md"):
+                continue
+            if origin == "user":
+                if raw_txt.strip():
+                    kept_blocks.append(raw_txt.strip())
+            else:
+                stripped_ide = _strip_leading_ide_tags(raw_txt).strip()
+                if stripped_ide and not stripped_ide.startswith(CODEX_DROPPED_WRAPPER_PREFIXES):
+                    kept_blocks.append(stripped_ide)
+    elif isinstance(content, str):
+        if origins and all(o == "user" for o in origins):
+            if content.strip():
+                kept_blocks.append(content.strip())
+        else:
+            stripped_ide = _strip_leading_ide_tags(content).strip()
+            if stripped_ide and not stripped_ide.startswith(CODEX_DROPPED_WRAPPER_PREFIXES):
+                kept_blocks.append(stripped_ide)
+
+    if not kept_blocks:
+        return None, None
+
+    merged_text = "\n\n".join(kept_blocks)
+    kind = "ask_question_answer" if merged_text.lstrip().startswith("<send_user_message_question_reply>") else "user_input"
+
+    rec_id: Optional[str] = None
+    for cand_id in (payload.get("id"), entry.get("uuid")):
+        if isinstance(cand_id, str) and cand_id.strip():
+            rec_id = f"id:{cand_id.strip()}"
+            break
+    if rec_id is None and isinstance(entry.get("ordinal"), int) and isinstance(entry.get("timestamp"), str):
+        canonical_json = json.dumps(entry, sort_keys=True, ensure_ascii=False)
+        rec_id = "record:" + hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+    step_idx = entry.get("ordinal") if isinstance(entry.get("ordinal"), int) else fallback_step
+    created_at = str(entry.get("timestamp") or "")
+
+    return rec_id, {
+        "step_index": step_idx,
+        "created_at": created_at,
+        "kind": kind,
+        "content": merged_text,
+    }
+
+
+def extract_codex_session_words(
+    transcript_path_str: str,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """合并解析同一 Codex 主会话所有 rollout 分段的用户原话并生成完整性摘要"""
+    segments, resolved_sid, issues = discover_codex_session_segments(transcript_path_str, session_id=session_id)
+    if not segments:
+        return {
+            "session_id": resolved_sid or session_id or "unknown",
+            "words": [],
+            "segments": [],
+            "sources": [],
+            "issues": issues or ["未找到可读的 Codex 会话分段"],
+            "complete": False,
+        }
+
+    words: List[Dict[str, Any]] = []
+    sources: List[Dict[str, Any]] = []
+    seen_cross_segment_ids: Set[str] = set()
+
+    for seg_path in segments:
+        digest = hashlib.sha256()
+        offset = 0
+        bad_lines = 0
+        seg_ids: Set[str] = set()
+        line_counter = 0
+
+        try:
+            initial_size = seg_path.stat().st_size
+            with open(seg_path, "rb") as f:
+                for raw_line in f:
+                    line_counter += 1
+                    if not raw_line.endswith(b"\n") and not raw_line.rstrip().endswith(b"}"):
+                        issues.append(f"末尾存在未写完记录: {seg_path.name}")
+                        break
+                    offset += len(raw_line)
+                    digest.update(raw_line)
+                    if not raw_line.strip():
+                        continue
+                    # 仅 response_item 的用户消息需要完整 JSON 解析，跳过海量工具输出行
+                    if b"response_item" not in raw_line or b"message" not in raw_line:
+                        continue
+                    try:
+                        entry = json.loads(raw_line.decode("utf-8", errors="replace"))
+                    except ValueError:
+                        bad_lines += 1
+                        continue
+                    rec_id, item = extract_codex_entry_words(entry, fallback_step=line_counter)
+                    if item is None:
+                        continue
+                    if rec_id is not None and rec_id in seen_cross_segment_ids:
+                        continue
+                    if rec_id is not None:
+                        seg_ids.add(rec_id)
+                    item["turn"] = len(words) + 1
+                    words.append(item)
+            seen_cross_segment_ids.update(seg_ids)
+            if bad_lines:
+                issues.append(f"存在损坏 JSON 行 ({bad_lines} 行): {seg_path.name}")
+            sources.append(
+                {
+                    "path": str(seg_path),
+                    "complete_offset": offset,
+                    "observed_size": initial_size,
+                    "sha256": digest.hexdigest(),
+                }
+            )
+        except OSError as exc:
+            issues.append(f"读取分段失败 ({seg_path.name}): {exc}")
+
+    return {
+        "session_id": resolved_sid or session_id or "unknown",
+        "words": words,
+        "segments": [str(p) for p in segments],
+        "sources": sources,
+        "issues": issues,
+        "complete": len(issues) == 0,
+    }
+
+
+def refresh_codex_session_archive(
+    transcript_path_str: str,
+    user_words_dir: Path,
+    session_id: str,
+) -> Dict[str, Any]:
+    """
+    刷新 Codex 会话的用户原话归档 (<user_words_dir>/<session_id>.md) 与校验元数据 (.json)。
+    若本次读取遇到缺口而磁盘已有先前验证通过的完整文档，则保留旧文档并如实标注 preserved=True。
+    """
+    sid = (session_id or "unknown_session").strip()
+    md_path = user_words_dir / f"{sid}.md"
+    meta_path = user_words_dir / f"{sid}.json"
+
+    prev_saved: Dict[str, Any] = {
+        "file": str(md_path),
+        "available": False,
+        "preserved": False,
+        "count": None,
+        "last_time": None,
+        "sources": [],
+    }
+    if md_path.is_file():
+        try:
+            prev_bytes = md_path.read_bytes()
+            prev_bytes.decode("utf-8")
+            prev_sha = hashlib.sha256(prev_bytes).hexdigest()
+            prev_saved["available"] = True
+            prev_saved["sha256"] = prev_sha
+            if meta_path.is_file():
+                meta_loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+                # 兼容新版直接字段与旧版 publication 嵌套字段
+                pub = meta_loaded.get("publication") if isinstance(meta_loaded, dict) else None
+                cand_meta = pub if isinstance(pub, dict) else meta_loaded
+                if isinstance(cand_meta, dict) and cand_meta.get("sha256") == prev_sha:
+                    prev_saved["count"] = cand_meta.get("count")
+                    prev_saved["last_time"] = cand_meta.get("last_time")
+                    prev_saved["sources"] = cand_meta.get("sources") or []
+        except Exception:
+            pass
+
+    parsed = extract_codex_session_words(transcript_path_str, session_id=sid)
+    words = parsed["words"]
+    issues = list(parsed["issues"])
+    complete = bool(parsed["complete"])
+
+    # 若提取完整（或尚无旧归档但已提取出有效原话），原子更新归档 Markdown 与元数据
+    should_publish = complete or (bool(words) and not prev_saved["available"])
+    if should_publish:
+        try:
+            md_text = format_user_words_markdown(sid, words)
+            md_sha = hashlib.sha256(md_text.encode("utf-8")).hexdigest()
+            last_ts = words[-1]["created_at"] if words else None
+            pub_record = {
+                "format": "user-guard-codex-v1",
+                "id": sid,
+                "file": str(md_path),
+                "count": len(words),
+                "last_time": last_ts,
+                "sources": parsed["sources"],
+                "sha256": md_sha,
+            }
+            atomic_write_json(meta_path, pub_record)
+            atomic_write_text(md_path, md_text)
+            saved_info = {
+                "file": str(md_path),
+                "available": True,
+                "preserved": False,
+                "count": len(words),
+                "last_time": last_ts,
+                "sources": parsed["sources"],
+                "sha256": md_sha,
+            }
+        except Exception as exc:
+            complete = False
+            issues.append(f"归档落盘失败: {exc}")
+            saved_info = dict(prev_saved, preserved=bool(prev_saved["available"]))
+    else:
+        saved_info = dict(prev_saved, preserved=bool(prev_saved["available"]))
+
+    return {
+        "complete": complete,
+        "words": words,
+        "issues": issues,
+        "saved": saved_info,
+        "meta_path": str(meta_path),
+    }

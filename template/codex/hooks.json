@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "^(compact|resume)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.codex/hooks/session_context_loader.py\" --client codex --state-dir \"~/.codex/hooks/state/session-context\" --log \"~/.codex/hooks/logs/session-context.jsonl\"",
+            "timeout": 45,
+            "statusMessage": "恢复本会话用户原话"
+          }
+        ]
+      }
+    ]
+  }
+}

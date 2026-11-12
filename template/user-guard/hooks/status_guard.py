@@ -1133,21 +1133,25 @@ def _detect_command_external_mutation(
         tail_args = m_inst.group(1) or ""
         arg_tokens = _safe_split_tokens(tail_args)
         lower_tokens = {t.lower() for t in arg_tokens}
-        if "--dry-run" in lower_tokens or "-dryrun" in lower_tokens:
+        if "--dry-run" in lower_tokens or "-dryrun" in lower_tokens or "--probe-apps" in lower_tokens:
             continue
         target_dir_val = _extract_flag_value(arg_tokens, "--target-dir")
         skills_dir_val = _extract_flag_value(arg_tokens, "--codex-skills-dir")
-        if target_dir_val and "--no-zotero" in lower_tokens:
-            td_ok = _is_write_target_allowed(
+        codex_home_val = _extract_flag_value(arg_tokens, "--codex-home")
+        if (target_dir_val or codex_home_val) and "--no-zotero" in lower_tokens:
+            td_ok = (not target_dir_val) or _is_write_target_allowed(
                 target_dir_val, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp
             )
             sd_ok = (not skills_dir_val) or _is_write_target_allowed(
                 skills_dir_val, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp
             )
-            if td_ok and sd_ok:
+            ch_ok = (not codex_home_val) or _is_write_target_allowed(
+                codex_home_val, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp
+            )
+            if td_ok and sd_ok and ch_ok:
                 continue
         return (
-            "执行全局配置同步安装 (将更新 ~/.gemini/config 与 ~/.codex)",
+            "执行全局配置同步安装 (将更新本机 ~/.gemini/config 与/或 ~/.codex)",
             "~/.gemini/config/plugins/user-guard, ~/.codex",
             _compact_snippet(m_inst.group(0)),
         )

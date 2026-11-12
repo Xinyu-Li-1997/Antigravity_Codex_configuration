@@ -33,7 +33,7 @@ INSTALLER_SPEC.loader.exec_module(INSTALLER)
 
 def _build_subprocess_cmd(hook_cmd: str) -> list:
     """将 hooks.json 中的命令安全替换为当前测试 Python 解释器执行，跨 Windows/Linux/macOS 通用"""
-    tokens = shlex.split(hook_cmd, posix=(os.name != "nt"))
+    tokens = [t.strip('"') for t in shlex.split(hook_cmd, posix=(os.name != "nt"))]
     # 找到第一个 .py 脚本位置，保留 -X utf8 -I -B 及脚本参数
     script_idx = next((i for i, t in enumerate(tokens) if t.endswith(".py")), 1)
     return [sys.executable, "-X", "utf8", "-I", "-B"] + tokens[script_idx:]
@@ -120,6 +120,22 @@ class TestEndToEndIntegration(unittest.TestCase):
         license_text = license_file.read_text(encoding="utf-8")
         self.assertIn("Apache License", license_text)
         self.assertIn("Version 2.0, January 2004", license_text)
+
+        root_agents_md = REPO_ROOT / "AGENTS.md"
+        self.assertTrue(root_agents_md.is_file(), "仓库根目录须包含供双端共读自举配置的 AGENTS.md")
+        root_agents_text = root_agents_md.read_text(encoding="utf-8")
+        self.assertIn("--probe-apps", root_agents_text)
+        self.assertIn("--app codex", root_agents_text)
+        self.assertIn("--app antigravity", root_agents_text)
+
+        codex_tpl = REPO_ROOT / "template" / "codex"
+        self.assertTrue((codex_tpl / "hooks.json").is_file())
+        for toml_name in ("readonly-auditor.toml", "readonly-reader.toml", "readonly-collaborator.toml"):
+            toml_path = codex_tpl / "agents" / toml_name
+            self.assertTrue(toml_path.is_file(), f"缺少 Codex 只读子代理模板: {toml_name}")
+            toml_text = toml_path.read_text(encoding="utf-8")
+            self.assertIn('name = "readonly-', toml_text)
+            self.assertIn("严禁修改任何文件", toml_text)
 
     def test_02_zero_personal_info_leakage_across_repo(self) -> None:
         """全仓库源码、配置、测试与文档 100% 脱敏审计（零硬编码个人主目录、主机路径或 API 密钥）"""
@@ -632,6 +648,157 @@ class TestEndToEndIntegration(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 INSTALLER._sync_codex_global_rules(tpl_rules, codex_dir, dry_run=False)
             self.assertEqual(codex_agents.read_text(encoding="utf-8"), synced)
+
+    def test_15_standalone_codex_full_sandbox_install_and_hook_subprocess(self) -> None:
+        """验证单 Codex 模式 (--app codex --codex-home) 全量独立部署、Zotero 合并、信任哈希保持及钩子子进程运行"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "standalone_codex_home"
+            fake_zotero = root / "zotero-mcp-stub"
+            fake_zotero.write_text("stub", encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-X",
+                    "utf8",
+                    str(REPO_ROOT / "install.py"),
+                    "--app",
+                    "codex",
+                    "--codex-home",
+                    str(codex_home),
+                    "--zotero-cmd",
+                    str(fake_zotero),
+                    "--skip-test",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=25,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+
+            # 1) 验证全套 Codex 独立工作流资产已生成，且未生成反重力目录
+            self.assertFalse((root / "plugins").exists())
+            self.assertTrue((codex_home / "AGENTS.md").is_file())
+            for name in ("readonly-reader.toml", "readonly-auditor.toml", "readonly-collaborator.toml"):
+                self.assertTrue((codex_home / "agents" / name).is_file())
+            self.assertTrue((codex_home / "hooks" / "session_context_loader.py").is_file())
+            self.assertTrue((codex_home / "hooks" / "user_words.py").is_file())
+            self.assertTrue((codex_home / "skills" / "cae-harness" / "SKILL.md").is_file())
+
+            cfg_text = (codex_home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('sandbox_mode = "workspace-write"', cfg_text)
+            self.assertIn('approval_policy = "on-request"', cfg_text)
+            self.assertIn('model_reasoning_summary = "auto"', cfg_text)
+            self.assertIn("network_access = true", cfg_text)
+            self.assertIn("HOOKS = false", cfg_text)
+            self.assertIn("[mcp_servers.zotero]", cfg_text)
+
+            # 2) 二次运行必须保持已有有效 hooks.json 字节完全不变（保护 Codex trusted_hash）
+            hooks_json_path = codex_home / "hooks.json"
+            first_hooks_bytes = hooks_json_path.read_bytes()
+            proc2 = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-X",
+                    "utf8",
+                    str(REPO_ROOT / "install.py"),
+                    "--app",
+                    "codex",
+                    "--codex-home",
+                    str(codex_home),
+                    "--no-zotero",
+                    "--skip-test",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=25,
+            )
+            self.assertEqual(proc2.returncode, 0, proc2.stderr + proc2.stdout)
+            self.assertEqual(hooks_json_path.read_bytes(), first_hooks_bytes)
+
+            # 3) 真实子进程调用生成的 Codex hooks.json 恢复命令
+            hooks_doc = json.loads(hooks_json_path.read_text(encoding="utf-8"))
+            raw_cmd = hooks_doc["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            sid = "standalone-codex-e2e-001"
+            rollout = codex_home / "sessions" / "2026" / "11" / "13" / f"rollout-2026-11-13T00-00-00-{sid}.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": str(root), "source": "cli"}})
+                + "\n"
+                + json.dumps(
+                    {
+                        "type": "response_item",
+                        "ordinal": 1,
+                        "timestamp": "2026-11-13T00:00:05Z",
+                        "payload": {"id": "u1", "type": "message", "role": "user", "content": "单 Codex 独立工作流原话测试"},
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            hook_proc = subprocess.run(
+                _build_subprocess_cmd(raw_cmd),
+                input=json.dumps(
+                    {
+                        "session_id": sid,
+                        "transcript_path": str(rollout),
+                        "cwd": str(root),
+                        "hook_event_name": "SessionStart",
+                        "source": "compact",
+                    },
+                    ensure_ascii=False,
+                ),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=15,
+            )
+            self.assertEqual(hook_proc.returncode, 0, hook_proc.stderr)
+            out_json = json.loads(hook_proc.stdout.strip())
+            self.assertEqual(out_json["hookSpecificOutput"]["hookEventName"], "SessionStart")
+            self.assertIn("单 Codex 独立工作流原话测试", out_json["hookSpecificOutput"]["additionalContext"])
+            self.assertTrue((codex_home / "hooks" / "state" / "user-words" / f"{sid}.md").is_file())
+
+    def test_16_single_app_detection_prompt_and_standalone_modes(self) -> None:
+        """验证仅安装单客户端时的交互提示、拒绝安全退出、确认单独安装及跨子系统互操作免打扰"""
+        only_codex_det = {
+            "antigravity": {"native_installed": False, "interop_available": False},
+            "codex": {"native_installed": True, "interop_available": False},
+        }
+        # 用户选择 'n'（先去安装反重力）-> 干净退出码 0
+        with mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                INSTALLER.resolve_app_plan("auto", False, False, only_codex_det, interactive=True, auto_yes=False, dry_run=False)
+            self.assertEqual(cm.exception.code, 0)
+
+        # 用户选择 'y'（不装反重力，仅配单 Codex）-> (False, True)
+        with mock.patch("builtins.input", return_value="y"), contextlib.redirect_stdout(io.StringIO()):
+            plan_cx = INSTALLER.resolve_app_plan("auto", False, False, only_codex_det, interactive=True, auto_yes=False, dry_run=False)
+        self.assertEqual(plan_cx, (False, True))
+
+        # 仅安装反重力且 --yes -> (True, False)
+        only_ag_det = {
+            "antigravity": {"native_installed": True, "interop_available": False},
+            "codex": {"native_installed": False, "interop_available": False},
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            plan_ag = INSTALLER.resolve_app_plan("auto", False, False, only_ag_det, interactive=True, auto_yes=True, dry_run=False)
+        self.assertEqual(plan_ag, (True, False))
+
+        # WSL 原生仅装反重力、但 Windows 侧已装 Codex (interop_available=True) -> 免打扰直接返回 (True, False)
+        wsl_interop_det = {
+            "antigravity": {"native_installed": True, "interop_available": False},
+            "codex": {"native_installed": False, "interop_available": True},
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            plan_wsl = INSTALLER.resolve_app_plan("auto", False, False, wsl_interop_det, interactive=True, auto_yes=False, dry_run=False)
+        self.assertEqual(plan_wsl, (True, False))
 
 
 if __name__ == "__main__":

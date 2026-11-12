@@ -356,6 +356,7 @@ class TestGuardsOffline(unittest.TestCase):
             r'Remove-Item -Force "X:\Projects\.codex-worktrees"',
             'wsl.exe -d Ubuntu -- rm -rf /mnt/x/Projects/.codex-worktrees',
             'python -B install.py',
+            'python -B install.py --app codex',
             r'python -B "X:\Projects\myproj\install.py"',
         ):
             r_cmd = status_guard.handle_pre_tool_use(
@@ -375,7 +376,9 @@ class TestGuardsOffline(unittest.TestCase):
         # 3) 安全对照：--dry-run、项目内沙箱安装、只读查询外部目录、含外部路径字面量的 git commit 均放行
         for safe_cmd in (
             "python -B install.py --dry-run",
+            "python -B install.py --probe-apps",
             r'python -B install.py --target-dir "X:\Projects\myproj\.sandbox\plugin" --no-zotero',
+            r'python -B install.py --app codex --codex-home "X:\Projects\myproj\.sandbox\codex" --no-zotero',
             r'Get-Item -Force "X:\Projects\.codex-worktrees"',
             r'git commit -m "fix: block X:\Projects\.codex-worktrees and ../.codex-worktrees"',
         ):

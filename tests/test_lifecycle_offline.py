@@ -282,6 +282,147 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
         self.assertEqual(sub_words[0]["kind"], "subagent_message")
         self.assertIn("请只读审查 status_guard.py", sub_words[0]["content"])
 
+    def test_06_codex_multisegment_rollout_extraction_and_session_start_hook(self) -> None:
+        """验证 Codex 模式跨归档与活动分段合并、provenance 过滤、选项框识别及缺口保底"""
+        sid = "01a1c238-test-codex-session"
+        codex_root = self.tmp_root / ".codex"
+        seg1 = codex_root / "archived_sessions" / f"rollout-2026-11-09T01-00-00-{sid}.jsonl"
+        seg2 = codex_root / "sessions" / "2026" / "11" / "10" / f"rollout-2026-11-10T05-00-00-{sid}_cont.jsonl"
+        seg_sub = codex_root / "sessions" / "2026" / "11" / "10" / f"rollout-2026-11-10T06-00-00-{sid}_sub.jsonl"
+
+        _append_jsonl(seg1, {"type": "session_meta", "payload": {"id": sid, "cwd": "/tmp/proj", "source": "cli"}})
+        # 系统自动注入的 AGENTS.md 与环境块应被过滤
+        _append_jsonl(
+            seg1,
+            {
+                "type": "response_item",
+                "ordinal": 1,
+                "timestamp": "2026-11-09T01:00:01Z",
+                "payload": {
+                    "id": "sys-msg-1",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "# AGENTS.md instructions for /tmp/proj"}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_metadata": [{"provenance": {"type": "agents_md"}}]
+                    },
+                },
+            },
+        )
+        # 人类真实输入（即使正文引用了 # AGENTS.md 字面量，因 provenance=user 必须完整保留）
+        shared_first_msg = {
+            "type": "response_item",
+            "ordinal": 2,
+            "timestamp": "2026-11-09T01:01:00Z",
+            "payload": {
+                "id": "usr-msg-1",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "首轮立项：检查 # AGENTS.md instructions 与 DGSEM 通量守恒"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "content_item_metadata": [{"provenance": {"type": "user"}}]
+                },
+            },
+        }
+        _append_jsonl(seg1, shared_first_msg)
+
+        # 第二段续跑包含第一段镜像记录（应按 id 去重）+ 两次人类打字“继续”（不同 id 均须保留）+ 选项框回答
+        _append_jsonl(seg2, {"type": "session_meta", "payload": {"id": sid, "cwd": "/tmp/proj", "source": "desktop"}})
+        _append_jsonl(seg2, shared_first_msg)
+        _append_jsonl(
+            seg2,
+            {
+                "type": "response_item",
+                "ordinal": 3,
+                "timestamp": "2026-11-10T05:01:00Z",
+                "payload": {"id": "usr-msg-2", "type": "message", "role": "user", "content": "<environment_context>\nauto\n</environment_context>"},
+            },
+        )
+        _append_jsonl(
+            seg2,
+            {
+                "type": "response_item",
+                "ordinal": 4,
+                "timestamp": "2026-11-10T05:02:00Z",
+                "payload": {"id": "usr-msg-3", "type": "message", "role": "user", "content": "继续"},
+            },
+        )
+        _append_jsonl(
+            seg2,
+            {
+                "type": "response_item",
+                "ordinal": 5,
+                "timestamp": "2026-11-10T05:03:00Z",
+                "payload": {"id": "usr-msg-4", "type": "message", "role": "user", "content": "继续"},
+            },
+        )
+        _append_jsonl(
+            seg2,
+            {
+                "type": "response_item",
+                "ordinal": 6,
+                "timestamp": "2026-11-10T05:04:00Z",
+                "payload": {
+                    "id": "usr-msg-5",
+                    "type": "message",
+                    "role": "user",
+                    "content": "<send_user_message_question_reply>采用熵稳定通量</send_user_message_question_reply>",
+                },
+            },
+        )
+
+        # 子代理分段不应混入主会话
+        _append_jsonl(seg_sub, {"type": "session_meta", "payload": {"id": sid, "cwd": "/tmp/proj", "source": "subagent"}})
+        _append_jsonl(
+            seg_sub,
+            {
+                "type": "response_item",
+                "ordinal": 1,
+                "timestamp": "2026-11-10T06:00:01Z",
+                "payload": {"id": "sub-1", "type": "message", "role": "user", "content": "子代理内部提示词"},
+            },
+        )
+
+        state_dir = codex_root / "hooks" / "state" / "session-context"
+        log_file = codex_root / "hooks" / "logs" / "session-context.jsonl"
+        out = session_context_loader.handle_codex_session_start(
+            {
+                "session_id": sid,
+                "transcript_path": str(seg2),
+                "cwd": "/tmp/proj",
+                "hook_event_name": "SessionStart",
+                "source": "compact",
+            },
+            state_dir_str=str(state_dir),
+            log_path_str=str(log_file),
+        )
+        spec = out["hookSpecificOutput"]
+        self.assertEqual(spec["hookEventName"], "SessionStart")
+        ctx = spec["additionalContext"]
+        self.assertIn("提取状态：成功", ctx)
+        self.assertIn("第 1～4 条", ctx)
+        self.assertIn("DGSEM 通量守恒", ctx)
+        self.assertIn("采用熵稳定通量", ctx)
+        self.assertNotIn("子代理内部提示词", ctx)
+
+        md_file = codex_root / "hooks" / "state" / "user-words" / f"{sid}.md"
+        self.assertTrue(md_file.is_file())
+        md_text = md_file.read_text(encoding="utf-8")
+        self.assertEqual(md_text.count("\n继续\n"), 2, "两次真实打字『继续』均须保留")
+        self.assertTrue(log_file.is_file())
+        self.assertNotIn("DGSEM 通量守恒", log_file.read_text(encoding="utf-8"), "运行日志仅记元数据，不落盘对话正文")
+
+        # 当 transcript_path 缺失触发缺口时，必须保留上次已验证的归档文档
+        gap_out = session_context_loader.handle_codex_session_start(
+            {"session_id": sid, "transcript_path": "", "source": "resume"},
+            state_dir_str=str(state_dir),
+            log_path_str=str(log_file),
+        )
+        gap_ctx = gap_out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("提取状态：存在缺口", gap_ctx)
+        self.assertIn("保留上次已验证文档", gap_ctx)
+        self.assertEqual(md_file.read_text(encoding="utf-8"), md_text)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,17 +1,19 @@
 """
-session_context_loader.py - 反重力上下文压缩原话回溯引擎 (user-guard)
+session_context_loader.py - 反重力与 Codex 双端上下文压缩原话回溯引擎 (user-guard)
 
 挂载事件：
-- SessionStart: 会话初次启动或进程冷重载时同步检查点游标（若存在未注入的压缩检查点则补注入 1 次）
-- PreInvocation: 会话运行中每轮调用模型前，通过 O(Δbytes) 二进制增量游标检测新增 CHECKPOINT：
-  * 日常未压缩对话：零全盘读取、零上下文注入；
-  * 发生自动压缩或手动 /compact 后首轮：精确触发 1 次全量原话提取、落盘 _user_words.md 并注入索引与摘要；
-  * 压缩后第 2、3...N 轮日常对话：因检查点步号已登记，零重复注入；
-  * 再次发生新的压缩（产生更大 step_index 的 CHECKPOINT）：再次精确触发 1 次。
+- Antigravity 侧 (--client antigravity，默认)：
+  * SessionStart: 会话初次启动或进程冷重载时同步检查点游标（若存在未注入的压缩检查点则补注入 1 次）
+  * PreInvocation: 会话运行中每轮调用模型前，通过 O(Δbytes) 二进制增量游标检测新增 CHECKPOINT：
+    日常未压缩对话零全盘读取、零上下文注入；发生压缩后首轮精确触发 1 次全量原话提取落盘并注入索引与摘要。
+- Codex 侧 (--client codex)：
+  * SessionStart (matcher: ^(compact|resume)$): 在 Codex 发生上下文压缩或恢复会话时，合并同 ID 主会话全部 rollout 分段，
+    原子刷新 hooks/state/user-words/<session_id>.md 并通过 hookSpecificOutput.additionalContext 注入原话档案路径与核心指令摘要。
 """
 
 import argparse
 import json
+import os
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -346,9 +348,125 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
     return handle_context_check(payload, event_name="PreInvocation")
 
 
+def _append_codex_log(log_path: Path, entry: Dict[str, Any]) -> None:
+    """向 Codex 钩子日志文件写入仅含元数据的 JSONL 记录（附带 2MB 自动滚动裁剪）"""
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if log_path.exists() and log_path.stat().st_size > MAX_LOG_BYTES:
+            raw = log_path.read_bytes()
+            tail = raw[-TRIM_LOG_BYTES:]
+            nl = tail.find(b"\n")
+            if nl != -1:
+                tail = tail[nl + 1 :]
+            user_words.atomic_write_text(log_path, tail.decode("utf-8", errors="replace"))
+        with open(log_path, "a", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def handle_codex_session_start(
+    payload: Dict[str, Any],
+    state_dir_str: str = "",
+    log_path_str: str = "",
+) -> Dict[str, Any]:
+    """
+    处理 Codex SessionStart (compact / resume) 事件：
+    提取同 ID 主会话 rollout 原话并落盘至 user-words/<session_id>.md，返回 hookSpecificOutput.additionalContext。
+    """
+    codex_home_env = os.environ.get("CODEX_HOME", "").strip()
+    default_codex_home = Path(codex_home_env).expanduser() if codex_home_env else (Path.home() / ".codex")
+
+    state_dir = Path(os.path.expanduser(state_dir_str)) if state_dir_str else (default_codex_home / "hooks" / "state" / "session-context")
+    user_words_dir = (state_dir.parent / "user-words") if state_dir.name == "session-context" else (state_dir / "user-words")
+    log_path = Path(os.path.expanduser(log_path_str)) if log_path_str else (default_codex_home / "hooks" / "logs" / "session-context.jsonl")
+
+    source = str(payload.get("source") or "unknown").strip()
+    session_id = str(payload.get("session_id") or "").strip()
+    transcript_str = str(payload.get("transcript_path") or "").strip()
+    cwd_str = str(payload.get("cwd") or os.getcwd())
+
+    if not session_id:
+        result: Dict[str, Any] = {
+            "complete": False,
+            "words": [],
+            "issues": ["hook input 缺少有效 session_id"],
+            "saved": {"file": "", "available": False, "preserved": False, "count": None, "last_time": None, "sources": []},
+            "meta_path": "",
+        }
+    else:
+        result = user_words.refresh_codex_session_archive(transcript_str, user_words_dir, session_id)
+
+    saved = result.get("saved") or {}
+    complete = bool(result.get("complete"))
+    count = saved.get("count")
+    words = result.get("words") or []
+
+    lines: List[str] = [f"恢复来源：{source}"]
+    if saved.get("available"):
+        lines.append(f"本会话用户原话文件：{saved['file']}")
+        if isinstance(count, int) and count > 0:
+            scope = f"第 1～{count} 条"
+        elif count == 0:
+            scope = "0 条"
+        else:
+            scope = "尚未核实"
+        lines.append(f"已保存记录范围：{scope}；最后一条时间：{saved.get('last_time') or '未记录'}")
+        if saved.get("preserved"):
+            lines.append("文件状态：保留上次已验证文档，本次因读取缺口未覆盖")
+        sources = saved.get("sources") or []
+        if sources and result.get("meta_path"):
+            lines.append(f"源记录分段数：{len(sources)} 段；校验清单：{result['meta_path']}")
+    else:
+        lines.append("本会话用户原话文件：尚无已确认可读的归档文档")
+        lines.append("已保存记录范围：尚未核实")
+
+    lines.append("提取状态：成功（已合并同 ID 主会话记录）" if complete else "提取状态：存在缺口")
+    if not complete and result.get("issues"):
+        lines.append("缺口信息：" + json.dumps(result["issues"], ensure_ascii=False))
+    lines.append("请严格遵照全局规则 R9：结合下方核心指令摘要与上述原话归档文件核对用户全部原始诉求，汇报现状后再继续执行。")
+
+    header_block = "\n".join(lines)
+    if words and saved.get("available"):
+        inline_msg = build_compaction_system_message(words, Path(saved["file"]), f"Codex {source}")
+        # 复用 build_compaction_system_message 的预算控制能力，确保总长受控
+        if len(header_block) + len(inline_msg) + 2 <= MAX_INLINE_TOTAL_CHARS + 1200:
+            full_context = header_block + "\n\n" + inline_msg
+        else:
+            full_context = inline_msg
+    else:
+        full_context = header_block
+
+    _append_codex_log(
+        log_path,
+        {
+            "ts": get_current_iso_time(),
+            "event": "SessionStart",
+            "session_id": session_id or "unknown",
+            "cwd": cwd_str,
+            "source": source,
+            "pid": os.getpid(),
+            "client": "codex",
+            "outcome": "saved" if complete else "gap",
+            "saved": saved,
+            "issues": result.get("issues") or [],
+        },
+    )
+
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": full_context,
+        }
+    }
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Antigravity Compaction Context Loader Hook")
+    parser = argparse.ArgumentParser(description="Antigravity & Codex Compaction Context Loader Hook")
+    parser.add_argument("--client", type=str, default="antigravity", choices=("antigravity", "codex"), help="Host client type")
     parser.add_argument("--event", type=str, default="", help="Hook event name: SessionStart or PreInvocation")
+    parser.add_argument("--state-dir", type=str, default="", help="Optional state directory override (used by Codex hook)")
+    parser.add_argument("--log", type=str, default="", help="Optional JSONL log file path override (used by Codex hook)")
     args, _ = parser.parse_known_args()
 
     input_text = sys.stdin.read().strip()
@@ -357,7 +475,24 @@ def main() -> None:
         try:
             payload = json.loads(input_text)
         except Exception as e:
+            if args.client == "codex":
+                sys.stderr.write(f"session_context_loader JSON parse error: {e}\n")
+                sys.exit(2)
             log_event(args.event or "Unknown", "unknown", f"Failed to parse stdin JSON: {e}")
+
+    if args.client == "codex":
+        try:
+            response = handle_codex_session_start(payload, state_dir_str=args.state_dir, log_path_str=args.log)
+        except Exception as e:
+            response = {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": f"恢复来源：{payload.get('source', 'unknown')}\n提取状态：异常（{e}）",
+                }
+            }
+        sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        return
 
     event_name = args.event or str(payload.get("hookEventName") or payload.get("eventName") or "PreInvocation")
 

@@ -1,4 +1,4 @@
-# Antigravity user-guard installer bootstrap (Windows PowerShell)
+# Antigravity & Codex unified configuration installer bootstrap (Windows PowerShell)
 $ErrorActionPreference = "Stop"
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
