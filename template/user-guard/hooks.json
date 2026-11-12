@@ -1,0 +1,37 @@
+{
+  "user-guard-lifecycle": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 -X utf8 -I -B ./hooks/session_context_loader.py --event SessionStart",
+        "timeout": 30
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 -X utf8 -I -B ./hooks/session_context_loader.py --event PreInvocation",
+        "timeout": 30
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "run_command|read_file|manage_task|write_file|edit_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B ./hooks/status_guard.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 -X utf8 -I -B ./hooks/reply_repeat_guard.py",
+        "timeout": 15
+      }
+    ]
+  }
+}

@@ -1,0 +1,514 @@
+"""
+test_guards_offline.py - 防空转门禁 (status_guard) 与防刷屏门禁 (reply_repeat_guard) 离线单元测试套件
+
+覆盖验证：
+1. status_guard 对未变化日志文件的同参重复读取精准 deny，文件更新后自动恢复 allow；
+2. 【防翻页误杀】长输出文件（如 .system_generated/steps/17/output.txt 或长 .log）分段翻页读取（不同 StartLine/EndLine/ByteOffset）100% allow；
+3. 【防变参检索误杀】run_command 先 grep 再 tail 同一日志（或含 powershell/bash 包装器）按命令签名区分，变参 allow、同参重复 deny；
+4. 【防 manage_task 永久锁死】manage_task(Action="status") 联动 .system_generated/tasks/<TaskId>.log，日志新增输出后立即恢复 allow；
+5. 【防 WSL 死锁与业务文件误伤】wsl 查看子系统内部不可达路径不锁死；普通配置 status.json / test_result.json 及插件自身状态目录绝不误拦截；
+6. reply_repeat_guard 连续 3 次同质短等待回复精准 continue 拦截，且重入 continuationActive=True 时 100% allow 熔断防死循环；
+7. 【防误杀真实进展】连续 3 次包含不同迭代步数/残差数值的短回复、或含等待用户指示/提问的回复绝不误拦截。
+"""
+
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+HOOKS_DIR = Path(os.environ.get("USER_GUARD_INSTALLED_DIR", str(REPO_ROOT / "template" / "user-guard"))) / "hooks"
+sys.path.insert(0, str(HOOKS_DIR))
+
+import reply_repeat_guard  # noqa: E402
+import status_guard  # noqa: E402
+
+
+def _append_jsonl(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+class TestGuardsOffline(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp_obj = tempfile.TemporaryDirectory()
+        self.tmp_root = Path(self.tmp_obj.name)
+        self.plugin_data = self.tmp_root / "plugin_data"
+        self.old_plugin_data = os.environ.get("PLUGIN_DATA")
+        os.environ["PLUGIN_DATA"] = str(self.plugin_data)
+
+    def tearDown(self) -> None:
+        if self.old_plugin_data is None:
+            os.environ.pop("PLUGIN_DATA", None)
+        else:
+            os.environ["PLUGIN_DATA"] = self.old_plugin_data
+        self.tmp_obj.cleanup()
+
+    def test_01_status_guard_unchanged_deny_and_updated_allow(self) -> None:
+        """未变动日志文件同参重复读取被 deny，文件产生增量输出后恢复 allow"""
+        conv_id = "guard-001"
+        log_file = self.tmp_root / "cfd_solver.log"
+        log_file.write_text("Iter 1: residual = 1.0e-1\n", encoding="utf-8")
+
+        payload = {
+            "conversationId": conv_id,
+            "cwd": str(self.tmp_root),
+            "toolCall": {"name": "read_file", "args": {"Path": str(log_file), "StartLine": 1, "EndLine": 100}},
+        }
+
+        self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "allow")
+        r_dup = status_guard.handle_pre_tool_use(payload)
+        self.assertEqual(r_dup["decision"], "deny")
+        self.assertIn("Reactive Wakeup", r_dup["reason"])
+
+        # 算例追加新输出后自动恢复放行
+        time.sleep(0.01)
+        log_file.write_text("Iter 1: residual = 1.0e-1\nIter 2: residual = 3.2e-4\n", encoding="utf-8")
+        self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "allow")
+
+    def test_02_status_guard_allows_pagination_on_large_output(self) -> None:
+        """分段翻页读取 .system_generated/steps/17/output.txt 或大日志文件绝不误杀"""
+        conv_id = "guard-pagination-002"
+        step_out = self.tmp_root / ".system_generated" / "steps" / "17" / "output.txt"
+        step_out.parent.mkdir(parents=True, exist_ok=True)
+        step_out.write_text("Line\n" * 2000, encoding="utf-8")
+
+        p_page1 = {
+            "conversationId": conv_id,
+            "toolCall": {"name": "read_file", "args": {"Path": str(step_out), "StartLine": 1, "EndLine": 800}},
+        }
+        p_page2 = {
+            "conversationId": conv_id,
+            "toolCall": {"name": "read_file", "args": {"Path": str(step_out), "StartLine": 801, "EndLine": 1600}},
+        }
+        p_page3_offset = {
+            "conversationId": conv_id,
+            "toolCall": {
+                "name": "read_file",
+                "args": {"Path": str(step_out), "StartLine": 801, "EndLine": 1600, "ByteOffset": 46080},
+            },
+        }
+
+        self.assertEqual(status_guard.handle_pre_tool_use(p_page1)["decision"], "allow")
+        self.assertEqual(status_guard.handle_pre_tool_use(p_page2)["decision"], "allow", "翻读第 2 页必须放行！")
+        self.assertEqual(status_guard.handle_pre_tool_use(p_page3_offset)["decision"], "allow", "ByteOffset 续读必须放行！")
+        # 原地重复读第 1 页则精准拦截
+        self.assertEqual(status_guard.handle_pre_tool_use(p_page1)["decision"], "deny")
+
+    def test_03_status_guard_run_command_params_and_shell_wrappers(self) -> None:
+        """run_command 支持变参放行（先 grep 后 tail）与包装器剥离同参拦截"""
+        conv_id = "guard-cmd-003"
+        out_file = self.tmp_root / "output.txt"
+        out_file.write_text("INFO start\nERROR divergence at cell 42\n", encoding="utf-8")
+
+        p_grep = {
+            "conversationId": conv_id,
+            "cwd": str(self.tmp_root),
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "grep ERROR output.txt"}},
+        }
+        p_tail = {
+            "conversationId": conv_id,
+            "cwd": str(self.tmp_root),
+            "toolCall": {"name": "run_command", "args": {"CommandLine": 'bash -c "tail -n 20 output.txt"'}},
+        }
+
+        self.assertEqual(status_guard.handle_pre_tool_use(p_grep)["decision"], "allow")
+        self.assertEqual(status_guard.handle_pre_tool_use(p_tail)["decision"], "allow", "变参切换命令必须放行")
+        self.assertEqual(status_guard.handle_pre_tool_use(p_tail)["decision"], "deny", "完全相同的包装命令重复轮询必须阻断")
+
+    def test_04_manage_task_status_tracks_real_task_log_updates(self) -> None:
+        """manage_task(Action='status') 联动后台任务日志指纹，日志更新后立即恢复放行，不永久锁死"""
+        conv_id = "guard-task-004"
+        sg_dir = self.tmp_root / "brain" / conv_id / ".system_generated"
+        tp = sg_dir / "logs" / "transcript.jsonl"
+        task_log = sg_dir / "tasks" / "task-323.log"
+        tp.parent.mkdir(parents=True, exist_ok=True)
+        task_log.parent.mkdir(parents=True, exist_ok=True)
+        tp.write_text("", encoding="utf-8")
+        task_log.write_text("Step 10/100...\n", encoding="utf-8")
+
+        payload = {
+            "conversationId": conv_id,
+            "transcriptPath": str(tp),
+            "toolCall": {"name": "manage_task", "args": {"Action": "status", "TaskId": "task-323"}},
+        }
+
+        self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "allow")
+        self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "deny", "任务日志未变时应拦截空转轮询")
+
+        # 后台算例向 task-323.log 写入新进展 -> 必须自动放行！
+        time.sleep(0.01)
+        task_log.write_text("Step 10/100...\nStep 80/100...\n", encoding="utf-8")
+        self.assertEqual(
+            status_guard.handle_pre_tool_use(payload)["decision"],
+            "allow",
+            "后台任务日志更新后 manage_task(status) 必须自动放行，严禁永久封死！",
+        )
+
+    def test_05_wsl_unreachable_paths_and_normal_json_files_not_blocked(self) -> None:
+        """WSL 子系统不可达路径不锁死，普通代码配置 status.json / test_result.json 不误伤"""
+        conv_id = "guard-safe-005"
+
+        # 1. WSL 内部路径在宿主不可见，连续查询不应被 non_existent 锁死
+        wsl_payload = {
+            "conversationId": conv_id,
+            "cwd": str(self.tmp_root),
+            "toolCall": {
+                "name": "run_command",
+                "args": {"CommandLine": 'wsl bash -c "tail -n 20 /nonexistent_wsl_sim_dir/run.log"'},
+            },
+        }
+        self.assertEqual(status_guard.handle_pre_tool_use(wsl_payload)["decision"], "allow")
+        self.assertEqual(status_guard.handle_pre_tool_use(wsl_payload)["decision"], "allow")
+
+        # 2. 普通项目文件 http_status.json / test_result_schema.json 连续读取完全放行
+        for fname in ("http_status.json", "test_result_schema.json", "solver_core.f90"):
+            f = self.tmp_root / fname
+            f.write_text('{"ok": true}\n', encoding="utf-8")
+            p = {"conversationId": conv_id, "toolCall": {"name": "read_file", "args": {"Path": str(f)}}}
+            self.assertEqual(status_guard.handle_pre_tool_use(p)["decision"], "allow")
+            self.assertEqual(status_guard.handle_pre_tool_use(p)["decision"], "allow", f"普通文件 {fname} 绝不应被拦截")
+
+    def test_06_repeat_guard_blocks_homogeneous_and_respects_continuation_active(self) -> None:
+        """连续 3 次同质短等待回复触发拦截，且重入 continuationActive=True 时立即熔断放行防死循环"""
+        conv_id = "repeat-006"
+        tp = self.tmp_root / "transcript.jsonl"
+        _append_jsonl(tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "跑算例"})
+
+        replies = [
+            "后台算例仍在运行中，请稍候。",
+            "后台算例仍在运行中，请耐心等待。",
+            "后台算例还在运行中，请稍候。",
+        ]
+        decisions = []
+        for idx, text in enumerate(replies, start=1):
+            _append_jsonl(tp, {"step_index": idx, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": text})
+            res = reply_repeat_guard.handle_stop_repeat_guard(
+                {
+                    "conversationId": conv_id,
+                    "terminationReason": "NO_TOOL_CALL",
+                    "continuationActive": False,
+                    "transcriptPath": str(tp),
+                }
+            )
+            decisions.append(res["decision"])
+
+        self.assertEqual(decisions, ["allow", "allow", "continue"])
+
+        # 紧接着宿主携带 continuationActive=True 重入 Stop -> 必须无条件放行防无限唤醒！
+        _append_jsonl(tp, {"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "后台仍在运行，现挂起等待通知。"})
+        res_reentry = reply_repeat_guard.handle_stop_repeat_guard(
+            {
+                "conversationId": conv_id,
+                "terminationReason": "NO_TOOL_CALL",
+                "continuationActive": True,
+                "transcriptPath": str(tp),
+            }
+        )
+        self.assertEqual(res_reentry["decision"], "allow")
+
+    def test_07_repeat_guard_allows_distinct_numerical_progress_and_user_questions(self) -> None:
+        """包含不同迭代步数/残差的真实进度汇报，以及等待用户裁决的回复，绝不误判为刷屏"""
+        conv_id = "repeat-progress-007"
+        tp = self.tmp_root / "transcript_prog.jsonl"
+        _append_jsonl(tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "监控收敛"})
+
+        progress_replies = [
+            "算例正在计算：已完成 100 步，当前残差 1.2e-2，继续等待完成。",
+            "算例正在计算：已完成 500 步，当前残差 4.5e-5，继续等待完成。",
+            "算例正在计算：已完成 900 步，当前残差 8.1e-8，继续等待完成。",
+            "网格切换方案已就绪，后台尚未完成合并，等待您的指示。",
+        ]
+        for idx, text in enumerate(progress_replies, start=1):
+            _append_jsonl(tp, {"step_index": idx, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": text})
+            res = reply_repeat_guard.handle_stop_repeat_guard(
+                {
+                    "conversationId": conv_id,
+                    "terminationReason": "NO_TOOL_CALL",
+                    "continuationActive": False,
+                    "transcriptPath": str(tp),
+                }
+            )
+            self.assertEqual(res["decision"], "allow", f"第 {idx} 条真实进展或用户请示不应被误拦截")
+
+        # 补充验证：无数值但属于不同子任务主语的短状态汇报，绝不误判为同质复读
+        conv_id_distinct = "repeat-distinct-subject-007b"
+        tp_distinct = self.tmp_root / "transcript_distinct.jsonl"
+        _append_jsonl(tp_distinct, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "全流程运行"})
+        distinct_subject_replies = [
+            "前处理非结构网格划分仍在运行中，请稍候。",
+            "三维可压缩流场求解器正在计算，请耐心等待。",
+            "后处理流线与涡量场导出还在运行中，请稍候。",
+        ]
+        for idx, text in enumerate(distinct_subject_replies, start=1):
+            _append_jsonl(tp_distinct, {"step_index": idx, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": text})
+            res = reply_repeat_guard.handle_stop_repeat_guard(
+                {
+                    "conversationId": conv_id_distinct,
+                    "terminationReason": "NO_TOOL_CALL",
+                    "continuationActive": False,
+                    "transcriptPath": str(tp_distinct),
+                }
+            )
+            self.assertEqual(res["decision"], "allow", f"不同子任务主语第 {idx} 条状态汇报不应被误拦截")
+
+    def test_08_workspace_boundary_allows_project_artifacts_and_cross_env_paths(self) -> None:
+        """项目目录内写入、跨端 D:/ <-> /mnt/d/ 同项目等价路径、会话专属制品与标准临时目录 100% 放行"""
+        conv_id = "boundary-allow-008"
+        proj = self.tmp_root / "myproj"
+        proj.mkdir()
+        art_dir = self.tmp_root / "brain" / conv_id
+        tp = art_dir / ".system_generated" / "logs" / "transcript.jsonl"
+
+        base_payload = {
+            "conversationId": conv_id,
+            "cwd": str(proj),
+            "workspacePaths": [str(proj)],
+            "artifactDirectoryPath": str(art_dir),
+            "transcriptPath": str(tp),
+        }
+
+        for target_p in (
+            str(proj / "src" / "solver.py"),
+            "docs/report.md",
+            str(art_dir / "scratch" / "calc.py"),
+            str(self.plugin_data / "state" / "note.json"),
+        ):
+            res = status_guard.handle_pre_tool_use(
+                {**base_payload, "toolCall": {"name": "write_file", "args": {"Path": target_p}}}
+            )
+            self.assertEqual(res["decision"], "allow", f"允许范围内的路径 {target_p} 必须放行")
+
+        # 验证非临时目录项目支持跨端等价路径、系统临时目录、子代理/宿主对话记忆及 ~/.cache 正常放行
+        cross_payload = {
+            "conversationId": conv_id,
+            "cwd": r"X:\Projects\myproj",
+            "workspacePaths": [r"X:\Projects\myproj"],
+        }
+        for allowed_runtime_path in (
+            "/mnt/x/Projects/myproj/src/a.py",
+            "/tmp/cae_stage_check.json",
+            "/home/alice/.gemini/antigravity/brain/subagent-uuid-001/scratch/note.md",
+            r"C:\Users\alice\.gemini\antigravity\plugin_data\user-guard\state\conv_user_words.md",
+            "/home/alice/.codex/memories/proj_memo.json",
+            "/home/alice/.cache/solver-venv/pip-wheel.json",
+        ):
+            self.assertEqual(
+                status_guard.handle_pre_tool_use(
+                    {**cross_payload, "toolCall": {"name": "write_file", "args": {"Path": allowed_runtime_path}}}
+                )["decision"],
+                "allow",
+                f"临时目录、对话记忆与工具缓存路径应当放行: {allowed_runtime_path}",
+            )
+
+    def test_09_workspace_boundary_blocks_external_mutations_worktrees_and_link_escapes(self) -> None:
+        """项目目录外业务写删、外部 .codex-worktrees、全局核心配置篡改与软链接逃逸：交互清晰 force_ask、无头子任务硬 deny"""
+        import subprocess as _sp
+
+        conv_id = "boundary-block-009"
+        proj = self.tmp_root / "myproj"
+        outside = self.tmp_root / "outside_dir"
+        proj.mkdir()
+        outside.mkdir()
+
+        base_payload = {
+            "conversationId": conv_id,
+            "cwd": str(proj),
+            "workspacePaths": [str(proj)],
+        }
+
+        # 1) 交互会话：外部业务目录与全局核心配置文件触发 force_ask，且弹窗清晰展示动作与目标路径
+        r_ext_write = status_guard.handle_pre_tool_use(
+            {
+                **base_payload,
+                "toolCall": {
+                    "name": "write_file",
+                    "args": {"Path": str(self.tmp_root / "myproj_bak" / "a.py"), "Content": "x = 1\n"},
+                },
+            }
+        )
+        self.assertEqual(r_ext_write["decision"], "force_ask")
+        self.assertIn("具体写删动作：", r_ext_write["reason"])
+        self.assertIn("项目外目标路径：", r_ext_write["reason"])
+
+        for protected_cfg in (
+            "/home/alice/.codex/config.toml",
+            "/home/alice/.codex/AGENTS.md",
+            "/home/alice/.gemini/config/settings.json",
+        ):
+            r_ext_cfg = status_guard.handle_pre_tool_use(
+                {**base_payload, "toolCall": {"name": "edit_file", "args": {"Path": protected_cfg, "Target": "a", "Replacement": "b"}}}
+            )
+            self.assertEqual(r_ext_cfg["decision"], "force_ask", f"全局核心配置必须受保护: {protected_cfg}")
+
+        # 2) 交互会话：外部 git worktree add / 外部删除（含 wsl 直调）/ 非沙箱全局 install.py 均返回含意图说明的 force_ask
+        win_proj_payload = {
+            "conversationId": conv_id,
+            "cwd": r"X:\Projects\myproj",
+            "workspacePaths": [r"X:\Projects\myproj"],
+        }
+        for bad_cmd in (
+            'git worktree add "../.codex-worktrees/myproj/branch-a"',
+            r'Remove-Item -Force "X:\Projects\.codex-worktrees"',
+            'wsl.exe -d Ubuntu -- rm -rf /mnt/x/Projects/.codex-worktrees',
+            'python -B install.py',
+            r'python -B "X:\Projects\myproj\install.py"',
+        ):
+            r_cmd = status_guard.handle_pre_tool_use(
+                {
+                    **win_proj_payload,
+                    "toolCall": {
+                        "name": "run_command",
+                        "args": {"CommandLine": bad_cmd, "toolSummary": "清理或同步项目外目标测试"},
+                    },
+                }
+            )
+            self.assertEqual(r_cmd["decision"], "force_ask", f"越界命令必须触发 force_ask: {bad_cmd}")
+            self.assertIn("当前任务意图：清理或同步项目外目标测试", r_cmd["reason"])
+            self.assertIn("具体写删动作：", r_cmd["reason"])
+            self.assertIn("触发语句：", r_cmd["reason"])
+
+        # 3) 安全对照：--dry-run、项目内沙箱安装、只读查询外部目录、含外部路径字面量的 git commit 均放行
+        for safe_cmd in (
+            "python -B install.py --dry-run",
+            r'python -B install.py --target-dir "X:\Projects\myproj\.sandbox\plugin" --no-zotero',
+            r'Get-Item -Force "X:\Projects\.codex-worktrees"',
+            r'git commit -m "fix: block X:\Projects\.codex-worktrees and ../.codex-worktrees"',
+        ):
+            r_ok = status_guard.handle_pre_tool_use(
+                {**win_proj_payload, "toolCall": {"name": "run_command", "args": {"CommandLine": safe_cmd}}}
+            )
+            self.assertEqual(r_ok["decision"], "allow", f"安全命令不应被误拦截: {safe_cmd}")
+
+        # 4) 跨端无头子任务（CAE_HARNESS_DEPTH=1）：越界操作一律硬 deny
+        old_depth = os.environ.get("CAE_HARNESS_DEPTH")
+        os.environ["CAE_HARNESS_DEPTH"] = "1"
+        try:
+            r_deny_w = status_guard.handle_pre_tool_use(
+                {**base_payload, "toolCall": {"name": "write_file", "args": {"Path": str(outside / "x.txt")}}}
+            )
+            r_deny_wt = status_guard.handle_pre_tool_use(
+                {
+                    **win_proj_payload,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": 'git worktree add "../.codex-worktrees/wt"'}},
+                }
+            )
+            self.assertEqual(r_deny_w["decision"], "deny")
+            self.assertEqual(r_deny_wt["decision"], "deny")
+        finally:
+            if old_depth is None:
+                os.environ.pop("CAE_HARNESS_DEPTH", None)
+            else:
+                os.environ["CAE_HARNESS_DEPTH"] = old_depth
+
+        # 5) 软链接 / 目录联接逃逸拦截
+        escape_link = proj / "escape_link"
+        link_created = False
+        try:
+            escape_link.symlink_to(outside, target_is_directory=True)
+            link_created = True
+        except OSError:
+            if os.name == "nt":
+                env = os.environ.copy()
+                env["UG_LINK"] = str(escape_link)
+                env["UG_TARGET"] = str(outside)
+                p = _sp.run(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "New-Item -ItemType Junction -Path $env:UG_LINK -Target $env:UG_TARGET | Out-Null",
+                    ],
+                    env=env,
+                    capture_output=True,
+                    timeout=10,
+                )
+                link_created = p.returncode == 0
+        if link_created:
+            r_link = status_guard.handle_pre_tool_use(
+                {**base_payload, "toolCall": {"name": "write_file", "args": {"Path": str(escape_link / "escaped.txt")}}}
+            )
+            self.assertEqual(r_link["decision"], "force_ask", "通过项目内链接写向项目外目录必须被拦截")
+
+    def test_10_real_world_readonly_python_and_wsl_venv_never_false_positive(self) -> None:
+        """真实场景回归：含 .md 字面量、子代理 brain 只读检查、WSL ~/.cache 解释器与数组 .copy() 零误报；真实外部写必拦截"""
+        # 场景 A: 项目内 python3 -c 检查 .md 文件名列表并只读打开子代理 brain/<sub-id>/transcript.jsonl
+        linux_proj_payload = {
+            "conversationId": "parent-conv-010a",
+            "cwd": "/home/alice/cfd_proj",
+            "workspacePaths": ["/home/alice/cfd_proj"],
+        }
+        cmd_subagent_check = (
+            "python3 -c '\n"
+            "import sys\n"
+            'mods = ["AGENTS.md", "docs/README.md", "docs/handover/START-HERE.en.md"]\n'
+            'with open("/home/alice/.gemini/antigravity/brain/subagent-g5/.system_generated/logs/transcript.jsonl", "r", encoding="utf-8") as f:\n'
+            "    print(len(f.readlines()), len(mods))\n"
+            "'"
+        )
+        res_a = status_guard.handle_pre_tool_use(
+            {
+                **linux_proj_payload,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": cmd_subagent_check, "toolSummary": "Check wording hits and subagent state"},
+                },
+            }
+        )
+        self.assertEqual(res_a["decision"], "allow", "只读检查 .md 列表与子代理轨迹严禁误报")
+
+        # 场景 B: Windows 经 wsl.exe -e bash -lc 调用 $HOME/.cache/.../python 执行含 .copy()、.open('rb') 与 > 比较的只读后处理脚本
+        win_cfd_payload = {
+            "conversationId": "parent-conv-010b",
+            "cwd": r"x:/Projects/cfd_post/case_data 数据处理",
+            "workspacePaths": [r"x:/Projects/cfd_post/case_data 数据处理"],
+        }
+        cmd_wsl_venv_readonly = (
+            "wsl.exe -e bash -lc '$HOME/.cache/step1-venv/bin/python -B -c \"\n"
+            "from pathlib import Path\n"
+            "arr = [1, 2, 3].copy()\n"
+            'p = Path(\\"data/simbf.bin\\")\n'
+            'if len(arr) > 0 and p.exists():\n'
+            '    with p.open(\\"rb\\") as st:\n'
+            "        print(len(st.read()))\n"
+            "\"'"
+        )
+        res_b = status_guard.handle_pre_tool_use(
+            {
+                **win_cfd_payload,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": cmd_wsl_venv_readonly, "toolSummary": "Inspect profile sample stats"},
+                },
+            }
+        )
+        self.assertEqual(res_b["decision"], "allow", "WSL 缓存 venv 只读脚本（含 .copy() 与 > 比较）严禁误报")
+
+        # 对照场景 C: 同样通过 WSL venv python -c，但脚本内真正向项目外业务目录 open(..., 'w') 写文件 -> 必须精准拦截并说明原因
+        cmd_wsl_venv_real_write = (
+            "wsl.exe -e bash -lc '$HOME/.cache/step1-venv/bin/python -B -c \""
+            'open(\\"/mnt/x/Projects/outside_garbage.txt\\", \\"w\\").write(\\"leak\\")'
+            "\"'"
+        )
+        res_c = status_guard.handle_pre_tool_use(
+            {
+                **win_cfd_payload,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": cmd_wsl_venv_real_write, "toolSummary": "Export debug dump"},
+                },
+            }
+        )
+        self.assertEqual(res_c["decision"], "force_ask", "Python 内联真实写向项目外业务盘必须拦截")
+        self.assertIn("当前任务意图：Export debug dump", res_c["reason"])
+        self.assertIn("Python 写入/修改文件", res_c["reason"])
+        self.assertIn("/mnt/x/Projects/outside_garbage.txt", res_c["reason"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

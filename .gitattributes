@@ -1,0 +1,8 @@
+# Enforce consistent line endings across Windows, WSL2, Linux, and macOS
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.ps1 text eol=crlf
+

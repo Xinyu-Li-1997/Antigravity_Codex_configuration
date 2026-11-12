@@ -1,0 +1,7 @@
+{
+  "name": "user-guard",
+  "displayName": "User Guard & Scientific Standards",
+  "version": "1.2.0",
+  "description": "Engineering and scientific rules, incremental compaction recovery, polling and repeat guards, read-only subagents, and bidirectional Codex/Antigravity task delegation with explicit verification.",
+  "repository": "https://github.com/Xinyu-Li-1997/Antigravity_Codex_configuration"
+}
