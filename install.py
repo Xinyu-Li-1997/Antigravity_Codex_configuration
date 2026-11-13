@@ -41,13 +41,151 @@ for _stream_name in ("stdin", "stdout", "stderr"):
     if _stream is not None and hasattr(_stream, "reconfigure"):
         try:
             _stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
+        except (OSError, ValueError):
             pass
+
+# 一、常量、路径与平台识别
 
 IGNORED_NAMES = {"__pycache__", ".DS_Store", "Thumbs.db", ".gitkeep"}
 IGNORED_SUFFIXES = {".pyc", ".pyo", ".pyd"}
 EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 ZOTERO_ENV = {"ZOTERO_LOCAL": "true", "PYTHON_DOTENV_DISABLED": "1", "NO_PROXY": "localhost,127.0.0.1"}
+UTF8_BOM = b"\xef\xbb\xbf"
+REGRESSION_TIMEOUT_SECONDS = 600
+
+
+TOML_STRING = r'''(?:"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*')'''
+TOML_KEY = rf"(?:[A-Za-z0-9_-]+|{TOML_STRING})"
+TOML_KEY_PATH = rf"{TOML_KEY}(?:[ \t]*\.[ \t]*{TOML_KEY})*"
+TOML_TABLE = re.compile(rf"^[ \t]*(\[{{1,2}})[ \t]*({TOML_KEY_PATH})[ \t]*(\]{{1,2}})[ \t]*(?:#.*)?$")
+TOML_ASSIGNMENT = re.compile(rf"^([ \t]*({TOML_KEY_PATH})[ \t]*=[ \t]*)(.*)$")
+TOML_ARRAY_TOKEN = re.compile(rf"{TOML_STRING}|[^, \t]+")
+TOML_ESCAPE = re.compile(r'\\(?:(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})|([btnfr"\\]))')
+TOML_ESCAPED_CHAR = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
+HOOK_PYTHON_FLAGS = ["-X", "utf8", "-I", "-B"]
+LEGACY_PYTHON_FLAGS = ([], ["-B"], ["-I", "-B"], HOOK_PYTHON_FLAGS)
+HANDOFF_MARKER = re.compile(r"\[user-guard codex-handoff v1 mode=(advisory|enforce|off) compact_limit=([0-9]+)\]")
+
+
+def _is_mnt_windows_path(path_str: Optional[str]) -> bool:
+    """在 POSIX/WSL 下判断可执行文件路径是否位于 /mnt/<盘符>/ 挂载的 Windows 侧"""
+    if os.name == "nt" or not path_str:
+        return False
+    return bool(re.match(r"^/mnt/[a-zA-Z]/", path_str.replace("\\", "/")))
+
+
+def _is_wsl() -> bool:
+    if os.name == "nt":
+        return False
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text(encoding="utf-8").lower()
+    except (OSError, UnicodeError):
+        return False
+
+
+# 二、路径安全、原子读写与 TOML / JSON 配置处理
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except FileNotFoundError:
+        return False
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def _validate_path(path: Path, *, directory: bool) -> Path:
+    """逐级检查真实目录，拒绝符号链接、重解析点和目标文件硬链接。"""
+    path = path.expanduser().absolute()
+    if ".." in path.parts:
+        raise ValueError(f"安装路径不能包含未解析的上级目录: {path}")
+    for ancestor in (*reversed(path.parents), path):
+        if os.name == "nt":
+            if ancestor.name.endswith((".", " ")):
+                raise ValueError(f"Windows 安装路径不能包含以空格或点结尾的名称: {ancestor}")
+            if re.search(r'[<>:"|?*\x00-\x1f]', ancestor.name) or re.fullmatch(
+                r"(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\..*)?", ancestor.name, re.IGNORECASE,
+            ):
+                raise ValueError(f"Windows 安装路径包含保留名称或非法字符: {ancestor}")
+        if _is_link_or_junction(ancestor):
+            if ancestor == path:
+                raise ValueError(f"安装目标是链接或目录联接，请指定真实路径: {ancestor}")
+            raise ValueError(f"安装路径含祖先链接或目录联接，请指定真实路径: {ancestor}")
+        try:
+            metadata = ancestor.lstat()
+        except FileNotFoundError:
+            continue
+        want_directory = ancestor != path or directory
+        if want_directory and not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"安装目标或其祖先必须为目录: {ancestor}")
+        if not want_directory and not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"安装目标必须为普通文件: {ancestor}")
+        if not want_directory and metadata.st_nlink > 1:
+            raise ValueError(f"安装目标存在硬链接，请指定独立文件: {ancestor}")
+    return path
+
+
+def _validate_tree_links(root: Path) -> None:
+    """在镜像同步和缓存清理前检查整棵目录树中的链接。"""
+    _validate_path(root, directory=True)
+    if not root.is_dir():
+        return
+
+    def fail(error: OSError) -> None:
+        raise error
+
+    for parent, dirs, files in os.walk(root, onerror=fail, followlinks=False):
+        for name in dirs + files:
+            entry = Path(parent) / name
+            if _is_link_or_junction(entry):
+                raise ValueError(f"安装目标包含链接或目录联接，请先核对: {entry}")
+
+
+def validate_install_target(target: Path, repo_root: Path) -> Path:
+    """在镜像同步前核实绝对目标，拒绝源树、用户根目录和危险链接。"""
+    resolved = _validate_path(target, directory=True).resolve()
+    repo_root = repo_root.resolve()
+    user_home = Path.home()
+    user_root = user_home.resolve()
+    protected = {
+        user_root,
+        user_root / ".gemini",
+        user_root / ".gemini" / "config",
+        user_root / ".gemini" / "config" / "plugins",
+        user_root / ".codex",
+        user_root / ".codex" / "skills",
+    }
+    configured_home = os.environ.get("CODEX_HOME", "").strip()
+    if configured_home:
+        codex_home = Path(configured_home).expanduser()
+        codex_root = codex_home.resolve()
+        protected.update((codex_root, codex_root / "skills"))
+    if resolved in protected or resolved in user_root.parents:
+        raise ValueError(f"安装目标不能是用户根目录或共享配置目录: {resolved}")
+    if resolved == repo_root or resolved in repo_root.parents or repo_root in resolved.parents:
+        raise ValueError(f"安装目标与源码仓库重叠: {resolved}")
+    _validate_tree_links(resolved)
+    return resolved
+
+
+def validate_codex_home_target(codex_home: Path, repo_root: Path) -> Path:
+    """校验 Codex 主配置目录（支持真实 ~/.codex 或独立沙箱 --codex-home，拒绝源仓库重叠、用户主目录及链接重定向）"""
+    resolved = _validate_path(codex_home, directory=True).resolve()
+    repo_resolved = repo_root.resolve()
+    user_root = Path.home().resolve()
+
+    if resolved == user_root or resolved in user_root.parents:
+        raise ValueError(f"Codex 目标目录不能是用户主目录或上级系统目录: {resolved}")
+    gemini_root = user_root / ".gemini"
+    if resolved == gemini_root or gemini_root in resolved.parents:
+        raise ValueError(f"Codex 目标目录不能与反重力配置目录混用: {resolved}")
+    if resolved == repo_resolved or resolved in repo_resolved.parents or repo_resolved in resolved.parents:
+        raise ValueError(f"Codex 目标目录与源码仓库重叠: {resolved}")
+    return resolved
 
 
 class FileChange(NamedTuple):
@@ -57,34 +195,51 @@ class FileChange(NamedTuple):
 
 
 def _read_optional_bytes(path: Path) -> Optional[bytes]:
+    path = _validate_path(path, directory=False)
     try:
         return path.read_bytes()
     except FileNotFoundError:
         return None
 
 
+def _decode_utf8(path: Path, raw: bytes) -> str:
+    """接受 UTF-8 BOM，遇到损坏编码时在错误中标明原文件。"""
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeError as exc:
+        raise ValueError(f"{path} 不是有效的 UTF-8，原文件已保留。") from exc
+
+
 def _atomic_write(change: FileChange) -> None:
-    path, original, content = change
-    _validate_path(path, directory=False)
+    """先核对旧内容，再原子替换，避免中断留下半截文件或覆盖同期修改。"""
+    path = _validate_path(change.path, directory=False)
+    original, content = change.original, change.content
     if _read_optional_bytes(path) != original:
         raise ValueError(f"{path} 在安装期间发生变更，请重新运行安装器。")
     if content == original:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
+    _validate_path(path, directory=False)
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temp:
             temp_path = Path(temp.name)
             temp.write(content)
+            temp.flush()
+            os.fsync(temp.fileno())
         _validate_path(path, directory=False)
         if _read_optional_bytes(path) != original:
             raise ValueError(f"{path} 在安装期间发生变更，请重新运行安装器。")
+        _validate_path(temp_path, directory=False)
         if original is not None:
             temp_path.chmod(stat.S_IMODE(path.stat().st_mode))
         temp_path.replace(path)
     finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
+        if temp_path is not None and temp_path.exists():
+            # Windows 无法删除带只读属性的临时文件。
+            _validate_path(temp_path, directory=False)
+            temp_path.chmod(stat.S_IMODE(temp_path.stat().st_mode) | stat.S_IWUSR)
+            temp_path.unlink()
 
 
 def _apply_file_change(change: Optional[FileChange], dry_run: bool) -> None:
@@ -101,8 +256,25 @@ def _json_bytes(doc: Dict[str, Any]) -> bytes:
     return (json.dumps(doc, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
 
 
+def _preserve_text_format(content: bytes, original: Optional[bytes]) -> bytes:
+    """重新生成 JSON 等文本时沿用原文件的 BOM 和换行格式。"""
+    previous = original or b""
+    if b"\r\n" in previous:
+        content = content.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    return (UTF8_BOM if previous.startswith(UTF8_BOM) else b"") + content
+
+
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"JSON 中包含非法数值 {value}")
+
+
+def _reject_duplicate_json_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"JSON 键重复: {key}")
+        result[key] = value
+    return result
 
 
 def _read_json_object(path: Path, raw: Optional[bytes]) -> Dict[str, Any]:
@@ -115,36 +287,11 @@ def _read_json_object(path: Path, raw: Optional[bytes]) -> Dict[str, Any]:
         )
         if not isinstance(result, dict):
             raise ValueError("顶层必须是对象")
+        # JSON 数字溢出及未配对的 Unicode 代理项也须在写入前检出。
+        _json_bytes(result)
     except (ValueError, RecursionError) as exc:
         raise ValueError(f"无法安全合并 {path}，原文件已保留: {exc}") from exc
     return result
-
-
-def _plan_user_zotero(config_root: Path, zotero_exe: Optional[str]) -> Optional[FileChange]:
-    path = config_root / "mcp_config.json"
-    _validate_path(path, directory=False)
-    if not zotero_exe:
-        return None
-    raw = _read_optional_bytes(path)
-    data = _read_json_object(path, raw)
-    servers = data.setdefault("mcpServers", {})
-    if not isinstance(servers, dict) or any(not isinstance(server, dict) for server in servers.values()):
-        raise ValueError(f"{path} 的 mcpServers 及各服务器条目必须为对象，原文件已保留。")
-    if servers.get("zotero"):
-        print("[*] 保留反重力已配置的 Zotero MCP。")
-        return None
-    servers["zotero"] = {"command": zotero_exe, "args": [], "env": ZOTERO_ENV}
-    return FileChange(path, raw, _json_bytes(data))
-
-
-TOML_STRING = r'''(?:"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*')'''
-TOML_KEY = rf"(?:[A-Za-z0-9_-]+|{TOML_STRING})"
-TOML_KEY_PATH = rf"{TOML_KEY}(?:[ \t]*\.[ \t]*{TOML_KEY})*"
-TOML_TABLE = re.compile(rf"^[ \t]*(\[{{1,2}})[ \t]*({TOML_KEY_PATH})[ \t]*(\]{{1,2}})[ \t]*(?:#.*)?$")
-TOML_ASSIGNMENT = re.compile(rf"^([ \t]*({TOML_KEY_PATH})[ \t]*=[ \t]*)(.*)$")
-TOML_ARRAY_TOKEN = re.compile(rf"{TOML_STRING}|[^, \t]+")
-TOML_ESCAPE = re.compile(r'\\(?:(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})|([btnfr"\\]))')
-TOML_ESCAPED_CHAR = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
 
 
 def _toml_string(value: str) -> str:
@@ -271,6 +418,45 @@ def _toml_inline_table_end(line: str, start: int) -> Optional[int]:
     return None
 
 
+def _toml_inline_table_location(
+    line: str, start: int, path: Tuple[str, ...],
+) -> Optional[Tuple[int, int, Tuple[str, ...]]]:
+    """沿嵌套内联表找到插入位置，缺失的子表可用点分键补齐。"""
+    end = _toml_inline_table_end(line, start)
+    if end is None:
+        return None
+    if not path:
+        return start, end, ()
+    cursor = start + 1
+    while cursor < end:
+        assignment = TOML_ASSIGNMENT.match(line[cursor:end])
+        if assignment is None:
+            break
+        keys = _toml_key_parts(assignment[2])
+        value_start = cursor + assignment.end(1)
+        if path[:len(keys)] == keys and line[value_start] == "{":
+            return _toml_inline_table_location(line, value_start, path[len(keys):])
+        cursor = value_start
+        depth = 0
+        while cursor < end:
+            char = line[cursor]
+            if char in "\"'":
+                string = re.match(TOML_STRING, line[cursor:])
+                if string is None:
+                    return None
+                cursor += string.end()
+                continue
+            if char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+            elif char == "," and depth == 0:
+                cursor += 1
+                break
+            cursor += 1
+    return start, end, path
+
+
 def _toml_statement_end(lines: List[str], start: int, offset: int) -> int:
     """跳过多行值，避免把值中的文本当成表头或键。"""
     quote = ""
@@ -308,13 +494,13 @@ def _toml_statement_end(lines: List[str], start: int, offset: int) -> int:
 
 
 class CodexConfig:
-    """语义识别已有键，只在原文中插入缺项或替换显式要改的值。"""
+    """保留注释、BOM 与换行，在原 TOML 文本中补缺或替换指定字符串。"""
 
     def __init__(self, path: Path):
         self.path = path
         _validate_path(path, directory=False)
         self.original = _read_optional_bytes(path)
-        self.source = (self.original or b"").decode("utf-8")
+        self.source = _decode_utf8(path, self.original or b"")
         self.newline = "\r\n" if "\r\n" in self.source else "\n"
         self.data = _parse_toml(self.source, self.path)
 
@@ -357,6 +543,10 @@ class CodexConfig:
             return
         lines, tables, assignments = self._locations()
         missing_lines = [line + self.newline for line in missing]
+        inline_parent = next((
+            path[:depth] for depth in range(len(path), 0, -1)
+            if path[:depth] in assignments and assignments[path[:depth]][1][3].startswith("{")
+        ), None)
         if not path:
             lines[0:0] = missing_lines
         elif path in tables:
@@ -364,13 +554,15 @@ class CodexConfig:
             if not lines[insert - 1].endswith("\n"):
                 lines[insert - 1] += self.newline
             lines[insert:insert] = missing_lines
-        elif path in assignments and assignments[path][1][3].startswith("{"):
-            index, assignment = assignments[path]
+        elif inline_parent is not None:
+            index, assignment = assignments[inline_parent]
             line = lines[index]
-            start = assignment.end(1)
-            end = _toml_inline_table_end(line, start)
-            if end is None:
+            location = _toml_inline_table_location(line, assignment.end(1), path[len(inline_parent):])
+            if location is None:
                 raise ValueError(f"{self.path} 的内联表 {'.'.join(path)} 需要手工补齐缺失配置")
+            start, end, remaining = location
+            if remaining:
+                missing = [".".join(remaining) + "." + entry for entry in missing]
             insert = len(line[:end].rstrip(" \t"))
             separator = ", " if line[start + 1:insert].strip() else " "
             padding = " " if insert == end else ""
@@ -379,7 +571,7 @@ class CodexConfig:
             # 如果已有点分键，沿其所在的显式父表补缺，避免重定义点分键建立的表。
             existing = any(key[:len(path)] == path for key in assignments)
             if existing:
-                parent = next((path[:i] for i in range(len(path) - 1, 0, -1) if path[:i] in tables), ())
+                parent = next((path[:depth] for depth in range(len(path) - 1, 0, -1) if path[:depth] in tables), ())
                 insert = tables[parent] + 1 if parent else 0
                 if insert and not lines[insert - 1].endswith("\n"):
                     lines[insert - 1] += self.newline
@@ -412,14 +604,12 @@ class CodexConfig:
 
     def change(self) -> Optional[FileChange]:
         updated = self.source.encode("utf-8")
+        if (self.original or b"").startswith(UTF8_BOM):
+            updated = UTF8_BOM + updated
         return FileChange(self.path, self.original, updated) if updated != (self.original or b"") else None
 
 
-def _is_mnt_windows_path(path_str: Optional[str]) -> bool:
-    """在 POSIX/WSL 下判断可执行文件路径是否位于 /mnt/<盘符>/ 挂载的 Windows 侧"""
-    if os.name == "nt" or not path_str:
-        return False
-    return bool(re.match(r"^/mnt/[a-zA-Z]/", path_str.replace("\\", "/")))
+# 三、双端客户端、WSL 互操作与 Python / Zotero 探测
 
 
 def _first_executable(candidates: List[Path], *, windows: bool = False) -> Optional[str]:
@@ -480,23 +670,12 @@ def _find_windows_codex_package() -> Tuple[Optional[str], Optional[str]]:
         app = Path(location) / "app"
         return (_first_executable([app / "resources" / "codex.exe"], windows=True),
                 _first_executable([app / "Codex.exe"], windows=True))
-    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None, None
 
 
-def _is_wsl() -> bool:
-    if os.name == "nt":
-        return False
-    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
-        return True
-    try:
-        return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text(encoding="utf-8").lower()
-    except (OSError, UnicodeError):
-        return False
-
-
 def _probe_wsl_windows_profile_dir() -> Optional[Path]:
-    """在 WSL 环境下探测对应的 Windows 宿主用户主目录（如 /mnt/c/Users/<user>），只读零副作用"""
+    """以 UTF-16 读取 Windows 用户主目录，再用 wslpath 转为本侧路径。"""
     if not _is_wsl():
         return None
     cmd_exe = shutil.which("cmd.exe")
@@ -505,15 +684,14 @@ def _probe_wsl_windows_profile_dir() -> Optional[Path]:
         return None
     try:
         profile = subprocess.run(
-            [cmd_exe, "/d", "/c", "echo", "%USERPROFILE%"],
+            [cmd_exe, "/d", "/u", "/c", "echo", "%USERPROFILE%"],
             cwd=str(Path(cmd_exe).parent),
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
+            encoding="utf-16-le",
             timeout=5,
         )
-        win_profile = profile.stdout.strip()
+        win_profile = profile.stdout.strip().lstrip("\ufeff")
         if profile.returncode != 0 or not PureWindowsPath(win_profile).is_absolute():
             return None
         converted = subprocess.run(
@@ -521,15 +699,14 @@ def _probe_wsl_windows_profile_dir() -> Optional[Path]:
             capture_output=True,
             text=True,
             encoding="utf-8",
-            errors="replace",
             timeout=5,
         )
         wsl_home = converted.stdout.strip()
         if converted.returncode != 0 or not wsl_home:
             return None
-        p = Path(wsl_home)
-        return p if p.is_absolute() and p.is_dir() else None
-    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        profile_path = Path(wsl_home)
+        return profile_path if profile_path.is_absolute() and profile_path.is_dir() else None
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
 
@@ -539,14 +716,18 @@ def _wsl_distro_list(wsl: str, *options: str) -> Optional[List[str]]:
         if result.returncode != 0:
             return None
         # 不同版本的 wsl.exe 重定向输出可能是 UTF-16 或 UTF-8。
-        encoding = "utf-16-le" if b"\0" in result.stdout else "utf-8-sig"
-        return [line.strip().lstrip("\ufeff") for line in result.stdout.decode(encoding).splitlines() if line.strip()]
-    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        if result.stdout.startswith((b"\xff\xfe", b"\xfe\xff")):
+            encoding = "utf-16"
+        else:
+            encoding = "utf-16-le" if b"\0" in result.stdout else "utf-8-sig"
+        names = [line.strip().lstrip("\ufeff").strip() for line in result.stdout.decode(encoding).splitlines()]
+        return [name for name in names if name]
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
 
 def _probe_windows_wsl() -> Dict[str, Any]:
-    """列出发行版，只检查已运行发行版的用户目录和可执行路径。"""
+    """只检查已运行发行版，避免只读探测启动已停止的 WSL 环境。"""
     result: Dict[str, Any] = {"status": "unknown", "installed_distros": [], "running_distros": [], "apps": {}}
     wsl = shutil.which("wsl.exe")
     if not wsl:
@@ -592,7 +773,7 @@ def _probe_windows_wsl() -> Dict[str, Any]:
                     )
             if any(not any(item["distro"] == distro for item in result["apps"].get(name, [])) for name in ("agy", "codex")):
                 complete = False
-        except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        except (OSError, ValueError, subprocess.SubprocessError):
             complete = False
     result["status"] = "checked" if complete else "unknown"
     return result
@@ -688,10 +869,6 @@ def detect_installed_apps() -> Dict[str, Any]:
     }
 
 
-HOOK_PYTHON_FLAGS = ["-X", "utf8", "-I", "-B"]
-LEGACY_PYTHON_FLAGS = ([], ["-B"], ["-I", "-B"], HOOK_PYTHON_FLAGS)
-
-
 def _hook_python_candidates() -> List[Tuple[str, str, List[str]]]:
     """从安装器自己的 PATH 和当前解释器发现候选，不读取钩子注册表。"""
     candidates: List[Tuple[str, str, List[str]]] = []
@@ -725,7 +902,7 @@ def _is_working_python_cmd(executable: str, launcher_args: List[str]) -> bool:
             timeout=5,
         )
         return proc.returncode == 0
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return False
 
 
@@ -747,9 +924,9 @@ def detect_hook_python_command(*, antigravity: bool = False) -> str:
 def detect_zotero_mcp_executable(explicit_cmd: str = "") -> Optional[str]:
     """动态探测本机是否存在可用的 zotero-mcp 可执行文件（零个人路径硬编码）。"""
     if explicit_cmd:
-        p = Path(os.path.expanduser(explicit_cmd))
-        if p.exists() and p.is_file():
-            return str(p.resolve())
+        explicit_path = Path(explicit_cmd).expanduser()
+        if explicit_path.is_file():
+            return str(explicit_path.resolve())
         found = shutil.which(explicit_cmd)
         if found:
             return found
@@ -764,14 +941,13 @@ def detect_zotero_mcp_executable(explicit_cmd: str = "") -> Optional[str]:
 
     # 1. 扫描 ~/.local/share/codex-tools/zotero-mcp-* 虚拟环境
     codex_tools_dir = home / ".local" / "share" / "codex-tools"
-    if codex_tools_dir.exists() and codex_tools_dir.is_dir():
-        venv_dirs = sorted(codex_tools_dir.glob("zotero-mcp*"), reverse=True)
-        for vd in venv_dirs:
-            for sub in ("Scripts", "bin"):
-                for ename in exe_names:
-                    cand = vd / ".venv" / sub / ename
-                    if cand.exists() and cand.is_file():
-                        return str(cand.resolve())
+    candidates: List[Path] = []
+    try:
+        for venv_dir in sorted(codex_tools_dir.glob("zotero-mcp*"), reverse=True):
+            candidates.extend(venv_dir / ".venv" / subdir / name
+                              for subdir in ("Scripts", "bin") for name in exe_names)
+    except OSError:
+        pass
 
     # 2. 扫描常见 pipx / uv / user local bin 路径
     common_bins = [
@@ -779,26 +955,151 @@ def detect_zotero_mcp_executable(explicit_cmd: str = "") -> Optional[str]:
         home / "pipx" / "venvs" / "zotero-mcp" / ("Scripts" if os.name == "nt" else "bin"),
         home / ".local" / "pipx" / "venvs" / "zotero-mcp" / ("Scripts" if os.name == "nt" else "bin"),
     ]
-    for bdir in common_bins:
-        for ename in exe_names:
-            cand = bdir / ename
-            if cand.exists() and cand.is_file():
-                return str(cand.resolve())
+    candidates.extend(directory / name for directory in common_bins for name in exe_names)
+    found = _first_executable(candidates, windows=os.name == "nt")
+    if found:
+        return str(Path(found).resolve())
 
     # 3. 兼容从本机 ~/.codex/config.toml 中读取已验证存在的 zotero 路径
-    codex_cfg = home / ".codex" / "config.toml"
+    configured_home = os.environ.get("CODEX_HOME", "").strip()
+    codex_root = Path(configured_home).expanduser() if configured_home else home / ".codex"
+    codex_cfg = codex_root / "config.toml"
     if codex_cfg.is_file():
         try:
-            cfg = _parse_toml(codex_cfg.read_bytes().decode("utf-8"), codex_cfg)
+            cfg = _parse_toml(codex_cfg.read_bytes().decode("utf-8-sig"), codex_cfg)
             command = cfg.get("mcp_servers", {}).get("zotero", {}).get("command")
             if isinstance(command, str):
                 candidate = Path(command).expanduser()
-                if candidate.is_absolute() and candidate.is_file():
+                if candidate.is_absolute() and _first_executable([candidate], windows=os.name == "nt"):
                     return str(candidate.resolve())
-        except (AttributeError, OSError, ValueError):
+        except (AttributeError, OSError, ValueError, RuntimeError):
             pass
 
     return None
+
+
+# 四、反重力插件镜像、MCP 与默认模型同步
+
+
+def should_ignore_template_item(path: Path) -> bool:
+    return any(part in IGNORED_NAMES for part in path.parts) or path.suffix.lower() in IGNORED_SUFFIXES
+
+
+def _template_files(template_dir: Path) -> List[Path]:
+    return [
+        item for item in sorted(template_dir.rglob("*"))
+        if not should_ignore_template_item(item.relative_to(template_dir)) and item.is_file()
+    ]
+
+
+def _validate_mirror(template_dir: Path, target_dir: Path) -> None:
+    """写入和清理共用一次完整校验，拒绝目录重叠及源、目标树中的链接。"""
+    _validate_path(template_dir, directory=True)
+    if not template_dir.is_dir():
+        raise ValueError(f"找不到安装模板目录 {template_dir}")
+    _validate_path(target_dir, directory=True)
+    source, target = template_dir.resolve(), target_dir.resolve()
+    if source == target or source in target.parents or target in source.parents:
+        raise ValueError(f"安装目标与模板目录重叠: {target_dir}")
+    _validate_tree_links(template_dir)
+    _validate_tree_links(target_dir)
+    for item in _template_files(template_dir):
+        _validate_path(target_dir / item.relative_to(template_dir), directory=False)
+
+
+def mirror_sync_plugin(
+    template_dir: Path, target_plugin_dir: Path, dry_run: bool = False, *, hooks_bytes: Optional[bytes] = None,
+) -> None:
+    """
+    将 template_dir 镜像同步至 target_plugin_dir，并精准清理陈旧废弃文件与 __pycache__。
+    保留运行态历史归档（如 hooks/state/*_user_words.md 与 hooks/logs/lifecycle.log），但清除废弃 *_stop_gate.json。
+    """
+    _validate_mirror(template_dir, target_plugin_dir)
+    files = _template_files(template_dir)
+    expected_rel_files = {item.relative_to(template_dir) for item in files}
+    pending_updates: List[Tuple[Path, FileChange]] = []
+    for src in files:
+        rel = src.relative_to(template_dir)
+        dst = target_plugin_dir / rel
+        original = _read_optional_bytes(dst)
+        content = hooks_bytes if hooks_bytes is not None and rel == Path("hooks.json") else src.read_bytes()
+        if original != content:
+            pending_updates.append((src, FileChange(dst, original, content)))
+
+    if dry_run:
+        if pending_updates:
+            print(f"[Dry-Run] 将同步 {len(pending_updates)} 个变更文件至: {target_plugin_dir}")
+            for source, change in pending_updates:
+                print(f"  [SYNC] {change.path.relative_to(target_plugin_dir)}")
+        else:
+            print(f"[*] 目录已是最新状态，无需写入: {target_plugin_dir}")
+    else:
+        target_plugin_dir.mkdir(parents=True, exist_ok=True)
+        for source, change in pending_updates:
+            _atomic_write(change)
+            if change.original is None:
+                change.path.chmod(stat.S_IMODE(source.stat().st_mode))
+
+    if not target_plugin_dir.exists():
+        return
+
+    stale_files: List[Path] = []
+    stale_dirs: List[Path] = []
+
+    for existing in sorted(target_plugin_dir.rglob("*")):
+        rel = existing.relative_to(target_plugin_dir)
+        if existing.is_dir():
+            if existing.name == "__pycache__" and not any(parent.name == "__pycache__" for parent in rel.parents):
+                stale_dirs.append(existing)
+            continue
+
+        if "__pycache__" in rel.parts:
+            continue
+
+        if len(rel.parts) >= 2 and rel.parts[0] == "hooks" and rel.parts[1] in ("state", "logs"):
+            if existing.name == ".gitkeep" or existing.name.endswith("_stop_gate.json"):
+                stale_files.append(existing)
+            continue
+
+        if rel not in expected_rel_files:
+            stale_files.append(existing)
+
+    for stale_file in stale_files:
+        rel = stale_file.relative_to(target_plugin_dir)
+        if dry_run:
+            print(f"  [Dry-Run CLEAN] 将清理过时文件: {rel}")
+        else:
+            _validate_path(stale_file, directory=False)
+            stale_file.unlink(missing_ok=True)
+            print(f"  [-] 已清理过时残留文件: {rel}")
+
+    for stale_dir in stale_dirs:
+        rel = stale_dir.relative_to(target_plugin_dir)
+        if dry_run:
+            print(f"  [Dry-Run CLEAN] 将清理缓存目录: {rel}")
+        else:
+            _validate_path(stale_dir, directory=True)
+            _validate_tree_links(stale_dir)
+            shutil.rmtree(stale_dir)
+            print(f"  [-] 已清理字节码缓存目录: {rel}")
+
+
+def _plan_user_zotero(config_root: Path, zotero_exe: Optional[str]) -> Optional[FileChange]:
+    """仅补齐缺失的 Zotero 条目，已有远程或本地连接沿用用户配置。"""
+    path = config_root / "mcp_config.json"
+    _validate_path(path, directory=False)
+    if not zotero_exe:
+        return None
+    raw = _read_optional_bytes(path)
+    data = _read_json_object(path, raw)
+    servers = data.setdefault("mcpServers", {})
+    if not isinstance(servers, dict) or any(not isinstance(server, dict) for server in servers.values()):
+        raise ValueError(f"{path} 的 mcpServers 及各服务器条目必须为对象，原文件已保留。")
+    if servers.get("zotero"):
+        print("[*] 保留反重力已配置的 Zotero MCP。")
+        return None
+    servers["zotero"] = {"command": zotero_exe, "args": [], "env": ZOTERO_ENV}
+    return FileChange(path, raw, _preserve_text_format(_json_bytes(data), raw))
 
 
 def _parse_agy_model_lines(output: str) -> List[Dict[str, str]]:
@@ -818,9 +1119,9 @@ def _select_agy_frontier_max_label(models: List[Dict[str, str]]) -> Optional[str
     skip_tokens = {"lite", "mini", "fast", "flash", "hydrogen", "orchestrator", "router"}
     tiered: List[Tuple[str, str, str]] = []
     for item in models:
-        m = re.match(r"^(.+)-(minimal|low|medium|high|xhigh|max|ultra)$", item["slug"].lower())
-        if m and m.group(2) != "ultra":
-            tiered.append((m.group(1), m.group(2), item["display_name"]))
+        match = re.match(r"^(.+)-(minimal|low|medium|high|xhigh|max|ultra)$", item["slug"].lower())
+        if match and match.group(2) != "ultra":
+            tiered.append((match.group(1), match.group(2), item["display_name"]))
     if not tiered:
         return next(
             (item["display_name"] for item in models if not item["slug"].lower().endswith("-ultra")),
@@ -835,9 +1136,115 @@ def _select_agy_frontier_max_label(models: List[Dict[str, str]]) -> Optional[str
     return variants[best_tier]
 
 
+def _plan_agy_model(
+    gemini_root: Path, *, dry_run: bool, overwrite: bool,
+) -> List[FileChange]:
+    """保留现有模型。预演仅读取本侧缓存，正式安装才查询原生 CLI。"""
+    cli_dir = gemini_root / "antigravity-cli"
+    settings_path = cli_dir / "settings.json"
+    desktop_path = gemini_root / "config" / "config.json"
+    cache_path = cli_dir / "cache" / "cae_models_cache.json"
+    _validate_path(settings_path, directory=False)
+    settings_raw = _read_optional_bytes(settings_path)
+    settings = _read_json_object(settings_path, settings_raw)
+    current = settings.get("model")
+    if not overwrite and not (isinstance(current, str) and current.strip()):
+        _validate_path(desktop_path, directory=False)
+        desktop = _read_json_object(desktop_path, _read_optional_bytes(desktop_path))
+        user_settings = desktop.get("userSettings", {})
+        if not isinstance(user_settings, dict):
+            raise ValueError(f"{desktop_path} 的 userSettings 必须为对象")
+        current = user_settings.get("model")
+    if isinstance(current, str) and current.strip() and not overwrite:
+        print("[*] 保留 Antigravity 已配置的默认模型。")
+        return []
+
+    _validate_path(cache_path, directory=False)
+    cache_raw = _read_optional_bytes(cache_path)
+    models: List[Dict[str, str]] = []
+    changes = []
+    agy_bin = None if dry_run else _native_cli("agy", gemini_root.parent)
+    if agy_bin:
+        try:
+            proc = subprocess.run(
+                [agy_bin, "models"], capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=6,
+            )
+            if proc.returncode == 0:
+                models = _parse_agy_model_lines(proc.stdout)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    if models:
+        snapshot = {
+            "source": "agy_models_cli",
+            "fetched_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "models": models,
+        }
+        changes.append(FileChange(cache_path, cache_raw, _preserve_text_format(_json_bytes(snapshot), cache_raw)))
+    elif cache_raw is not None:
+        try:
+            cache = _read_json_object(cache_path, cache_raw)
+            if cache.get("source") in (None, "agy_models_cli"):
+                models = [item for item in cache.get("models", [])
+                          if isinstance(item, dict) and isinstance(item.get("slug"), str)
+                          and isinstance(item.get("display_name"), str) and item["slug"] and item["display_name"]]
+        except (TypeError, ValueError):
+            print(f"[*] 无法读取模型目录 {cache_path}，保留原文件。")
+    label = _select_agy_frontier_max_label(models)
+    if not label:
+        suffix = "。预演不会查询 CLI，正式安装可尝试读取本侧模型目录。" if dry_run else "，保留原配置。"
+        print("[*] 未取得 Antigravity 的可用模型目录" + suffix)
+    elif settings.get("model") != label:
+        settings["model"] = label
+        changes.append(FileChange(settings_path, settings_raw, _preserve_text_format(_json_bytes(settings), settings_raw)))
+    return changes
+
+
+def configure_agy_frontier_max_default(
+    gemini_root: Path, dry_run: bool = False, *, overwrite: bool = False,
+) -> None:
+    """把已校验的模型变更逐文件原子落盘，预演只输出计划。"""
+    for change in _plan_agy_model(gemini_root, dry_run=dry_run, overwrite=overwrite):
+        _apply_file_change(change, dry_run)
+
+
+def _agy_hooks_bytes(source: bytes, py_cmd: str) -> bytes:
+    """以模板为输入生成目标平台命令，使重装比较最终内容。"""
+    hooks_data = _read_json_object(Path("hooks.json"), source)
+    lifecycle = hooks_data["user-guard-lifecycle"]
+    for event, groups in lifecycle.items():
+        for group in groups:
+            for hook in group.get("hooks", [group]):
+                command = hook["command"]
+                prefix, separator, script = command.partition(" ./hooks/")
+                if not separator or prefix != "python3 -X utf8 -I -B":
+                    raise ValueError(f"反重力钩子模板的 {event} 命令格式有误")
+                hook["command"] = py_cmd + separator + script
+    return _json_bytes(hooks_data)
+
+
+# 五、Codex 规则、只读子代理、钩子与沙箱配置同步
+
+
+def codex_skill_target(skills_dir: str, plugin_target_explicit: bool, disabled: bool) -> Optional[Path]:
+    """显式插件目标仅配合显式技能目标，避免隔离安装触及真实用户目录。"""
+    if disabled:
+        return None
+    if skills_dir:
+        return Path(skills_dir).expanduser().absolute() / "cae-harness"
+    if plugin_target_explicit:
+        return None
+    configured_home = os.environ.get("CODEX_HOME", "").strip()
+    codex_root = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
+    if not codex_root.is_dir():
+        return None
+    return codex_root.absolute() / "skills" / "cae-harness"
+
+
 def _apply_codex_frontier_max(
     editor: "CodexConfig", cache_path: Path, *, overwrite: bool,
 ) -> None:
+    """按本机模型目录补齐缺项，显式覆盖时才更新已有模型及挡位。"""
     keys = ("model", "model_reasoning_effort")
     values = {key: editor.data[key] for key in keys if key in editor.data}
     if any(not isinstance(value, str) for value in values.values()):
@@ -850,9 +1257,12 @@ def _apply_codex_frontier_max(
         return
 
     try:
-        cache = json.loads(cache_path.read_text(encoding="utf-8-sig"))
-        models = [m for m in cache["models"] if isinstance(m, dict) and isinstance(m.get("slug"), str) and m["slug"]]
-    except (OSError, ValueError, KeyError, TypeError):
+        cache = _read_json_object(cache_path, cache_path.read_bytes())
+        if not isinstance(cache.get("models"), list):
+            raise ValueError("模型目录的 models 必须是列表")
+        models = [model for model in cache["models"]
+                  if isinstance(model, dict) and isinstance(model.get("slug"), str) and model["slug"]]
+    except (OSError, ValueError):
         print(f"[*] 未读取到有效的 Codex 模型目录 {cache_path}，默认模型设置保持原样。")
         return
 
@@ -863,14 +1273,14 @@ def _apply_codex_frontier_max(
         return [level for level in raw_levels if isinstance(level, dict) and level.get("effort") in EFFORT_ORDER]
 
     if cur_model and not overwrite:
-        selected = next((m for m in models if m["slug"] == cur_model), None)
+        selected = next((model for model in models if model["slug"] == cur_model), None)
     else:
-        visible = [m for m in models if m.get("visibility") != "hide"] or models
+        visible = [model for model in models if model.get("visibility") != "hide"] or models
         if cur_effort and not overwrite:
-            visible = [m for m in visible if any(level["effort"] == cur_effort for level in supported_levels(m))]
+            visible = [model for model in visible if any(level["effort"] == cur_effort for level in supported_levels(model))]
         selected = min(
             visible,
-            key=lambda m: m["priority"] if type(m.get("priority")) is int else 9999,
+            key=lambda model: model["priority"] if type(model.get("priority")) is int else 9999,
             default=None,
         )
     if selected is None:
@@ -904,6 +1314,7 @@ def _apply_codex_workspace_boundary(editor: "CodexConfig") -> None:
 
 
 def _apply_codex_baseline(editor: "CodexConfig", include_sandbox: bool) -> None:
+    """补齐工程配置基线，沿用用户已明确设置的开关。"""
     editor.add_defaults((), {"model_reasoning_summary": '"auto"'})
     editor.add_defaults(("features",), {"memories": "false", "chronicle": "false"})
     editor.add_defaults(("memories",), {
@@ -931,6 +1342,7 @@ def _plan_codex_config(
     codex_root: Path, *, include_sandbox: bool, include_model: bool,
     overwrite_model: bool, zotero_exe: Optional[str],
 ) -> Optional["FileChange"]:
+    """先在内存中合并 TOML 并校验，双端安装可在写入前统一报错。"""
     editor = CodexConfig(codex_root / "config.toml")
     _apply_codex_baseline(editor, include_sandbox)
     if zotero_exe:
@@ -956,28 +1368,30 @@ def _sync_codex_workspace_boundary(codex_root: Path, dry_run: bool = False) -> N
 
 
 def _sync_codex_global_rules(template_rules_path: Path, codex_root: Path, dry_run: bool = False) -> None:
-    """将模板 R0-R9 全局核心总纲同步至 <codex_root>/AGENTS.md；若用户自定义了『## 工具与本机』等非默认尾段则原样保留。"""
+    """更新工程规则，保留末尾自定义『## 工具与本机』段的原文及换行。"""
     if not template_rules_path.is_file():
         return
-    try:
-        template_text = template_rules_path.read_text(encoding="utf-8").replace("\r\n", "\n")
-    except Exception:
-        return
+    template_text = _decode_utf8(template_rules_path, template_rules_path.read_bytes()).replace("\r\n", "\n")
 
-    env_sec_re = re.compile(r"(?:^|\n)(##\s+工具与([^\r\n]*)[\s\S]*)$")
-    m_tpl_env = env_sec_re.search(template_text)
-    template_core = template_text[: m_tpl_env.start()].rstrip() if m_tpl_env else template_text.rstrip()
+    env_sec_re = re.compile(r"^##[ \t]+工具与([^\r\n]*)[^\S\n]*(?:\r?\n|$)", re.MULTILINE)
+    template_env = env_sec_re.search(template_text)
+    template_core = template_text[:template_env.start()].rstrip() if template_env else template_text.rstrip()
 
     codex_agents = codex_root / "AGENTS.md"
     original = _read_optional_bytes(codex_agents)
-    existing = (original or b"").decode("utf-8").replace("\r\n", "\n")
+    existing = _decode_utf8(codex_agents, original or b"")
 
-    m_usr_env = env_sec_re.search(existing) if existing else None
-    has_custom_env = bool(m_usr_env and m_usr_env.group(2).strip() != "运行环境")
-    if has_custom_env and m_usr_env is not None:
-        merged = (template_core + "\n\n" + m_usr_env.group(1).strip() + "\n") if template_core else (m_usr_env.group(1).strip() + "\n")
+    user_env = env_sec_re.search(existing)
+    has_custom_env = bool(user_env and user_env.group(1).strip() != "运行环境")
+    newline = "\r\n" if "\r\n" in existing else "\n"
+    if has_custom_env and user_env is not None:
+        custom_tail = existing[user_env.start():]
+        # 旧版安装器为尾段补一个末尾换行，继续兼容这一输出约定。
+        if not custom_tail.endswith("\n"):
+            custom_tail += newline
+        merged = (template_core.replace("\n", newline) + newline * 2 if template_core else "") + custom_tail
     else:
-        merged = template_text.rstrip() + "\n"
+        merged = (template_text.rstrip() + "\n").replace("\n", newline)
 
     if existing == merged:
         print("[*] Codex 全局规则 AGENTS.md 已是最新状态。")
@@ -987,7 +1401,8 @@ def _sync_codex_global_rules(template_rules_path: Path, codex_root: Path, dry_ru
         print(f"[Dry-Run] 将同步更新 {codex_agents} 全局规则")
         return
 
-    _atomic_write(FileChange(codex_agents, original, merged.encode("utf-8")))
+    content = (UTF8_BOM if (original or b"").startswith(UTF8_BOM) else b"") + merged.encode("utf-8")
+    _atomic_write(FileChange(codex_agents, original, content))
     print(f"[+] 已同步更新 Codex 全局规则 {codex_agents}")
 
 
@@ -1016,13 +1431,16 @@ def _sync_codex_agents(codex_template_dir: Path, codex_root: Path, dry_run: bool
         print(f"[+] 已同步 Codex 只读子代理至 {dst_agents_dir}: {', '.join(updated_names)}")
 
 
-def _reject_duplicate_json_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    result: Dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"JSON 键重复: {key}")
-        result[key] = value
-    return result
+class ManagedCodexHook(NamedTuple):
+    kind: str
+    interpreter: Optional[Tuple[str, List[str]]]
+    policy: Optional[Tuple[str, int]] = None
+
+
+class CodexHooksPlan(NamedTuple):
+    change: Optional[FileChange]
+    mode: str
+    compact_limit: int
 
 
 def _codex_hook_tokens(handler: Dict[str, Any]) -> List[str]:
@@ -1033,12 +1451,6 @@ def _codex_hook_tokens(handler: Dict[str, Any]) -> List[str]:
         return [token.strip('"') for token in tokens] if os.name == "nt" else tokens
     except ValueError:
         return []
-
-
-class ManagedCodexHook(NamedTuple):
-    kind: str
-    interpreter: Optional[Tuple[str, List[str]]]
-    policy: Optional[Tuple[str, int]] = None
 
 
 def _codex_managed_hook(
@@ -1104,9 +1516,6 @@ def _codex_managed_hook(
     return None
 
 
-HANDOFF_MARKER = re.compile(r"\[user-guard codex-handoff v1 mode=(advisory|enforce|off) compact_limit=([0-9]+)\]")
-
-
 def _codex_handoff_policy(
     doc: Dict[str, Any], policies: Set[Tuple[str, int]], requested_mode: Optional[str],
     requested_limit: Optional[int],
@@ -1117,7 +1526,7 @@ def _codex_handoff_policy(
     markers = [(index, line) for index, line in enumerate(description.split("\n"))
                if line.startswith("[user-guard codex-handoff")]
     if markers:
-        match = HANDOFF_MARKER.fullmatch(markers[0][1])
+        match = HANDOFF_MARKER.fullmatch(markers[0][1].removesuffix("\r"))
         if len(markers) != 1 or match is None:
             raise ValueError("Codex 钩子 description 中的交接配置标记无效或重复")
         policies.add((match[1], int(match[2])))
@@ -1131,10 +1540,13 @@ def _codex_handoff_policy(
     marker = f"[user-guard codex-handoff v1 mode={mode} compact_limit={limit}]"
     if markers:
         lines = description.split("\n")
-        lines[markers[0][0]] = marker
+        ending = "\r" if markers[0][1].endswith("\r") else ""
+        lines[markers[0][0]] = marker + ending
         doc["description"] = "\n".join(lines)
     else:
-        doc["description"] = description + ("\n" if description and not description.endswith("\n") else "") + marker
+        newline = "\r\n" if "\r\n" in description else "\n"
+        separator = newline if description and not description.endswith("\n") else ""
+        doc["description"] = description + separator + marker
     return mode, limit
 
 
@@ -1147,16 +1559,11 @@ def _read_codex_hooks(path: Path, raw: Optional[bytes]) -> Dict[str, Any]:
     return doc
 
 
-class CodexHooksPlan(NamedTuple):
-    change: Optional[FileChange]
-    mode: str
-    compact_limit: int
-
-
 def _plan_codex_hooks(
     hooks_path: Path, template_path: Path, py_cmd: str,
     mode: Optional[str] = None, compact_limit: Optional[int] = None,
 ) -> CodexHooksPlan:
+    """逐条识别本项目钩子并合并，保留用户 handler、信任信息及交接策略。"""
     _validate_path(hooks_path, directory=False)
     codex_root = hooks_path.parent.resolve()
     original = _read_optional_bytes(hooks_path)
@@ -1254,11 +1661,18 @@ def _plan_codex_hooks(
             else:
                 events.pop(event, None)
     try:
-        content = _json_bytes(doc)
+        content = _preserve_text_format(_json_bytes(doc), original)
     except (ValueError, RecursionError) as exc:
         raise ValueError(f"无法安全合并 {hooks_path}，钩子注册表不能写成有效的 UTF-8 JSON: {exc}") from exc
     change = FileChange(hooks_path, original, content) if doc != initial else None
     return CodexHooksPlan(change, mode, compact_limit)
+
+
+def _codex_hook_script_names(mode: str) -> List[str]:
+    names = ["session_context_loader.py", "user_words.py"]
+    if mode != "off":
+        names.append("handoff_gate.py")
+    return names
 
 
 def _sync_codex_hooks(
@@ -1288,11 +1702,13 @@ def _sync_codex_hooks(
             _atomic_write(FileChange(dst_file, original, src_bytes))
 
     pycache_dir = dst_hooks_dir / "__pycache__"
-    if pycache_dir.is_dir() and not _is_link_or_junction(pycache_dir):
+    _validate_path(pycache_dir, directory=True)
+    _validate_tree_links(pycache_dir)
+    if pycache_dir.is_dir():
         if dry_run:
             print(f"  [Dry-Run CLEAN] 将清理 Codex 钩子字节码缓存: {pycache_dir}")
         else:
-            shutil.rmtree(pycache_dir, ignore_errors=True)
+            shutil.rmtree(pycache_dir)
 
     if scripts_updated:
         action = "将同步" if dry_run else "已同步"
@@ -1308,326 +1724,39 @@ def _sync_codex_hooks(
         print(f"[+] 已合并 Codex 钩子注册表 {hooks_path}（交接模式 {mode}，压缩次数阈值 {compact_limit}）")
 
 
-def _plan_agy_model(
-    gemini_root: Path, *, dry_run: bool, overwrite: bool,
-) -> List[FileChange]:
-    """优先保留现有模型。预演仅使用已有的本侧目录。"""
-    cli_dir = gemini_root / "antigravity-cli"
-    settings_path = cli_dir / "settings.json"
-    desktop_path = gemini_root / "config" / "config.json"
-    cache_path = cli_dir / "cache" / "cae_models_cache.json"
-    _validate_path(settings_path, directory=False)
-    settings_raw = _read_optional_bytes(settings_path)
-    settings = _read_json_object(settings_path, settings_raw)
-    current = settings.get("model")
-    if not overwrite and not (isinstance(current, str) and current.strip()):
-        _validate_path(desktop_path, directory=False)
-        desktop = _read_json_object(desktop_path, _read_optional_bytes(desktop_path))
-        user_settings = desktop.get("userSettings", {})
-        if not isinstance(user_settings, dict):
-            raise ValueError(f"{desktop_path} 的 userSettings 必须为对象")
-        current = user_settings.get("model")
-    if isinstance(current, str) and current.strip() and not overwrite:
-        print("[*] 保留 Antigravity 已配置的默认模型。")
-        return []
-
-    _validate_path(cache_path, directory=False)
-    cache_raw = _read_optional_bytes(cache_path)
-    models: List[Dict[str, str]] = []
-    changes = []
-    agy_bin = None if dry_run else _native_cli("agy", gemini_root.parent)
-    if agy_bin:
-        try:
-            proc = subprocess.run(
-                [agy_bin, "models"], capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=6,
-            )
-            if proc.returncode == 0:
-                models = _parse_agy_model_lines(proc.stdout)
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            pass
-    if models:
-        snapshot = {
-            "source": "agy_models_cli",
-            "fetched_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "models": models,
-        }
-        changes.append(FileChange(cache_path, cache_raw, _json_bytes(snapshot)))
-    elif cache_raw is not None:
-        try:
-            cache = _read_json_object(cache_path, cache_raw)
-            if cache.get("source") in (None, "agy_models_cli"):
-                models = [item for item in cache.get("models", [])
-                          if isinstance(item, dict) and isinstance(item.get("slug"), str)
-                          and isinstance(item.get("display_name"), str) and item["slug"] and item["display_name"]]
-        except (TypeError, ValueError):
-            print(f"[*] 无法读取模型目录 {cache_path}，保留原文件。")
-    label = _select_agy_frontier_max_label(models)
-    if not label:
-        suffix = "。预演不会查询 CLI，正式安装可尝试读取本侧模型目录。" if dry_run else "，保留原配置。"
-        print("[*] 未取得 Antigravity 的可用模型目录" + suffix)
-    elif settings.get("model") != label:
-        settings["model"] = label
-        changes.append(FileChange(settings_path, settings_raw, _json_bytes(settings)))
-    return changes
-
-
-def configure_agy_frontier_max_default(
-    gemini_root: Path, dry_run: bool = False, *, overwrite: bool = False,
-) -> None:
-    for change in _plan_agy_model(gemini_root, dry_run=dry_run, overwrite=overwrite):
-        _apply_file_change(change, dry_run)
-
-
-def _agy_hooks_bytes(source: bytes, py_cmd: str) -> bytes:
-    """以模板为输入生成目标平台命令，使重装比较最终内容。"""
-    hooks_data = json.loads(source.decode("utf-8"))
-    lifecycle = hooks_data["user-guard-lifecycle"]
-    for event, groups in lifecycle.items():
-        for group in groups:
-            for hook in group.get("hooks", [group]):
-                command = hook["command"]
-                prefix, separator, script = command.partition(" ./hooks/")
-                if not separator or prefix != "python3 -X utf8 -I -B":
-                    raise ValueError(f"反重力钩子模板的 {event} 命令格式有误")
-                hook["command"] = py_cmd + separator + script
-    return _json_bytes(hooks_data)
-
-
-def should_ignore_template_item(path: Path) -> bool:
-    if any(part in IGNORED_NAMES for part in path.parts):
-        return True
-    if path.suffix.lower() in IGNORED_SUFFIXES:
-        return True
-    return False
-
-
-def _template_files(template_dir: Path) -> List[Path]:
-    return [
-        item for item in sorted(template_dir.rglob("*"))
-        if not should_ignore_template_item(item.relative_to(template_dir)) and item.is_file()
-    ]
-
-
-def _validate_mirror(template_dir: Path, target_dir: Path) -> None:
-    _validate_path(target_dir, directory=True)
-    for item in _template_files(template_dir):
-        _validate_path(target_dir / item.relative_to(template_dir), directory=False)
-
-
-def mirror_sync_plugin(
-    template_dir: Path, target_plugin_dir: Path, dry_run: bool = False, *, hooks_bytes: Optional[bytes] = None,
-) -> None:
-    """
-    将 template_dir 镜像同步至 target_plugin_dir，并精准清理陈旧废弃文件与 __pycache__。
-    保留运行态历史归档（如 hooks/state/*_user_words.md 与 hooks/logs/lifecycle.log），但清除废弃 *_stop_gate.json。
-    """
-    files = _template_files(template_dir)
-    expected_rel_files = {item.relative_to(template_dir) for item in files}
-    pending_updates: List[Tuple[Path, Path, Optional[bytes], bytes]] = []
-    for src in files:
-        rel = src.relative_to(template_dir)
-        dst = target_plugin_dir / rel
-        original = _read_optional_bytes(dst)
-        content = hooks_bytes if hooks_bytes is not None and rel == Path("hooks.json") else src.read_bytes()
-        if original != content:
-            pending_updates.append((src, rel, original, content))
-
-    if dry_run:
-        if pending_updates:
-            print(f"[Dry-Run] 将同步 {len(pending_updates)} 个变更文件至: {target_plugin_dir}")
-            for _src, rel, _orig, _content in pending_updates:
-                print(f"  [SYNC] {rel}")
-        else:
-            print(f"[*] 目录已是最新状态，无需写入: {target_plugin_dir}")
-    else:
-        target_plugin_dir.mkdir(parents=True, exist_ok=True)
-        for src, rel, original, content in pending_updates:
-            dst = target_plugin_dir / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write(FileChange(dst, original, content))
-            if original is None:
-                dst.chmod(stat.S_IMODE(src.stat().st_mode))
-
-    if not target_plugin_dir.exists():
-        return
-
-    stale_files: List[Path] = []
-    stale_dirs: List[Path] = []
-
-    for existing in sorted(target_plugin_dir.rglob("*")):
-        rel = existing.relative_to(target_plugin_dir)
-        if existing.is_dir():
-            if existing.name == "__pycache__":
-                stale_dirs.append(existing)
-            continue
-
-        if "__pycache__" in rel.parts:
-            continue
-
-        if len(rel.parts) >= 2 and rel.parts[0] == "hooks" and rel.parts[1] in ("state", "logs"):
-            if existing.name == ".gitkeep" or existing.name.endswith("_stop_gate.json"):
-                stale_files.append(existing)
-            continue
-
-        if rel not in expected_rel_files:
-            stale_files.append(existing)
-
-    for sf in stale_files:
-        rel = sf.relative_to(target_plugin_dir)
-        if dry_run:
-            print(f"  [Dry-Run CLEAN] 将清理过时文件: {rel}")
-        else:
-            sf.unlink(missing_ok=True)
-            print(f"  [-] 已清理过时残留文件: {rel}")
-
-    for sd in stale_dirs:
-        rel = sd.relative_to(target_plugin_dir)
-        if dry_run:
-            print(f"  [Dry-Run CLEAN] 将清理缓存目录: {rel}")
-        else:
-            shutil.rmtree(sd, ignore_errors=True)
-            print(f"  [-] 已清理字节码缓存目录: {rel}")
-
-
-def codex_skill_target(skills_dir: str, plugin_target_explicit: bool, disabled: bool) -> Optional[Path]:
-    """显式插件目标仅配合显式技能目标，避免隔离安装触及真实用户目录。"""
-    if disabled:
-        return None
-    if skills_dir:
-        return Path(skills_dir).expanduser().absolute() / "cae-harness"
-    if plugin_target_explicit:
-        return None
-    configured_home = os.environ.get("CODEX_HOME", "").strip()
-    codex_root = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
-    if not codex_root.is_dir():
-        return None
-    return codex_root.absolute() / "skills" / "cae-harness"
-
-
-def _is_link_or_junction(path: Path) -> bool:
-    if path.is_symlink():
-        return True
-    try:
-        attributes = getattr(path.lstat(), "st_file_attributes", 0)
-    except FileNotFoundError:
-        return False
-    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
-
-
-def _validate_path(path: Path, *, directory: bool) -> Path:
-    path = path.expanduser().absolute()
-    if ".." in path.parts:
-        raise ValueError(f"安装路径不能包含未解析的上级目录: {path}")
-    for ancestor in (*reversed(path.parents), path):
-        if os.name == "nt" and ancestor.name.endswith((".", " ")):
-            raise ValueError(f"Windows 安装路径不能包含以空格或点结尾的名称: {ancestor}")
-        if _is_link_or_junction(ancestor):
-            if ancestor == path:
-                raise ValueError(f"安装目标是链接或目录联接，请指定真实路径: {ancestor}")
-            raise ValueError(f"安装路径含祖先链接或目录联接，请指定真实路径: {ancestor}")
-        try:
-            metadata = ancestor.lstat()
-        except FileNotFoundError:
-            continue
-        want_directory = ancestor != path or directory
-        if want_directory and not stat.S_ISDIR(metadata.st_mode):
-            raise ValueError(f"安装目标或其祖先必须为目录: {ancestor}")
-        if not want_directory and not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(f"安装目标必须为普通文件: {ancestor}")
-        if not want_directory and metadata.st_nlink > 1:
-            raise ValueError(f"安装目标存在硬链接，请指定独立文件: {ancestor}")
-    return path
-
-
-def validate_install_target(target: Path, repo_root: Path) -> Path:
-    """在镜像同步前核实绝对目标，拒绝源树、用户根目录和危险链接。"""
-    resolved = _validate_path(target, directory=True).resolve()
-    repo_root = repo_root.resolve()
-    user_home = Path.home()
-    user_root = user_home.resolve()
-    protected = {
-        user_root,
-        user_root / ".gemini",
-        user_root / ".gemini" / "config",
-        user_root / ".gemini" / "config" / "plugins",
-        user_root / ".codex",
-        user_root / ".codex" / "skills",
-    }
-    configured_home = os.environ.get("CODEX_HOME", "").strip()
-    if configured_home:
-        codex_home = Path(configured_home).expanduser()
-        codex_root = codex_home.resolve()
-        protected.update((codex_root, codex_root / "skills"))
-    if resolved in protected or resolved in user_root.parents:
-        raise ValueError(f"安装目标不能是用户根目录或共享配置目录: {resolved}")
-    if resolved == repo_root or resolved in repo_root.parents or repo_root in resolved.parents:
-        raise ValueError(f"安装目标与源码仓库重叠: {resolved}")
-    _validate_tree_links(resolved)
-    return resolved
-
-
-def _validate_tree_links(root: Path) -> None:
-    if not root.is_dir():
-        return
-
-    def fail(error: OSError) -> None:
-        raise error
-
-    for parent, dirs, files in os.walk(root, onerror=fail, followlinks=False):
-        for name in dirs + files:
-            entry = Path(parent) / name
-            if _is_link_or_junction(entry):
-                raise ValueError(f"安装目标包含链接或目录联接，请先核对: {entry}")
-
-
-def validate_codex_home_target(codex_home: Path, repo_root: Path) -> Path:
-    """校验 Codex 主配置目录（支持真实 ~/.codex 或独立沙箱 --codex-home，拒绝源仓库重叠、用户主目录及链接重定向）"""
-    resolved = _validate_path(codex_home, directory=True).resolve()
-    repo_resolved = repo_root.resolve()
-    user_root = Path.home().resolve()
-
-    if resolved == user_root or resolved in user_root.parents:
-        raise ValueError(f"Codex 目标目录不能是用户主目录或上级系统目录: {resolved}")
-    gemini_root = user_root / ".gemini"
-    if resolved == gemini_root or gemini_root in resolved.parents:
-        raise ValueError(f"Codex 目标目录不能与反重力配置目录混用: {resolved}")
-    if resolved == repo_resolved or resolved in repo_resolved.parents or repo_resolved in resolved.parents:
-        raise ValueError(f"Codex 目标目录与源码仓库重叠: {resolved}")
-    return resolved
-
-
-def _codex_hook_script_names(mode: str) -> List[str]:
-    names = ["session_context_loader.py", "user_words.py"]
-    if mode != "off":
-        names.append("handoff_gate.py")
-    return names
-
-
 def _validate_codex_assets(
     codex_root: Path, codex_template_dir: Path, args: argparse.Namespace, hooks_plan: Optional[CodexHooksPlan],
 ) -> None:
+    """在双端任一目录写入前，检查目标路径及本次需要的全部 Codex 模板。"""
     _validate_path(codex_root / "config.toml", directory=False)
     if not args.no_codex_rules:
+        source_rules = codex_template_dir.parent / "user-guard" / "rules" / "AGENTS.md"
+        _decode_utf8(source_rules, _validate_path(source_rules, directory=False).read_bytes())
         rules = _validate_path(codex_root / "AGENTS.md", directory=False)
-        try:
-            (_read_optional_bytes(rules) or b"").decode("utf-8")
-        except UnicodeError as exc:
-            raise ValueError(f"{rules} 不是有效的 UTF-8，原文件已保留。") from exc
+        _decode_utf8(rules, _read_optional_bytes(rules) or b"")
     if not args.no_codex_agents:
+        source_agents = _validate_path(codex_template_dir / "agents", directory=True)
+        if not source_agents.is_dir():
+            raise ValueError(f"找不到 Codex 只读子代理模板目录 {source_agents}")
         _validate_path(codex_root / "agents", directory=True)
-        for source in (codex_template_dir / "agents").glob("*.toml"):
+        for source in source_agents.glob("*.toml"):
+            _decode_utf8(source, _validate_path(source, directory=False).read_bytes())
             _validate_path(codex_root / "agents" / source.name, directory=False)
     if hooks_plan is not None:
         hooks_dir = codex_root / "hooks"
         _validate_path(hooks_dir, directory=True)
         for name in _codex_hook_script_names(hooks_plan.mode):
+            source = codex_template_dir.parent / "user-guard" / "hooks" / name
+            _decode_utf8(source, _validate_path(source, directory=False).read_bytes())
             _validate_path(hooks_dir / name, directory=False)
         for rel in ("state", "state/handoff", "state/session-context", "state/user-words", "logs"):
             _validate_path(hooks_dir / rel, directory=True)
         _validate_path(hooks_dir / "logs" / "session-context.jsonl", directory=False)
         pycache = _validate_path(hooks_dir / "__pycache__", directory=True)
         _validate_tree_links(pycache)
+
+
+# 六、CLI 参数、预演与主安装流程
 
 
 def _confirm_single_app_install(
@@ -1646,10 +1775,10 @@ def _confirm_single_app_install(
         print(f"[*] 当前为非交互或自动确认模式，将仅针对已安装的 {installed_label} 生成/执行独立配置。")
         return True
     try:
-        ans = input(f"是否不安装 {missing_label}，直接单独配置本机 {installed_label} 独立工作流？[Y/n]: ").strip().lower()
+        answer = input(f"是否不安装 {missing_label}，直接单独配置本机 {installed_label} 独立工作流？[Y/n]: ").strip().lower()
     except EOFError:
         return True
-    if ans in ("n", "no", "0", "false"):
+    if answer in ("n", "no", "0", "false"):
         print(f"[*] 已按选择取消本次配置。待安装 {missing_label} 后重新运行即可一键完成双端配置。")
         return False
     return True
@@ -1721,6 +1850,7 @@ def resolve_app_plan(
 
 
 def main() -> None:
+    """先解析参数、完成双端预检，再按预演或正式安装路径执行。"""
     parser = argparse.ArgumentParser(description="Antigravity & Codex 统一工作流与双向协作安装器")
     if sys.version_info < (3, 9):
         parser.error("需要 Python 3.9 或更高版本")
@@ -1758,7 +1888,11 @@ def main() -> None:
         parser.error("--codex-handoff-compactions 必须为非负整数")
 
     if args.probe_apps:
-        print(json.dumps(detect_installed_apps(), indent=2, ensure_ascii=False))
+        try:
+            detection = detect_installed_apps()
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        print(json.dumps(detection, indent=2, ensure_ascii=False))
         return
 
     if args.no_codex_skill and args.codex_skills_dir:
@@ -1777,13 +1911,20 @@ def main() -> None:
     codex_template_dir = repo_root / "template" / "codex"
     tests_dir = repo_root / "tests"
 
-    if not template_dir.exists():
+    if not template_dir.is_dir():
         print(f"[!] 错误：找不到反重力插件模板目录 {template_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.skip_test and not args.dry_run and not tests_dir.is_dir():
+        print(f"[!] 错误：找不到测试套件目录 {tests_dir}", file=sys.stderr)
         sys.exit(1)
 
     has_explicit_ag = bool(args.target_dir)
     has_explicit_cx = bool(args.codex_home or args.codex_skills_dir)
-    detection = detect_installed_apps() if args.app == "auto" and not (has_explicit_ag or has_explicit_cx) else {}
+    try:
+        detection = detect_installed_apps() if args.app == "auto" and not (has_explicit_ag or has_explicit_cx) else {}
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     is_interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
 
     install_ag, install_cx = resolve_app_plan(
@@ -1825,7 +1966,10 @@ def main() -> None:
     is_sandbox_run = bool(args.target_dir or args.codex_home or args.codex_skills_dir)
     zotero_exe: Optional[str] = None
     if not args.no_zotero and (not is_sandbox_run or args.zotero_cmd):
-        zotero_exe = detect_zotero_mcp_executable(args.zotero_cmd)
+        try:
+            zotero_exe = detect_zotero_mcp_executable(args.zotero_cmd)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
         if args.zotero_cmd and not zotero_exe:
             parser.error(f"指定的 Zotero MCP 可执行文件不存在: {args.zotero_cmd}")
         if not zotero_exe:
@@ -1924,37 +2068,37 @@ def main() -> None:
         print(f"[*] Codex 技能路径: {target_skill_dir}")
     print("-" * 80)
 
-    # 1. 部署反重力侧
-    if target_plugin_dir is not None:
-        mirror_sync_plugin(template_dir, target_plugin_dir, dry_run=args.dry_run, hooks_bytes=agy_hooks)
-        _apply_file_change(agy_zotero_change, args.dry_run)
-        for change in agy_model_changes:
-            _apply_file_change(change, args.dry_run)
+    try:
+        # 部署反重力侧。
+        if target_plugin_dir is not None:
+            mirror_sync_plugin(template_dir, target_plugin_dir, dry_run=args.dry_run, hooks_bytes=agy_hooks)
+            _apply_file_change(agy_zotero_change, args.dry_run)
+            for change in agy_model_changes:
+                _apply_file_change(change, args.dry_run)
 
-    # 2. 部署 Codex 侧
-    if install_cx:
-        if target_skill_dir is not None:
-            mirror_sync_plugin(template_dir / "skills" / "cae-harness", target_skill_dir, dry_run=args.dry_run)
-        if full_codex_sync and codex_root is not None:
-            if not args.dry_run:
-                codex_root.mkdir(parents=True, exist_ok=True)
-            if not args.no_codex_rules:
-                _sync_codex_global_rules(template_dir / "rules" / "AGENTS.md", codex_root, dry_run=args.dry_run)
-            if not args.no_codex_agents:
-                _sync_codex_agents(codex_template_dir, codex_root, dry_run=args.dry_run)
-            if codex_hooks_plan is not None:
-                _sync_codex_hooks(template_dir / "hooks", codex_root, codex_hooks_plan, dry_run=args.dry_run)
-            _apply_file_change(codex_config_change, args.dry_run)
+        # 部署 Codex 侧。
+        if install_cx:
+            if target_skill_dir is not None:
+                mirror_sync_plugin(template_dir / "skills" / "cae-harness", target_skill_dir, dry_run=args.dry_run)
+            if full_codex_sync and codex_root is not None:
+                if not args.dry_run:
+                    codex_root.mkdir(parents=True, exist_ok=True)
+                if not args.no_codex_rules:
+                    _sync_codex_global_rules(template_dir / "rules" / "AGENTS.md", codex_root, dry_run=args.dry_run)
+                if not args.no_codex_agents:
+                    _sync_codex_agents(codex_template_dir, codex_root, dry_run=args.dry_run)
+                if codex_hooks_plan is not None:
+                    _sync_codex_hooks(template_dir / "hooks", codex_root, codex_hooks_plan, dry_run=args.dry_run)
+                _apply_file_change(codex_config_change, args.dry_run)
+    except (OSError, ValueError) as exc:
+        print(f"[!] 配置同步失败: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if args.dry_run:
         print("\n[+] Dry-Run 演练检查完成，未修改磁盘文件。")
         return
 
     if not args.skip_test:
-        if not tests_dir.exists():
-            print(f"[!] 错误：找不到测试套件目录 {tests_dir}", file=sys.stderr)
-            sys.exit(1)
-
         print("\n" + "=" * 80)
         print("  正在执行全量无字节码 (-B) 自动化测试回归...")
         print("=" * 80)
@@ -1962,6 +2106,7 @@ def main() -> None:
         env = os.environ.copy()
         env.pop("USER_GUARD_STATE_DIR", None)
         env.pop("USER_GUARD_LOGS_DIR", None)
+        env.pop("USER_GUARD_INSTALLED_CODEX_DIR", None)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["USER_GUARD_INSTALLED_DIR"] = str(target_plugin_dir if (install_ag and target_plugin_dir is not None) else template_dir)
         if install_cx and codex_root is not None:
@@ -1981,11 +2126,15 @@ def main() -> None:
             "test_*.py",
             "-v",
         ]
-        res = subprocess.run(test_cmd, env=env)
+        try:
+            result = subprocess.run(test_cmd, env=env, cwd=str(repo_root), timeout=REGRESSION_TIMEOUT_SECONDS)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(f"\n[!] 自动化回归测试执行失败: {exc}", file=sys.stderr)
+            sys.exit(1)
 
-        if res.returncode != 0:
+        if result.returncode != 0:
             print("\n[!] 自动化回归测试未全部通过，请检查上方输出日志。", file=sys.stderr)
-            sys.exit(res.returncode)
+            sys.exit(result.returncode)
 
     print("\n" + "=" * 80)
     if args.skip_test:

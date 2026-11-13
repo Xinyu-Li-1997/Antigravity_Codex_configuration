@@ -15,6 +15,8 @@ status_guard.py - 反重力 PreToolUse 项目目录硬边界、长会话交接�
    - manage_task (Action == "status") 轮询后台任务状态（自动联动 .system_generated/tasks/<TaskId>.log 真实物理指纹，有新输出自动放行，杜绝永久锁死）。
 """
 
+# ① 常量、阈值与宿主依赖
+
 import ast
 import hashlib
 import json
@@ -79,6 +81,92 @@ DENY_REASON_TEXT = (
     "请等待后台任务完成通知或先推进其他工作；文件产生新输出、或改变读取区间/查询参数后将自动放行。"
 )
 
+# 项目目录外文件改动硬边界门禁 (Workspace Boundary Hard Guard - R4)
+
+_NULL_SINKS = {"/dev/null", "nul", "$null"}
+_LOCAL_VAR_TOKEN_RE = re.compile(r"(?:\$\{?(?:tmp|temp|tmpdir|out|dst|work|stage)\w*\}?|%(?:tmp|temp)\w*%)", re.IGNORECASE)
+# 引号内的转义与普通字符分支互斥；命令头限定在子句起点，避免长串失败匹配反复回扫。
+_COMMIT_MSG_RE = re.compile(
+    r"""((?:^|[\r\n;|&])\s*\bgit\b[^\r\n;|&]*?\bcommit\b[^\r\n;|&]*?(?:\s-(?:m|am)|--message(?:=|\s+)))(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\S+)""",
+    re.IGNORECASE,
+)
+_GIT_WORKTREE_ADD_RE = re.compile(r"\bgit\b[^\r\n;|&]*?\bworktree\s+add\b([^\r\n;|&]+)", re.IGNORECASE)
+_INSTALLER_INVOKE_RE = re.compile(
+    r"(?:^|[;&|\r\n]\s*)(?:[A-Za-z_]\w*=\S+\s+)*"
+    r"(?:(?:wsl(?:\.exe)?|bash|sh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?|"
+    r"python[0-9.]*(?:\.exe)?|py(?:\.exe)?\s+-3)\b[^\r\n;|&]*?[\s\"'\\/]+|(?:\.[\\/]))"
+    r"(?<![A-Za-z0-9_.-])install\.(?:py|ps1|sh)\b\"?'?([^\r\n;|&]*)",
+    re.IGNORECASE,
+)
+
+_PY_INLINE_HEAD_RE = re.compile(
+    r"""(?<![^\s;|&()])(?:"[^"\r\n]*[\\/]|'[^'\r\n]*[\\/]|[^\s"';|&()]+[\\/]|["'])?\bpython[0-9.]*(?:\.exe)?\b["']?"""
+    r"(?:\s+(?:-[BIuEsSqvV]+|-X\s+\S+|-W\s+\S+))*\s+-c\s+",
+    re.IGNORECASE,
+)
+_PS_HERESTRING_PY_RE = re.compile(
+    r"@(['\"])\r?\n([\s\S]*?)\r?\n\1@\s*\|\s*[^\r\n|]*\bpython[0-9.]*(?:\.exe)?\b",
+    re.IGNORECASE,
+)
+_SH_HEREDOC_PY_RE = re.compile(
+    r"\bpython[0-9.]*(?:\.exe)?\b[^\r\n]*<<-?\s*['\"]?([A-Za-z0-9_]+)['\"]?\r?\n([\s\S]*?)\r?\n\1(?=\r?\n|$)",
+    re.IGNORECASE,
+)
+_DOTNET_IO_MUTATE_RE = re.compile(
+    r"\[(?:System\.)?IO\.(File|Directory)\]::"
+    r"(Write\w*|Append\w*|Create\w*|Delete\w*|Move\w*|Copy\w*)\s*\(([^)\r\n]+)\)",
+    re.IGNORECASE,
+)
+_SHELL_REDIRECT_RE = re.compile(
+    r"""(?:^|[\s;|&()])(?:\d+)?(>{1,2})(?![>&=])\s*("(?:\\.|[^"\\])+"|'(?:''|[^'])+'|[^\s;|&<>()]+)""",
+)
+
+_SHELL_DELETE_VERBS = {"rm", "rmdir", "del", "erase", "remove-item"}
+_SHELL_CREATE_WRITE_VERBS = {
+    "mkdir",
+    "md",
+    "touch",
+    "truncate",
+    "tee",
+    "new-item",
+    "set-content",
+    "add-content",
+    "clear-content",
+    "out-file",
+}
+_SHELL_MOVE_VERBS = {"mv", "move", "ren", "rename", "move-item", "rename-item"}
+_SHELL_COPY_VERBS = {"cp", "copy", "xcopy", "robocopy", "copy-item"}
+_PS_NON_PATH_VALUE_FLAGS = {
+    "-value",
+    "-itemtype",
+    "-type",
+    "-encoding",
+    "-filter",
+    "-include",
+    "-exclude",
+    "-delimiter",
+    "-stream",
+}
+
+WSL_TEMP_CHECK = """
+import json, os, sys, tempfile
+from pathlib import Path
+
+targets = json.load(sys.stdin)
+runtime_root = tempfile.gettempdir()
+allowed = []
+if runtime_root == "/tmp" and Path(runtime_root).resolve() == Path(runtime_root):
+    for raw in targets:
+        normalized = os.path.normpath(raw)
+        resolved = Path(raw).resolve()
+        if (normalized.startswith("/tmp/") and resolved != Path(runtime_root)
+                and resolved.is_relative_to(runtime_root)):
+            allowed.append(raw)
+print(json.dumps(allowed))
+"""
+
+
+# ② 路径定位、日志与轮询状态读写
 
 def get_data_dirs() -> Tuple[Path, Path]:
     return user_words.resolve_data_dirs(HOOKS_DIR)
@@ -91,6 +179,50 @@ def get_current_iso_time() -> str:
 def log_event(event_name: str, conversation_id: str, message: str) -> None:
     user_words.append_lifecycle_log(HOOKS_DIR, event_name, conversation_id, message)
 
+
+def _is_inside_dir(target: Path, parent: Path) -> bool:
+    try:
+        target.resolve().relative_to(parent.resolve())
+        return True
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def resolve_target_path(
+    raw_path_str: str,
+    cwd: Optional[str],
+    workspace_paths: Optional[List[str]],
+) -> Path:
+    """严格按 payload.cwd -> workspacePaths 优先级解析相对路径，绝不落入插件自身工作目录"""
+    return handoff_gate._resolve_candidate_path(raw_path_str, cwd, workspace_paths)
+
+
+def _canonical_path_key(p: Path) -> str:
+    return user_words._canonical_path_key(p)
+
+
+def _load_guard_state(state_file: Path, conversation_id: str) -> Dict[str, Any]:
+    if state_file.exists():
+        try:
+            data = json.loads(state_file.read_text(encoding="utf-8-sig"))
+            if (isinstance(data, dict) and data.get("version") == 2
+                    and data.get("conversationId") == conversation_id and isinstance(data.get("records"), dict)):
+                return data
+            raise ValueError("轮询状态格式或会话身份错误")
+        except (ValueError, OSError, RecursionError) as exc:
+            log_event("PreToolUse:poll_state_error", conversation_id, f"轮询状态读取失败（{exc}），保留原文件")
+            raise
+    return {"version": 2, "conversationId": conversation_id, "records": {}}
+
+
+def _save_guard_state(state_file: Path, state: Dict[str, Any], conversation_id: str) -> None:
+    state["version"] = 2
+    state["conversationId"] = conversation_id
+    state["updatedAt"] = get_current_iso_time()
+    user_words.atomic_write_json(state_file, state)
+
+
+# ③ 证据查询解析、文件指纹与防空转检测
 
 def is_evidence_file(file_path_str: str) -> bool:
     """严格判定路径是否属于算例/后台任务输出证据文件"""
@@ -105,7 +237,7 @@ def is_evidence_file(file_path_str: str) -> bool:
     if "/.system_generated/tasks/" in norm_slashes or "/.system_generated/steps/" in norm_slashes:
         return True
 
-    p = Path(cleaned)
+    p = Path(cleaned.replace("\\", "/"))
     name = p.name
     ext = p.suffix.lower()
 
@@ -114,14 +246,6 @@ def is_evidence_file(file_path_str: str) -> bool:
     if EVIDENCE_FILENAME_RE.match(name):
         return True
     return False
-
-
-def _is_inside_dir(target: Path, parent: Path) -> bool:
-    try:
-        target.resolve().relative_to(parent.resolve())
-        return True
-    except Exception:
-        return False
 
 
 def _safe_split_tokens(segment: str) -> List[str]:
@@ -177,9 +301,10 @@ def _unwrap_inner_command(tokens: List[str]) -> Tuple[List[str], bool]:
                 flag_low = tokens[idx].lower()
                 idx += 1
                 if flag_low in ("-c", "/c", "-command") and idx < n:
-                    inner_tokens = _safe_split_tokens(" ".join(tokens[idx:]))
-                    sub_tokens, sub_remote = _unwrap_inner_command(inner_tokens)
-                    return sub_tokens, (used_subsystem or sub_remote)
+                    tokens = _safe_split_tokens(" ".join(tokens[idx:]))
+                    idx = 0
+                    n = len(tokens)
+                    break
             continue
 
         break
@@ -195,11 +320,8 @@ def parse_run_command_evidence(command_line: str) -> Tuple[Optional[str], bool, 
     if not command_line or not command_line.strip():
         return None, False, ""
 
-    norm_cmd = re.sub(r"\s+", " ", command_line.strip())
-    if os.name == "nt":
-        norm_cmd_sig = norm_cmd.casefold()
-    else:
-        norm_cmd_sig = norm_cmd
+    # 查询参数中的大小写与引号内空白有实际含义，不能随 Windows 路径一起折叠。
+    norm_cmd_sig = command_line.strip()
 
     # 若含重定向写入或修改型操作符，非纯只读查询，直接放行
     if re.search(r"(?:>>|>|\btee\b|\brm\b|\bmv\b|\bcp\b|\bsed\s+-i\b)", command_line):
@@ -235,43 +357,6 @@ def parse_run_command_evidence(command_line: str) -> Tuple[Optional[str], bool, 
     return None, any_subsystem, norm_cmd_sig
 
 
-def resolve_target_path(
-    raw_path_str: str,
-    cwd: Optional[str],
-    workspace_paths: Optional[List[str]],
-) -> Path:
-    """严格按 payload.cwd -> workspacePaths 优先级解析相对路径，绝不落入插件自身工作目录"""
-    cleaned = os.path.expanduser(raw_path_str.strip().strip("\"'"))
-    p = Path(cleaned)
-    if p.is_absolute():
-        return p
-
-    search_bases: List[Path] = []
-    if cwd and str(cwd).strip():
-        search_bases.append(Path(str(cwd).strip()))
-    if workspace_paths:
-        for wp in workspace_paths:
-            if wp and str(wp).strip():
-                search_bases.append(Path(str(wp).strip()))
-
-    for base in search_bases:
-        cand = base / p
-        if cand.exists():
-            return cand
-
-    if search_bases:
-        return search_bases[0] / p
-    return p
-
-
-def _canonical_path_key(p: Path) -> str:
-    try:
-        resolved = str(p.resolve())
-    except OSError:
-        resolved = str(p)
-    return resolved.casefold() if os.name == "nt" else resolved
-
-
 def compute_file_fingerprint(target_path: Path) -> Optional[Dict[str, Any]]:
     """
     计算证据文件的快速复合指纹：
@@ -281,7 +366,7 @@ def compute_file_fingerprint(target_path: Path) -> Optional[Dict[str, Any]]:
     path_key = _canonical_path_key(target_path)
     try:
         resolved_str = str(target_path.resolve())
-    except OSError:
+    except (OSError, ValueError, RuntimeError):
         resolved_str = str(target_path)
 
     if not target_path.exists():
@@ -320,7 +405,7 @@ def compute_file_fingerprint(target_path: Path) -> Optional[Dict[str, Any]]:
             "size": fsize,
             "sha256": hasher.hexdigest(),
         }
-    except Exception:
+    except (OSError, ValueError):
         return None
 
 
@@ -333,30 +418,9 @@ def _is_fingerprint_equal(rec: Dict[str, Any], fp: Dict[str, Any]) -> bool:
     )
 
 
-def _load_guard_state(state_file: Path, conversation_id: str) -> Dict[str, Any]:
-    if state_file.exists():
-        try:
-            data = json.loads(state_file.read_text(encoding="utf-8"))
-            if (isinstance(data, dict) and data.get("version") == 2
-                    and data.get("conversationId") == conversation_id and isinstance(data.get("records"), dict)):
-                return data
-            raise ValueError("轮询状态格式或会话身份错误")
-        except (ValueError, OSError) as exc:
-            log_event("PreToolUse:poll_state_error", conversation_id, f"轮询状态读取失败（{exc}），保留原文件")
-            raise
-    return {"version": 2, "conversationId": conversation_id, "records": {}}
-
-
-def _save_guard_state(state_file: Path, state: Dict[str, Any], conversation_id: str) -> None:
-    state["version"] = 2
-    state["conversationId"] = conversation_id
-    state["updatedAt"] = get_current_iso_time()
-    user_words.atomic_write_json(state_file, state)
-
-
 def _locate_task_log_file(transcript_path_str: Optional[str], task_id: str) -> Optional[Path]:
     """根据会话 transcriptPath 定位 Antigravity 后台任务日志 .system_generated/tasks/<TaskId>.log"""
-    if not transcript_path_str or not task_id:
+    if not transcript_path_str or not user_words.valid_session_id(task_id):
         return None
     tp = Path(transcript_path_str)
     # 标准布局: <brain>/<convId>/.system_generated/logs/transcript.jsonl
@@ -371,74 +435,155 @@ def _locate_task_log_file(transcript_path_str: Optional[str], task_id: str) -> O
     return candidates[0]
 
 
-# ==============================================================================
-# 项目目录外文件改动硬边界门禁 (Workspace Boundary Hard Guard - R4)
-# ==============================================================================
+def _check_polling_locked(tool_name: str, args: Dict[str, Any], conversation_id: str, cwd: Optional[str],
+                          workspace_paths: List[str], transcript_path_str: Optional[str], state_dir: Path,
+                          logs_dir: Path) -> Dict[str, Any]:
+    state_file = state_dir / f"{conversation_id}_status_guard.json"
 
-_NULL_SINKS = {"/dev/null", "nul", "$null"}
-_LOCAL_VAR_TOKEN_RE = re.compile(r"(?:\$\{?(?:tmp|temp|tmpdir|out|dst|work|stage)\w*\}?|%(?:tmp|temp)\w*%)", re.IGNORECASE)
-_COMMIT_MSG_RE = re.compile(
-    r"""(\bgit\b[^\r\n;|&]*?\bcommit\b[^\r\n;|&]*?(?:\s-(?:m|am)|--message(?:=|\s+)))(?:"(?:\\.|[^"])*"|'(?:''|[^'])*'|\S+)""",
-    re.IGNORECASE,
-)
-_GIT_WORKTREE_ADD_RE = re.compile(r"\bgit\b[^\r\n;|&]*?\bworktree\s+add\b([^\r\n;|&]+)", re.IGNORECASE)
-_INSTALLER_INVOKE_RE = re.compile(
-    r"(?:^|[;&|\r\n]\s*)(?:[A-Za-z_]\w*=\S+\s+)*"
-    r"(?:(?:wsl(?:\.exe)?|bash|sh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?|"
-    r"python[0-9.]*(?:\.exe)?|py(?:\.exe)?\s+-3)\b[^\r\n;|&]*?[\s\"'\\/]+|(?:\.[\\/]))"
-    r"(?<![A-Za-z0-9_.-])install\.(?:py|ps1|sh)\b\"?'?([^\r\n;|&]*)",
-    re.IGNORECASE,
-)
+    # 分支 1: read_file 或 run_command 访问证据文件
+    if tool_name in ("read_file", "run_command"):
+        raw_target: Optional[str] = None
+        param_sig = ""
+        is_subsystem_cmd = False
 
-_PY_INLINE_HEAD_RE = re.compile(
-    r"""(?:"[^"\r\n]*[\\/]|'[^'\r\n]*[\\/]|[^\s"';|&()]+[\\/])?\bpython[0-9.]*(?:\.exe)?\b["']?"""
-    r"(?:\s+(?:-[BIuEsSqvV]+|-X\s+\S+|-W\s+\S+))*\s+-c\s+",
-    re.IGNORECASE,
-)
-_PS_HERESTRING_PY_RE = re.compile(
-    r"@(['\"])\r?\n([\s\S]*?)\r?\n\1@\s*\|\s*[^\r\n|]*\bpython[0-9.]*(?:\.exe)?\b",
-    re.IGNORECASE,
-)
-_SH_HEREDOC_PY_RE = re.compile(
-    r"\bpython[0-9.]*(?:\.exe)?\b[^\r\n]*<<-?\s*['\"]?([A-Za-z0-9_]+)['\"]?\r?\n([\s\S]*?)\r?\n\1(?=\r?\n|$)",
-    re.IGNORECASE,
-)
-_DOTNET_IO_MUTATE_RE = re.compile(
-    r"\[(?:System\.)?IO\.(File|Directory)\]::"
-    r"(Write\w*|Append\w*|Create\w*|Delete\w*|Move\w*|Copy\w*)\s*\(([^)\r\n]+)\)",
-    re.IGNORECASE,
-)
-_SHELL_REDIRECT_RE = re.compile(
-    r"""(?:^|[\s;|&()])(?:\d+)?(>{1,2})(?![>&=])\s*("(?:\\.|[^"])+"|'(?:''|[^'])+'|[^\s;|&<>()]+)""",
-)
+        if tool_name == "read_file":
+            file_arg = str(args.get("AbsolutePath") or args.get("Path") or args.get("path") or "").strip()
+            if not file_arg or not is_evidence_file(file_arg):
+                return {"decision": "allow"}
+            raw_target = file_arg
+            start_line = args.get("StartLine", args.get("startLine"))
+            end_line = args.get("EndLine", args.get("endLine"))
+            byte_offset = args.get("ByteOffset", args.get("byteOffset"))
+            param_sig = f"s={start_line}:e={end_line}:b={byte_offset}"
+        else:
+            cmd_line = str(args.get("CommandLine") or args.get("command_line") or args.get("command") or "")
+            raw_target, is_subsystem_cmd, param_sig = parse_run_command_evidence(cmd_line)
+            if not raw_target:
+                return {"decision": "allow"}
 
-_SHELL_DELETE_VERBS = {"rm", "rmdir", "del", "erase", "remove-item"}
-_SHELL_CREATE_WRITE_VERBS = {
-    "mkdir",
-    "md",
-    "touch",
-    "truncate",
-    "tee",
-    "new-item",
-    "set-content",
-    "add-content",
-    "clear-content",
-    "out-file",
-}
-_SHELL_MOVE_VERBS = {"mv", "move", "ren", "rename", "move-item", "rename-item"}
-_SHELL_COPY_VERBS = {"cp", "copy", "xcopy", "robocopy", "copy-item"}
-_PS_NON_PATH_VALUE_FLAGS = {
-    "-value",
-    "-itemtype",
-    "-type",
-    "-encoding",
-    "-filter",
-    "-include",
-    "-exclude",
-    "-delimiter",
-    "-stream",
-}
+        # Windows 宿主下通过 wsl/ssh/docker 访问子系统内部 POSIX 路径（宿主不可见）时豁免防死锁
+        cleaned_raw = raw_target.strip().strip("\"'")
+        is_posix_style_on_win = os.name == "nt" and cleaned_raw.startswith("/") and not cleaned_raw.startswith("//")
+        target_path = resolve_target_path(raw_target, cwd, workspace_paths)
 
+        if (is_subsystem_cmd or is_posix_style_on_win) and not target_path.exists():
+            return {"decision": "allow"}
+
+        # 豁免插件自身的状态与日志目录，绝不自我拦截
+        if _is_inside_dir(target_path, state_dir) or _is_inside_dir(target_path, logs_dir):
+            return {"decision": "allow"}
+
+        fp = compute_file_fingerprint(target_path)
+        if not fp:
+            return {"decision": "allow"}
+
+        query_key = f"{tool_name}:{fp['pathKey']}|{param_sig}"
+        state = _load_guard_state(state_file, conversation_id)
+        records = state.setdefault("records", {})
+        last_rec = records.get(query_key)
+
+        if isinstance(last_rec, dict) and _is_fingerprint_equal(last_rec, fp):
+            query_count = int(last_rec.get("queryCount", 1)) + 1
+            last_rec["queryCount"] = query_count
+            last_rec["lastBlockedAt"] = get_current_iso_time()
+            _save_guard_state(state_file, state, conversation_id)
+            log_event(
+                "PreToolUse:status_guard",
+                conversation_id,
+                f"DENIED unchanged {tool_name} on {fp['path']} [{param_sig}] (query #{query_count})",
+            )
+            return {"decision": "deny", "reason": DENY_REASON_TEXT}
+
+        records[query_key] = {
+            "type": "evidence_query",
+            "tool": tool_name,
+            "path": fp["path"],
+            "params": param_sig,
+            "exists": fp["exists"],
+            "mtimeNs": fp["mtimeNs"],
+            "size": fp["size"],
+            "sha256": fp["sha256"],
+            "queryCount": 1,
+            "lastAllowedAt": get_current_iso_time(),
+        }
+        _save_guard_state(state_file, state, conversation_id)
+        log_event(
+            "PreToolUse:status_guard",
+            conversation_id,
+            f"ALLOWED {tool_name} on {fp['path']} [{param_sig}] (size={fp['size']})",
+        )
+        return {"decision": "allow"}
+
+    # 分支 2: manage_task(Action="status") 联动后台任务日志物理指纹
+    if tool_name == "manage_task":
+        action = str(args.get("Action") or args.get("action") or "").strip().lower()
+        if action != "status":
+            return {"decision": "allow"}
+
+        task_id = str(args.get("TaskId") or args.get("taskId") or args.get("task_id") or "default_task").strip()
+        task_key = f"task:{task_id}"
+        task_log_path = _locate_task_log_file(transcript_path_str, task_id)
+        task_fp = compute_file_fingerprint(task_log_path) if task_log_path else None
+
+        state = _load_guard_state(state_file, conversation_id)
+        records = state.setdefault("records", {})
+        last_rec = records.get(task_key)
+        now_epoch = time.time()
+
+        if isinstance(last_rec, dict):
+            if task_fp and task_fp["exists"]:
+                # 任务日志存在：严格依据任务日志是否产生新输出判定放行或阻断
+                if _is_fingerprint_equal(last_rec, task_fp):
+                    query_count = int(last_rec.get("queryCount", 1)) + 1
+                    last_rec["queryCount"] = query_count
+                    last_rec["lastBlockedAt"] = get_current_iso_time()
+                    _save_guard_state(state_file, state, conversation_id)
+                    log_event(
+                        "PreToolUse:status_guard",
+                        conversation_id,
+                        f"DENIED unchanged manage_task(status) for {task_id} (query #{query_count})",
+                    )
+                    return {"decision": "deny", "reason": DENY_REASON_TEXT}
+            else:
+                # 尚无任务日志文件时：阻断 30 秒内的高频盲目轮询，超时后允许再次探查防永久锁死
+                last_epoch = float(last_rec.get("lastAllowedEpoch", 0.0))
+                if (now_epoch - last_epoch) < TASK_NO_LOG_COOLDOWN_SEC:
+                    query_count = int(last_rec.get("queryCount", 1)) + 1
+                    last_rec["queryCount"] = query_count
+                    last_rec["lastBlockedAt"] = get_current_iso_time()
+                    _save_guard_state(state_file, state, conversation_id)
+                    log_event(
+                        "PreToolUse:status_guard",
+                        conversation_id,
+                        f"DENIED rapid manage_task(status) polling for {task_id} (query #{query_count})",
+                    )
+                    return {"decision": "deny", "reason": DENY_REASON_TEXT}
+
+        new_rec: Dict[str, Any] = {
+            "type": "manage_task_status",
+            "taskId": task_id,
+            "queryCount": 1,
+            "lastAllowedEpoch": now_epoch,
+            "lastAllowedAt": get_current_iso_time(),
+        }
+        if task_fp:
+            new_rec.update(
+                {
+                    "exists": task_fp["exists"],
+                    "mtimeNs": task_fp["mtimeNs"],
+                    "size": task_fp["size"],
+                    "sha256": task_fp["sha256"],
+                }
+            )
+        records[task_key] = new_rec
+        _save_guard_state(state_file, state, conversation_id)
+        log_event("PreToolUse:status_guard", conversation_id, f"ALLOWED manage_task(status) for {task_id}")
+        return {"decision": "allow"}
+
+    return {"decision": "allow"}
+
+
+# ④ 跨系统路径归一化与目录边界
 
 def _expand_host_vars(raw_str: str) -> str:
     s = raw_str.strip().strip("\"'")
@@ -470,8 +615,8 @@ def _expand_host_vars(raw_str: str) -> str:
 
 
 def _normalize_cross_env_lexical(raw_str: str, base_dir: Optional[str] = None) -> str:
-    """将 Windows 盘符路径、WSL /mnt/<drive> 路径与 POSIX 路径统一为可跨端等价比较的规范键"""
-    expanded = _expand_host_vars(raw_str)
+    """盘符与 /mnt/<drive> 共用规范键；本机 POSIX 路径保留大小写，物理路径另查软链接。"""
+    expanded = user_words.strip_win_extended_prefix(_expand_host_vars(raw_str))
     if not expanded:
         return ""
     slashes = expanded.replace("\\", "/")
@@ -520,24 +665,6 @@ def _is_under_norm_key(target_key: str, root_key: str) -> bool:
 def _is_standard_os_temp_key(norm_key: str) -> bool:
     root = _normalize_cross_env_lexical(tempfile.gettempdir())
     return _is_under_norm_key(norm_key, root)
-
-
-WSL_TEMP_CHECK = """
-import json, os, sys, tempfile
-from pathlib import Path
-
-targets = json.load(sys.stdin)
-runtime_root = tempfile.gettempdir()
-allowed = []
-if runtime_root == "/tmp" and Path(runtime_root).resolve() == Path(runtime_root):
-    for raw in targets:
-        normalized = os.path.normpath(raw)
-        resolved = Path(raw).resolve()
-        if (normalized.startswith("/tmp/") and resolved != Path(runtime_root)
-                and resolved.is_relative_to(runtime_root)):
-            allowed.append(raw)
-print(json.dumps(allowed))
-"""
 
 
 def _is_wsl_standard_temp_path(target: str, distribution: str) -> bool:
@@ -594,7 +721,7 @@ def _outer_shell_operators(command: str) -> bool:
 
 def _resolve_nearest_existing(raw_str: str, base_dir: Optional[str]) -> Optional[Path]:
     """解析本地可达路径的真实物理位置，防御通过项目内软链接/目录联接逃逸写向项目外"""
-    expanded = _expand_host_vars(raw_str)
+    expanded = user_words.strip_win_extended_prefix(_expand_host_vars(raw_str))
     if not expanded:
         return None
     if os.name == "nt" and expanded.startswith("/") and not expanded.startswith("//"):
@@ -617,7 +744,7 @@ def _resolve_nearest_existing(raw_str: str, base_dir: Optional[str]) -> Optional
 
     try:
         return p.resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         return None
 
 
@@ -737,19 +864,7 @@ def _is_write_target_allowed(
     return True
 
 
-def _extract_flag_value(tokens: List[str], flag_name: str) -> Optional[str]:
-    for idx, tok in enumerate(tokens):
-        if tok == flag_name and idx + 1 < len(tokens):
-            return tokens[idx + 1]
-        if tok.startswith(flag_name + "="):
-            return tok.split("=", 1)[1]
-    return None
-
-
-def _compact_snippet(text: str, max_len: int = 140) -> str:
-    flat = re.sub(r"\s+", " ", text.strip())
-    return flat if len(flat) <= max_len else flat[: max_len - 3] + "..."
-
+# ⑤ 内联 Python 提取与 AST 写入目标分析
 
 def _read_quoted_arg(text: str, start_idx: int) -> Optional[Tuple[str, int, str]]:
     """从 start_idx 读取单引号或双引号包裹的参数内容，返回 (inner_content, end_idx, quote_char)"""
@@ -927,24 +1042,42 @@ def _scan_inline_python_code(
         )
 
     if tree is not None:
-        bindings: Dict[str, str] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                val = _eval_ast_path_expr(node.value, bindings)
-                if val:
-                    bindings[node.targets[0].id] = val
+        def _calls_in_order(node: ast.AST, bindings: Dict[str, str]):
+            # 按源码执行顺序跟踪简单赋值。不能先收集最终赋值，否则后面的安全路径
+            # 会掩盖前面已经发生的越界写入；无法求值的新赋值也必须取消旧绑定。
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                if node.value is not None:
+                    yield from _calls_in_order(node.value, bindings)
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                value = _eval_ast_path_expr(node.value, bindings) if node.value is not None else None
+                for target in targets:
+                    for name in ast.walk(target):
+                        if isinstance(name, ast.Name):
+                            if isinstance(target, ast.Name) and value is not None:
+                                bindings[name.id] = value
+                            else:
+                                bindings.pop(name.id, None)
+                return
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                bindings = dict(bindings)
+                for arg in ast.walk(node.args):
+                    if isinstance(arg, ast.arg):
+                        bindings.pop(arg.arg, None)
+            if isinstance(node, ast.Call):
+                yield node, bindings
+            for child in ast.iter_child_nodes(node):
+                yield from _calls_in_order(child, bindings)
 
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
+        for node, bindings in _calls_in_order(tree, {}):
             snippet = _compact_snippet(ast.get_source_segment(used_src, node) or "python call")
             fn = node.func
 
             # 1) 内置 open(path, mode)
-            if isinstance(fn, ast.Name) and fn.id == "open" and node.args:
+            if isinstance(fn, ast.Name) and fn.id == "open":
                 is_mut, mode_s = _open_mode_is_mutating(node, 1)
                 if is_mut:
-                    tgt = _eval_ast_path_expr(node.args[0], bindings)
+                    path_expr = node.args[0] if node.args else next((kw.value for kw in node.keywords if kw.arg == "file"), None)
+                    tgt = _eval_ast_path_expr(path_expr, bindings) if path_expr is not None else None
                     if _bad(tgt):
                         return f"Python 写入/修改文件 (open mode='{mode_s}')", str(tgt), snippet
 
@@ -1071,11 +1204,27 @@ def _scan_inline_python_code(
     return None
 
 
+# ⑥ Shell 子句、写入路径与审批响应
+
+def _extract_flag_value(tokens: List[str], flag_name: str) -> Optional[str]:
+    for idx, tok in enumerate(tokens):
+        if tok == flag_name and idx + 1 < len(tokens):
+            return tokens[idx + 1]
+        if tok.startswith(flag_name + "="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def _compact_snippet(text: str, max_len: int = 140) -> str:
+    flat = re.sub(r"\s+", " ", text.strip())
+    return flat if len(flat) <= max_len else flat[: max_len - 3] + "..."
+
+
 def _unwrap_shell_script_layer(cmd: str) -> Optional[str]:
     """若整条命令是 wsl/bash/powershell -c '<inner>' 包装，提取内层脚本以精确解析子句命令头"""
     m = re.match(
         r"^\s*(?:[A-Za-z_]\w*=\S+\s+)*"
-        r"""(?:wsl(?:\.exe)?\b(?:\s+(?:-(?:d|u)|--(?:distribution|user|cd))\s+(?:"(?:\\.|[^"])*"|'(?:''|[^'])*'|\S+)|\s+(?:--|-e|--exec|-[A-Za-z]+))*\s+)?"""
+        r"""(?:wsl(?:\.exe)?\b(?:\s+(?:-(?:d|u)|--(?:distribution|user|cd))\s+(?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|\S+)|\s+(?:--|-e|--exec|-[A-Za-z]+))*\s+)?"""
         r"(?:bash|sh|zsh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?)\b"
         r"(?:\s+(?:-(?:ExecutionPolicy|ep|WindowStyle|w|InputFormat|OutputFormat)\s+\S+|-[A-Za-z]+|/c))*\s+",
         cmd,
@@ -1200,10 +1349,51 @@ def _detect_command_external_mutation(
             inner, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth + 1, distribution,
         )
 
-    sanitized = _COMMIT_MSG_RE.sub(r'\1"__COMMIT_MSG__"', command_line)
+    sanitized = (_COMMIT_MSG_RE.sub(r'\1"__COMMIT_MSG__"', command_line)
+                 if "commit" in command_line.casefold() else command_line)
+
+    # 先拆壳并隔离内联 Python，再扫描 Shell；Python 字符串中的命令只是数据。
+    unwrapped = _unwrap_shell_script_layer(sanitized)
+    if unwrapped:
+        return _detect_command_external_mutation(
+            unwrapped, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
+            depth + 1, wsl_distribution,
+        )
+    # 先处理明确的目录切换；后续相对写入应以切换后的目录为基准。
+    first_clauses = handoff_gate._split_shell_clauses(sanitized)
+    if len(first_clauses) > 1:
+        first = first_clauses[0]
+        first_tokens = _safe_split_tokens(first)
+        if first_tokens and first_tokens[0].casefold() in ("cd", "chdir", "set-location"):
+            targets = _extract_clause_path_targets(first_tokens)
+            if len(targets) == 1 and not targets[0].startswith(("$", "%")) and not _SHELL_REDIRECT_RE.search(first):
+                end = sanitized.find(first) + len(first)
+                separator = re.match(r"\s*(?:&&|;|\r?\n)\s*", sanitized[end:])
+                if separator:
+                    return _detect_command_external_mutation(
+                        sanitized[end + separator.end():], _normalize_cross_env_lexical(targets[0], base_cwd),
+                        allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth + 1, wsl_distribution,
+                    )
+    py_blocks, shell_masked = _extract_and_mask_inline_python(sanitized)
+    for block in py_blocks:
+        py_hit = _scan_inline_python_code(
+            block, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth, wsl_distribution
+        )
+        if py_hit:
+            return py_hit
+
+    for inner in handoff_gate._extract_cmd_substitutions(shell_masked):
+        hit = _detect_command_external_mutation(
+            inner, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
+            depth + 1, wsl_distribution,
+        )
+        if hit:
+            return hit
 
     # 1. 专项拦截: git worktree add 指向项目目录外 (如 ../.codex-worktrees 或父目录)
-    for m_wt in _GIT_WORKTREE_ADD_RE.finditer(sanitized):
+    for m_wt in _GIT_WORKTREE_ADD_RE.finditer(shell_masked):
+        if _pos_inside_quotes(shell_masked, m_wt.start()):
+            continue
         wt_tokens = _safe_split_tokens(m_wt.group(1))
         idx = 0
         wt_path: Optional[str] = None
@@ -1223,7 +1413,9 @@ def _detect_command_external_mutation(
             return "创建项目外 Git 工作树 (git worktree add)", wt_path, _compact_snippet(m_wt.group(0))
 
     # 2. 专项拦截: 执行生产级全局安装脚本 (默认改写 ~/.gemini/config 与 ~/.codex)
-    for m_inst in _INSTALLER_INVOKE_RE.finditer(sanitized):
+    for m_inst in _INSTALLER_INVOKE_RE.finditer(shell_masked):
+        if _pos_inside_quotes(shell_masked, m_inst.start()):
+            continue
         prefix_seg = m_inst.group(0)
         if re.search(r"\b(?:git|rg|grep|cat|head|tail|Get-Content|Select-String|py_compile)\b", prefix_seg, re.IGNORECASE):
             continue
@@ -1253,24 +1445,7 @@ def _detect_command_external_mutation(
             _compact_snippet(m_inst.group(0)),
         )
 
-    # 3. 若整条命令被 shell 包装，拆壳检查内层脚本，同时保留已确认的 WSL 作用域。
-    unwrapped = _unwrap_shell_script_layer(sanitized)
-    if unwrapped:
-        return _detect_command_external_mutation(
-            unwrapped, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
-            depth + 1, wsl_distribution,
-        )
-
-    # 4. 提取并用 AST 精确扫描所有内联 Python 代码块（掩码替换后不再污染外层 Shell 扫描）
-    py_blocks, shell_masked = _extract_and_mask_inline_python(sanitized)
-    for block in py_blocks:
-        py_hit = _scan_inline_python_code(
-            block, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth, wsl_distribution
-        )
-        if py_hit:
-            return py_hit
-
-    # 5. 检查 PowerShell .NET [IO.File] / [IO.Directory] 写删方法
+    # 3. 检查 PowerShell .NET [IO.File] / [IO.Directory] 写删方法
     for m_net in _DOTNET_IO_MUTATE_RE.finditer(shell_masked):
         cls_name, method_name, raw_args = m_net.group(1), m_net.group(2), m_net.group(3)
         parts = [p.strip().strip("\"'") for p in raw_args.split(",") if p.strip()]
@@ -1285,18 +1460,18 @@ def _detect_command_external_mutation(
             ):
                 return f".NET 文件写删操作 ([IO.{cls_name}]::{method_name})", cand, _compact_snippet(m_net.group(0))
 
-    # 6. 检查外层 Shell 重定向 (> / >>) 的直接输出目标（忽略位于引号字面量内的符号）
+    # 4. 检查外层 Shell 重定向 (> / >>) 的直接输出目标（忽略位于引号字面量内的符号）
     for m_red in _SHELL_REDIRECT_RE.finditer(shell_masked):
         if _pos_inside_quotes(shell_masked, m_red.start()):
             continue
         op, red_tok = m_red.group(1), m_red.group(2).strip().strip("\"'")
-        if _looks_like_explicit_or_escaped_path(red_tok) and not _is_write_target_allowed(
+        if not _is_write_target_allowed(
             red_tok, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
         ):
             return f"Shell 输出重定向写入 ({op})", red_tok, _compact_snippet(m_red.group(0))
 
-    # 7. 按子句严格检查处于“命令头位置”的 Shell/PowerShell 写删移动复制命令
-    clauses = re.split(r"(?:\r?\n|;|&&|\|\||\|)|[{}]", shell_masked)
+    # 5. 按子句严格检查处于“命令头位置”的 Shell/PowerShell 写删移动复制命令
+    clauses = handoff_gate._split_shell_clauses(shell_masked)
     for raw_clause in clauses:
         clause = raw_clause.strip()
         if not clause:
@@ -1424,6 +1599,8 @@ def _build_boundary_violation_response(
     return {"decision": decision, "reason": reason}
 
 
+# ⑦ PreToolUse 调度与命令行主入口
+
 def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
     """处理 PreToolUse 门禁请求"""
     conversation_id = str(payload.get("conversationId") or "unknown_session").strip()
@@ -1504,162 +1681,12 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
         return boundary or {"decision": "allow"}
 
 
-def _check_polling_locked(tool_name: str, args: Dict[str, Any], conversation_id: str, cwd: Optional[str],
-                          workspace_paths: List[str], transcript_path_str: Optional[str], state_dir: Path,
-                          logs_dir: Path) -> Dict[str, Any]:
-    state_file = state_dir / f"{conversation_id}_status_guard.json"
-
-    # 分支 1: read_file 或 run_command 访问证据文件
-    if tool_name in ("read_file", "run_command"):
-        raw_target: Optional[str] = None
-        param_sig = ""
-        is_subsystem_cmd = False
-
-        if tool_name == "read_file":
-            file_arg = str(args.get("AbsolutePath") or args.get("Path") or args.get("path") or "").strip()
-            if not file_arg or not is_evidence_file(file_arg):
-                return {"decision": "allow"}
-            raw_target = file_arg
-            start_line = args.get("StartLine", args.get("startLine"))
-            end_line = args.get("EndLine", args.get("endLine"))
-            byte_offset = args.get("ByteOffset", args.get("byteOffset"))
-            param_sig = f"s={start_line}:e={end_line}:b={byte_offset}"
-        else:
-            cmd_line = str(args.get("CommandLine") or args.get("command_line") or args.get("command") or "")
-            raw_target, is_subsystem_cmd, param_sig = parse_run_command_evidence(cmd_line)
-            if not raw_target:
-                return {"decision": "allow"}
-
-        # Windows 宿主下通过 wsl/ssh/docker 访问子系统内部 POSIX 路径（宿主不可见）时豁免防死锁
-        cleaned_raw = raw_target.strip().strip("\"'")
-        is_posix_style_on_win = os.name == "nt" and cleaned_raw.startswith("/") and not cleaned_raw.startswith("//")
-        target_path = resolve_target_path(raw_target, cwd, workspace_paths)
-
-        if (is_subsystem_cmd or is_posix_style_on_win) and not target_path.exists():
-            return {"decision": "allow"}
-
-        # 豁免插件自身的状态与日志目录，绝不自我拦截
-        if _is_inside_dir(target_path, state_dir) or _is_inside_dir(target_path, logs_dir):
-            return {"decision": "allow"}
-
-        fp = compute_file_fingerprint(target_path)
-        if not fp:
-            return {"decision": "allow"}
-
-        query_key = f"{tool_name}:{fp['pathKey']}|{param_sig}"
-        state = _load_guard_state(state_file, conversation_id)
-        records = state.setdefault("records", {})
-        last_rec = records.get(query_key)
-
-        if isinstance(last_rec, dict) and _is_fingerprint_equal(last_rec, fp):
-            query_count = int(last_rec.get("queryCount", 1)) + 1
-            last_rec["queryCount"] = query_count
-            last_rec["lastBlockedAt"] = get_current_iso_time()
-            _save_guard_state(state_file, state, conversation_id)
-            log_event(
-                "PreToolUse:status_guard",
-                conversation_id,
-                f"DENIED unchanged {tool_name} on {fp['path']} [{param_sig}] (query #{query_count})",
-            )
-            return {"decision": "deny", "reason": DENY_REASON_TEXT}
-
-        records[query_key] = {
-            "type": "evidence_query",
-            "tool": tool_name,
-            "path": fp["path"],
-            "params": param_sig,
-            "exists": fp["exists"],
-            "mtimeNs": fp["mtimeNs"],
-            "size": fp["size"],
-            "sha256": fp["sha256"],
-            "queryCount": 1,
-            "lastAllowedAt": get_current_iso_time(),
-        }
-        _save_guard_state(state_file, state, conversation_id)
-        log_event(
-            "PreToolUse:status_guard",
-            conversation_id,
-            f"ALLOWED {tool_name} on {fp['path']} [{param_sig}] (size={fp['size']})",
-        )
-        return {"decision": "allow"}
-
-    # 分支 2: manage_task(Action="status") 联动后台任务日志物理指纹
-    if tool_name == "manage_task":
-        action = str(args.get("Action") or args.get("action") or "").strip().lower()
-        if action != "status":
-            return {"decision": "allow"}
-
-        task_id = str(args.get("TaskId") or args.get("taskId") or args.get("task_id") or "default_task").strip()
-        task_key = f"task:{task_id}"
-        task_log_path = _locate_task_log_file(transcript_path_str, task_id)
-        task_fp = compute_file_fingerprint(task_log_path) if task_log_path else None
-
-        state = _load_guard_state(state_file, conversation_id)
-        records = state.setdefault("records", {})
-        last_rec = records.get(task_key)
-        now_epoch = time.time()
-
-        if isinstance(last_rec, dict):
-            if task_fp and task_fp["exists"]:
-                # 任务日志存在：严格依据任务日志是否产生新输出判定放行或阻断
-                if _is_fingerprint_equal(last_rec, task_fp):
-                    query_count = int(last_rec.get("queryCount", 1)) + 1
-                    last_rec["queryCount"] = query_count
-                    last_rec["lastBlockedAt"] = get_current_iso_time()
-                    _save_guard_state(state_file, state, conversation_id)
-                    log_event(
-                        "PreToolUse:status_guard",
-                        conversation_id,
-                        f"DENIED unchanged manage_task(status) for {task_id} (query #{query_count})",
-                    )
-                    return {"decision": "deny", "reason": DENY_REASON_TEXT}
-            else:
-                # 尚无任务日志文件时：阻断 30 秒内的高频盲目轮询，超时后允许再次探查防永久锁死
-                last_epoch = float(last_rec.get("lastAllowedEpoch", 0.0))
-                if (now_epoch - last_epoch) < TASK_NO_LOG_COOLDOWN_SEC:
-                    query_count = int(last_rec.get("queryCount", 1)) + 1
-                    last_rec["queryCount"] = query_count
-                    last_rec["lastBlockedAt"] = get_current_iso_time()
-                    _save_guard_state(state_file, state, conversation_id)
-                    log_event(
-                        "PreToolUse:status_guard",
-                        conversation_id,
-                        f"DENIED rapid manage_task(status) polling for {task_id} (query #{query_count})",
-                    )
-                    return {"decision": "deny", "reason": DENY_REASON_TEXT}
-
-        new_rec: Dict[str, Any] = {
-            "type": "manage_task_status",
-            "taskId": task_id,
-            "queryCount": 1,
-            "lastAllowedEpoch": now_epoch,
-            "lastAllowedAt": get_current_iso_time(),
-        }
-        if task_fp:
-            new_rec.update(
-                {
-                    "exists": task_fp["exists"],
-                    "mtimeNs": task_fp["mtimeNs"],
-                    "size": task_fp["size"],
-                    "sha256": task_fp["sha256"],
-                }
-            )
-        records[task_key] = new_rec
-        _save_guard_state(state_file, state, conversation_id)
-        log_event("PreToolUse:status_guard", conversation_id, f"ALLOWED manage_task(status) for {task_id}")
-        return {"decision": "allow"}
-
-    return {"decision": "allow"}
-
-
 def main() -> None:
-    input_text = sys.stdin.read().strip()
     payload: Dict[str, Any] = {}
-    if input_text:
-        try:
-            payload = json.loads(input_text)
-        except Exception as e:
-            log_event("PreToolUse:status_guard", "unknown", f"Failed to parse stdin JSON: {e}")
+    try:
+        payload = user_words.read_hook_payload()
+    except (OSError, ValueError) as e:
+        log_event("PreToolUse:status_guard", "unknown", f"Failed to parse stdin JSON: {e}")
 
     try:
         response = handle_pre_tool_use(payload)

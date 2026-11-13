@@ -1,189 +1,221 @@
-# 反重力与 Codex：统一工程规范、独立工作流与双向协作配置
+# 反重力与 Codex：面向 AI-CAE 研发的工程规范、独立工作流与双端协作配置
 
-本仓库（`Antigravity_Codex_configuration`）维护 Google Antigravity（反重力）与 OpenAI Codex 共用的工程与科研工作流配置。两个客户端既能各自独立闭环工作，也能通过共享的 `cae-harness` 技能按专长协同攻坚，适用于通用代码工程、技术写作以及 CAE／CFD／数值分析与高性能计算研究。
+本仓库（`Antigravity_Codex_configuration`）维护 Google Antigravity（反重力）与 OpenAI Codex 共用的科研与工程工作流配置。两套客户端既可各自独立闭环运行，也可通过共享的 `cae-harness` 技能按专长协同攻坚，面向计算流体力学（CFD）、有限元分析（FEA）、偏微分方程（PDE）数值求解器、网格生成与高性能科学计算研发，同时兼容通用软件工程与技术写作。
 
-仓库内所有脚本仅使用 Python 标准库（要求 Python 3.9+；若需自动合并带复杂表结构的既有 `config.toml`，建议使用 Python 3.11+，遇到无法安全解析的配置时安装器会保留原文件并给出提示）。
+全仓脚本仅依赖 Python 标准库（要求 Python 3.9+；若需无损合并含复杂表结构的既有 `config.toml`，建议使用 Python 3.11+，遇到无法安全解析的配置时安装器会保留原文件并提示）。
 
-## 一、这套配置解决什么实际问题
+---
 
-长周期科研与工程会话最容易在交接和边界上出岔子：上下文压缩后漏掉用户的补充约束、审查子代理顺手改掉被审源码、算例没跑通却被归纳成“已验证”、临时文件写进其他项目目录，或是跨端调用遇到额度耗尽后原地死循环重试。本仓库用“规则约束 + 生命周期钩子 + 编排脚本”把这些环节管住：
+## 一、为什么需要这套配置（解决 AI-CAE 研发的真实痛点）
 
-| 常见痛点 | 本仓库的做法 | 实际作用边界 |
+用 AI 辅助推导离散格式、编写和审查大型数值求解器时，最容易在以下四个环节翻车：
+
+1. **长对话自动压缩丢掉前置物理与数值约定**：推导几百行可压缩 Navier-Stokes 离散算子、弯曲网格度量恒等式，或排查 C++/Fortran/Python 混合求解器时，客户端中途触发上下文压缩，把首轮立项定下的无量纲化基准、远场／壁面边界通量正负号或守恒判据直接漏掉。
+2. **为凑测试绿灯偷偷放宽容差或虚报“已验证”**：遇到离散守恒残差不降或制造解网格收敛阶（EOC）不达标，模型擅自把 `rtol=1e-12` 改成 `1e-4`、删改测试断言，或者刚改完源码还没跑算例就汇报“验证通过”。
+3. **只读审查变顺手改代码、脚本跑偏越界污染其他算例**：本想让子代理独立核查雅可比矩阵（Jacobian）或通量公式，它却顺手改了被审源码；或是命令写偏，在项目目录外新建 `git worktree`、误改相邻算例目录乃至宿主机全局配置。
+4. **单一客户端难以兼顾“百万窗口文献统筹”与“硬核公式编码攻坚”**：反重力擅长多篇文献对照、跨模块全局梳理与规范中文技术写作，Codex（`Astra`／`Sol`）擅长深层符号推导、高阶格式稳定性分析与 `872k` 窗口代码闭环；手动在两个窗口间复制粘贴既容易丢条件，遇到某端额度耗尽还会卡在半途。
+
+本仓库通过**全局规则（`R0–R11`）+ 本地同步守护脚本（Hooks）+ 严格只读子代理 + 跨端 CLI 编排器（`cae-harness`）**把上述漏洞逐一堵住：
+
+| AI-CAE 常见翻车点 | 本仓库的解决机制 | 实际作用边界（不夸大） |
 | --- | --- | --- |
-| 每个新项目都要重复交代中文规范、目录精简和验收标准 | 统一全局规则 `R0–R11`，具体物理模型与数值容差留在项目 `AGENTS.md` | 固化通用工程习惯，不覆盖具体课题的物理方程与收敛判据 |
-| 会话压缩或续接后丢掉早期诉求、插话和最新拍板 | 压缩／恢复钩子自动从本地轨迹提取并归档用户原话 | 完整保留原始指令供模型重读核对；存在截断缺口时如实标明 |
-| 审查时顺手改代码，失去独立复核意义 | 三个严格只读角色（通读摘录、审计核验、方向／数理协作） | 读写职责分离，审查结论必须附文件行号交回总控复核 |
-| 越界改其他项目、建外部 `git worktree` 或误改全局配置 | `R4` 目录硬边界 + 安装预检 + `PreToolUse` 检查与宿主沙箱 | 项目外写入须经用户明确批准；标准临时目录与运行缓存正常放行 |
-| 同一个算例日志被反复轮询、等待过程同质回复刷屏 | 日志复合指纹门禁 + `Stop` 数值进展识别守卫 | 文件有新内容或残差／步数有更新才放行，拦住原地空转刷屏 |
-| 超长会话已经频繁压缩丢上下文，却还在继续铺摊子 | 长会话预警、排空（`drain`）、冻结（`freeze`）与结构化交接 | 反重力自动收口核验交接提示词；Codex 默认采用 `advisory` 提醒 |
-| 不分轻重缓急乱选模型，或对侧额度耗尽后卡死 | 主会话尊重用户选择，后台按任务专长选模选挡，支持额度熔断与本侧接管 | 攻坚用单模型最高挡与最大声明窗口，默认禁用 `ultra` 套娃裂变 |
-| 嘴上说“全部读完／验证通过”，实际缺运行依据 | 结构化 JSON 回执、阅读覆盖清单与 `--verify-cmd` 硬门禁 | 严格区分“源码存在”“离线测试通过”与“真实宿主／算例实测” |
+| 每个新课题都要重复交代中文规范、精简目录与容差红线 | 双端统一部署全局规则 `R0–R11`；具体控制方程与离散参数留在项目内 `AGENTS.md` | 固化通用科研与工程纪律，不覆盖具体算例的物理模型与收敛判据 |
+| 上下文自动压缩或跨天续接后，忘掉首轮假设与中途拍板 | 压缩／恢复钩子自动从本地会话轨迹提取并归档全部用户原话 | 自动提醒模型重读磁盘原话核对；底层轨迹本身被截断时如实标明缺口 |
+| 独立核查时顺手改坏源码，失去第三方复核意义 | 双端对称配置三个严格只读子代理（通读摘录、审计核验、数理推导与润色协作） | 读写权限物理隔离；所有审查发现必须附文件路径与行号交回总控复核 |
+| 严禁放宽 `rtol`／`atol`，区分“改完代码”与“算例跑通” | `R3.6` 验收红线 + 结构化 JSON 回执 + `cae-harness gate` 外部验证命令门禁 | 严格区分“源码存在”“离线测试通过”与“真实宿主／算例实测通过” |
+| 越界修改相邻算例、建外部 `git worktree` 或改乱全局配置 | `R4` 目录硬边界 + Python AST／Shell 子句静态检查 + Codex `workspace-write` 沙箱 | 项目外写删须经用户明确批准；系统标准临时目录与运行缓存正常放行 |
+| 同一个算例残差日志被反复空读、空等套话连续刷屏 | 日志复合指纹门禁 + 回复数值进展识别守卫 | 日志内容有变化或迭代步数／残差有推进才放行，拦截原地空转刷屏 |
+| 会话已频繁压缩丢细节，还在继续派任务铺摊子 | 长会话分级预警、排空（`drain`）、冻结（`freeze`）与交接四要素核验 | 反重力自动收口生成【新对话提示词】；Codex 默认采用 `advisory` 提醒不强停 |
+| 跨端攻坚选错轻量模型，或对侧配额耗尽后死循环重试 | 默认满血旗舰选模配窗（按需才降挡省流）+ 额度冷却熔断与 `--fallback-on-quota` 本侧回退 | 预检或启动期额度耗尽且工作区未改动时，自动切回本侧匹配旗舰模型完成 |
 
-## 二、协作架构：原生子代理、复合模式与 `cae-harness`
+---
 
-### 1. 四类执行层各管什么
+## 二、三套部署模式怎么选
 
-| 层级 | 运行位置 | 上下文窗口形态 | 模型与推理挡位谁定 |
+仓库安装器会自动探测本机与跨子系统（Windows `<->` WSL）已安装的客户端，单端与双端共用同一套源码，互不绑架：
+
+| 部署模式 | 适用人群 | 安装参数 | 实际部署内容与生效路径 |
 | --- | --- | --- | --- |
-| 前端交互主会话 | 反重力或 Codex 当前聊天窗 | 当前主会话窗口 | 用户在客户端直接选定，后台脚本绝不反向篡改 |
-| 宿主内置复合模式 | 宿主内部（如反重力 `Orchestrator`） | 单一会话内多模型交替共享同一窗口 | 宿主固定编排，不支持外部 `--effort` 调挡 |
-| 本侧原生子代理 | 反重力 `invoke_subagent` 或 Codex `spawn_agent` | 每个原生子代理拥有独立的子会话上下文窗口 | 主线程按宿主原生接口指定角色与继承／显式模型 |
-| `cae-harness` 跨端 CLI | 独立启动的 `codex exec` 或 `agy` 无头进程 | 全新独立 CLI 会话，按所选模型声明最大窗口配置 | 脚本按任务专长自动匹配或按 `--engine`／`--tier` 显式指定 |
+| **双端协同（推荐）** | 同时安装了反重力与 Codex，希望文献统筹与硬核公式／求解器编码互补 | `--app both`（或默认 `auto`） | 同时配齐下方两端的全部独立能力，并打通 `cae-harness` 双向无头调用与额度熔断回退 |
+| **单反重力模式** | 只用 Google Antigravity | `--app antigravity` | 安装 `~/.gemini/config/plugins/user-guard` 原生插件（`R0–R11`、四类守护钩子、三个只读子代理、共享技能与可选 `zotero-mcp`） |
+| **单 Codex 模式** | 只用 OpenAI Codex | `--app codex` | 同步 `~/.codex/AGENTS.md`（自动保留末尾自定义 `## 工具与本机` 段落）、三个只读子代理（`~/.codex/agents/*.toml`）、原话恢复与交接钩子、`workspace-write` 沙箱基线及可选 `zotero-mcp` |
+
+---
+
+## 三、日常怎么用：四层执行架构与双端配合流
+
+### 1. 四类执行层职责边界（彻底理清谁归谁管）
+
+| 执行层 | 运行位置 | 上下文窗口形态 | 模型与思考挡位由谁决定 |
+| --- | --- | --- | --- |
+| **前端交互主会话** | 反重力或 Codex 当前桌面／终端窗口 | 当前主会话窗口 | 用户在前端界面自选，后台脚本绝不反向篡改 |
+| **宿主内置复合模式** | 宿主内部（如反重力 `Orchestrator`） | 单一会话内多模型交替共享同一个窗口（容量不叠加） | 宿主固定编排，不支持外部传 `--effort` 调挡 |
+| **本侧原生只读子代理** | 反重力 `invoke_subagent` 或 Codex 原生子代理 | 每个子代理拥有独立的子会话大上下文窗口 | 反重力侧默认 `inherit` 完全跟随主会话模型与挡位，不受 `cae-harness` 影响 |
+| **`cae-harness` 跨端 CLI** | 按需启动的 `codex exec` 或 `agy` 独立无头进程 | 全新隔离会话，自动下发所选模型声明的最大上下文窗口 | 由 `cae-harness` 按任务性质独立读取运行侧模型目录选定，不受前端主控模型影响 |
 
 ```mermaid
 flowchart TB
-    U["用户：目标、物理／工程约束与验收判据"] --> M["前端总控（默认反重力 Carbon High，或按项目选 Codex）"]
-    M --> N["本侧原生只读子代理（各自独立大上下文窗口）"]
-    M --> H["按需调用 cae-harness（数学公式推导／核心代码与门禁）"]
-    H --> C["Codex CLI：Astra / Sol（max 最高挡 + 872k 声明最大窗口）"]
-    H -. "Codex 额度熔断 (--fallback-on-quota)" .-> A["自动切回反重力本侧匹配模型与最高可用挡位"]
-    N --> R["总控亲自复核原始行号与实测回执后交付"]
+    U["开发者：物理问题、边界条件、容差判据与授权目录"] --> M["前端总控（默认反重力 Carbon High，或按项目指定 Codex）"]
+    M --> N["本侧原生只读子代理（inherit 跟随主对话 + 各自独立大窗口）<br/>长篇文献通读摘录 / 多文件公式与行号核验"]
+    M --> H["按需调用 cae-harness（无头 CLI 独立进程）<br/>PDE 与高阶格式推导 / 核心求解器编码 / 门禁验收"]
+    H --> C["Codex CLI：Astra / 最新代 Sol<br/>默认单模型最高挡 max + 872,000 声明最大窗口"]
+    H -. "Codex 额度耗尽且未改文件 (--fallback-on-quota)" .-> A["自动熔断并切回反重力本侧 Carbon (High) 完成"]
+    N --> R["总控亲自查对原文件行号、通量符号与算例实测输出后交付"]
     C --> R
     A --> R
 ```
 
-`cae-harness` 是本仓库维护的本地 Python 编排脚本与技能说明，**只调用用户在本机通过官方渠道安装并登录的 `codex` 与 `agy` CLI**，不经过任何第三方中转或非官方接口，也不在未调用时常驻后台。
+`cae-harness` 只是本仓库内的一份纯标准库 Python 脚本，**仅调用用户在本机通过官方渠道安装并登录的 `codex` 与 `agy` CLI**，不经过任何第三方中转接口，未调用时也不在后台常驻。
 
-### 2. 日常推荐工作流：反重力主控 + Codex 专长攻坚 + 额度熔断回退
+### 2. 日常科研与求解器开发三步配合法
 
-1. **反重力主会话与本侧原生子代理（大上下文统筹）**：
-   - 日常科研与综合工程推荐在反重力前端选用单模型 **`Gemini 4 Carbon (High)`** 作总控。相比在同一窗口内交替调用 Carbon 与 Hydrogen 的固定复合模式 `Orchestrator (Carbon)`，纯 `Carbon (High)` 主会话单次持续步数更长，且通过 `invoke_subagent` 派生的 `readonly-reader`、`readonly-auditor`、`readonly-collaborator` 默认采用 `inherit`，**每个子代理都能直接继承纯 `Carbon (High)` 并获得各自独立的约 `1M` 标称上下文窗口**，非常适合并行通读长文献、梳理多模块代码和独立核验行号。
-2. **数学公式推导与核心代码调用 Codex（因地制宜选 `Astra`／`Sol` + 最高挡 + 最长上下文）**：
-   - 遇到偏微分方程推导、高阶格式离散（如 DGSEM／WENO 通量、雅可比矩阵、特征分解、守恒性与熵稳定分析）或核心求解器代码实现时，反重力总控通过 `cae-harness` 发起 Codex 无头任务：
-     - **数学推导与路线攻坚（`math`／`direction`）**：自动优选深度推理模型 **`Astra`**（`gpt-6-astra`）；
-     - **核心代码实现、大输入审计与验收门禁（`code`／`audit`／`gate`）**：自动优选最新代工程主力 **`Sol`**（`gpt-6.1-sol`，多代并存时自动选中最新代，也可显式传 `codex:astra` 或 `codex:sol`）；
-     - **最高纯思考挡位与最长上下文**：数理推导与含核心公式的代码任务自动启用单模型最高非委派挡 **`max`**（跳过内部二次派生的 `ultra`），并读取该模型自身声明的最大上下文窗口（当前目录为 **`872,000` token**）下发给 `codex exec`。
-3. **Codex 额度不够时自动熔断并切回反重力本侧完成**：
-   - 调用时附带 `--fallback-on-quota`：一旦 Codex 返回用量耗尽或处于本地冷却期（`quota_exhausted`），且尚未修改工作区文件，脚本会立即登记 Codex 冷却状态（阻断后续无效重试），同时**自动切回反重力本侧匹配的模型与最高可用挡位（如 `gemini-4-carbon-high`）及本侧最大可用上下文**继续完成，并在回执 `quota_fallback` 中写明切换记录。
+1. **反重力主控统筹 + 原生 `inherit` 子代理并行读文献／审代码**：
+   日常课题推进推荐在反重力前端选择单模型 **`Gemini 4 Carbon (High)`**。相比在同一窗口内交替调用模型的 `Orchestrator (Carbon)`，纯 `Carbon (High)` 单轮持续推理更稳，且通过 `invoke_subagent` 唤起的 `readonly-reader`、`readonly-auditor`、`readonly-collaborator` 会自动继承 `Carbon (High)` 并各自获得独立的约 `1M` 标称上下文窗口，适合并行通读多篇参考文献或跨几十个源文件摘录边界条件与算子实现。
+2. **硬核数理推导与核心求解器编码交给 `cae-harness` 调 Codex（默认满血旗舰 + 按需省流）**：
+   遇到雅可比矩阵推导、DGSEM／WENO 离散守恒与熵稳定证明、CFL 步长分析或核心求解器模块编写与门禁测试时，通过 `cae-harness` 派发 Codex 无头任务：
+   - **数学推导、路线论证与高复杂度数理审查（`math`／`direction`）**：自动优选深度推理旗舰 **`Astra`**（`gpt-6-astra`）；
+   - **求解器代码实现、常规审查、大型代码审计与验证门禁（`code`／`review`／`audit`／`gate`）**：自动优选最新代工程旗舰 **`Sol`**（`gpt-6.1-sol`，多代并存时自动取最新代）；
+   - **默认满血（选项 A）与按需省流（选项 B）**：除纯文字润色（`polish` 短篇保持 `medium`、长篇保持 `high` 防过度发挥）外，默认一律启用所选旗舰模型的**单模型纯思考最高挡 `max`**（跳过内部二次派生的 `ultra` 挡防套娃烧穿配额），并显式下发模型声明最大上下文窗口（当前目录为 **`872,000` token**）。**只有当用户明确或模糊提出降挡、省额度、省 token 时**，脚本才切换为分级省流模式（常规任务用 `high`，表面格式／拼写微查启用轻量模型 + `low`）。
+3. **附带 `--fallback-on-quota` 兜底额度波动**：
+   当 Codex 处于用量冷却期或在预检／启动阶段报 `quota_exhausted` 且尚未改动工作区文件时，脚本立即记录冷却时间阻断盲目重试，并自动切回反重力本侧匹配的旗舰模型与最高可用挡位（如 `gemini-4-carbon-high`）继续完成任务，切换详情完整记入回执 `quota_fallback` 字段。
 
-## 三、模型、挡位与上下文能力对照表
+---
 
-**核验日期：2026-11-13。** 下表汇总官方公开文档、本机客户端目录声明与受控实测数据；实际运行时仍以当前执行侧读取到的模型目录为准。
+## 四、模型、挡位与五层上下文能力矩阵
 
-### 1. 双端主要模型与模式规格
+**核验日期：2026-11-13。** 下表汇总官方公开文档、本机客户端模型目录声明及受控实测结果；实际运行时以当前执行侧读取到的模型目录为准。
 
-| 客户端／模型 | 适用定位 | 可调挡位／运行机制 | 上下文窗口依据 |
+### 1. 双端主要模型规格对照
+
+| 客户端／模型 | 研发场景定位 | 可调思考挡位／运行机制 | 上下文窗口依据 |
 | --- | --- | --- | --- |
-| Codex：`GPT-6-Astra` | 高难度数学推导、物理建模与复杂根因分析 | 目录支持 `low/medium/high/xhigh/max/ultra`（后台最高选 `max`） | 本机目录声明默认 `272,000`、最大 `872,000` token（有效比 95%） |
-| Codex：`GPT-6.1-Sol` | 核心代码实现、大规模审计与命令门禁主力 | 同上六挡（含数学／数值公式线索或传 `--tier max` 时用 `max`） | 官方默认 `500,000`；本机目录声明最大 `872,000` token |
-| Codex：`GPT-6.1-Terra` | 多模态理解、界面操作与边界清晰的代码修改 | 同上六挡 | 本机目录声明默认 `500,000`、最大 `872,000` token |
-| Codex：`GPT-6-Luna` | 表面格式核查、简单文本提取与轻量检查 | 目录支持至 `max`（不含 `ultra`） | 本机目录声明默认 `272,000`、最大 `872,000` token |
-| 反重力：`Gemini 4 Carbon`／`Argon` | 推荐主会话总控与复杂工程科研推理 | 当前 CLI 目录提供 `low/medium/high`，单模型最高可用挡为 `high` | Google 模型文档公布 API 窗口 `1,048,576` token；客户端受检查点策略管理 |
-| 反重力：`Gemini 4 Hydrogen` | 日常快速编码实现与轻量检查 | 当前 CLI 目录提供 `low/medium/high/xhigh` | `/context` 面板显示约 `1.0M`，CLI 单消息长度与检查点阈值另算 |
-| 反重力：`Orchestrator (Carbon/Argon)` | 单会话内由 Carbon/Argon 规划审阅、Hydrogen 实施 | 固定复合配置，不可传 `--effort`；不等于多代理并发 | 内部子模型共享同一会话窗口，窗口容量不会叠加 |
+| Codex：`GPT-6-Astra` | 偏微分方程推导、高阶格式分析、复杂物理建模与根因排查 | 目录支持 `low/medium/high/xhigh/max/ultra`（后台默认选 `max`） | 本机目录声明默认 `272,000`、最大 `872,000` token（有效比 95%） |
+| Codex：`GPT-6.1-Sol` | 求解器核心编码、常规审查、全仓审计与验证门禁主力 | 同上六挡（后台默认选 `max`；用户要求降挡／省 token 时降为 `high`） | 官方默认 `500,000`；本机目录声明最大 `872,000` token |
+| Codex：`GPT-6.1-Terra` | 多模态图表理解、界面交互与边界明确的代码修改 | 同上六挡 | 本机目录声明默认 `500,000`、最大 `872,000` token |
+| Codex：`GPT-6-Luna` | 仅在用户要求降挡／省 token 且属表面拼写／格式微查时启用 | 目录支持至 `max`（不含 `ultra`） | 本机目录声明默认 `272,000`、最大 `872,000` token |
+| 反重力：`Gemini 4 Carbon`／`Argon` | 推荐前端主会话总控、长文献综合与跨模块架构把关 | 当前 CLI 目录提供 `low/medium/high`，单模型最高可用挡为 `high` | Google 官方公布 API 窗口 `1,048,576` token；客户端受自动检查点策略管理 |
+| 反重力：`Gemini 4 Hydrogen` | 快速辅助编码与按需省流模式下的表面格式微查 | 当前 CLI 目录提供 `low/medium/high/xhigh` | `/context` 面板显示约 `1.0M`，CLI 单条消息长度与检查点阈值另算 |
+| 反重力：`Orchestrator (Carbon/Argon)` | 单一窗口内由 Carbon/Argon 规划审阅、Hydrogen 实施 | 固定复合配置，不可传 `--effort`；并非多子代理并发 | 内部子模型共享同一会话窗口，总容量不会叠加 |
 
-参考来源：[OpenAI Codex 模型说明](https://learn.chatgpt.com/docs/models)、[Antigravity 模型说明](https://antigravity.google/docs/models)、[Gemini 4 Hydrogen 与 Orchestrator 公告](https://antigravity.google/blog/gemini-4-hydrogen-in-google-antigravity)、[Google Gemini 窗口规格表](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/migrate)。
+参考文档：[OpenAI Codex 模型说明](https://learn.chatgpt.com/docs/models)、[Antigravity 模型说明](https://antigravity.google/docs/models)、[Gemini 4 Hydrogen 与 Orchestrator 公告](https://antigravity.google/blog/gemini-4-hydrogen-in-google-antigravity)、[Google Gemini 窗口规格表](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/migrate)。
 
-### 2. 上下文窗口的五个不同层次（避免混用）
+### 2. 区分上下文窗口的五个层级（避免把“标称窗口”当成“单次塞入上限”）
 
-1. **API／目录声明最大窗口**：模型本身支持的最大上下文（如 Codex 目录声明的 `872,000` token、Gemini 4 API 公布的 `1,048,576` token）。`cae-harness` 调用 Codex 时会按所选模型显式下发 `-c model_context_window=<最大声明窗口>`。
-2. **单条消息入口上限**：客户端 RPC 对单次输入的字符／字节限制。2026-11-13 实测中，Codex `turn/start` 单条输入上限为 `1,048,576` 字符；反重力 CLI `1.5.8` 单条输入达 44～66 万字节时出现入口截断标记，改为每轮约 13 万字节分批送入则无截断。
-3. **宿主自动检查点（压缩）触发点**：客户端何时把旧历史折叠为摘要。实测 Codex `Sol` 在分轮累积至 `808,892` 输入 token（占 `828,400` 有效窗口的 97.65%）时同轮精确提取 6 项随机口令全部命中且未触发压缩；反重力 CLI `Hydrogen` 在 `241,625` 输入 token 时 6 项全中，继续追加到 `290,028` token 时触发自动检查点压缩。详细记录见[生命周期与实测规范](docs/架构设计与生命周期钩子规范.md)。
-4. **分片规划输入预算**：`cae-harness audit` 为源码、提示词、文件清单与 JSON Schema 预留安全余量后的单次估算值（可通过 `--codex-input-budget` 与 `--agy-input-budget` 调整）。
-5. **实际阅读覆盖**：子任务真正读了哪些文件与行号，以结构化回执和主线程抽查为准。发生上下文压缩后，先按 `R9` 恢复用户原话并核对缺口，不盲目重跑已经落盘的代码写入。
+1. **目录／API 声明最大窗口**：模型支持的最大上下文容量（如 Codex 目录声明 `872,000` token、Gemini 4 API 公布 `1,048,576` token）。`cae-harness` 启动 Codex 时显式下发 `-c model_context_window=<最大声明窗口>`。
+2. **单条消息入口上限**：客户端单次 RPC 请求允许送入的字符／字节数。`2026-11-13` 受控实测显示：Codex `turn/start` 单条消息上限为 `1,048,576` 字符；反重力 CLI `1.5.8` 单条消息达 44～66 万字节时出现入口截断标记，改为每轮约 13 万 UTF-8 字节分批送入则无截断（超长源码应让模型在目录内按文件读取，而非硬塞进单条提示词）。
+3. **宿主自动检查点（压缩）触发点**：客户端在累积多少 token 后自动把早期对话折叠成摘要。实测 Codex `GPT-6.1-Sol` 分轮累积至 `808,892` 输入 token（占 `828,400` 有效窗口的 **97.65%**）时未触发压缩，首中尾 6 处随机口令 **6/6 全部精确命中**；反重力 CLI `1.5.8` `Hydrogen` 累积至 `241,625` token 时 **6/6 全中**，继续追加至 `290,028` token 时触发自动检查点压缩（压缩后降至 `14,063` token，早期随机细节凭摘要无法找回）。完整测试记录见[架构设计与生命周期钩子规范](docs/架构设计与生命周期钩子规范.md)。
+4. **分片审计输入预算**：`cae-harness audit` 扣除系统提示词、文件清单与 JSON Schema 开销并预留安全余量后的单批源码上限（可通过 `--codex-input-budget`、`--agy-input-budget` 调整）。
+5. **实际阅读覆盖**：子任务真正读完了哪些文件与行号，以结构化回执和总控抽查为准。发生上下文压缩后，严格按 `R9` 重读原话归档核对缺口，绝不盲目重跑已经落盘的代码修改。
 
-### 3. 后台任务默认思考挡位分级
+### 3. `cae-harness` 选模与思考挡位速查表
 
-| 任务场景 | 后台选路与挡位策略 |
+| 场景分类 | 选模与挡位策略 |
 | --- | --- |
-| 数学公式推导、路线裁决、高阶数值格式／守恒性／稳定性、并发根因、门禁失败排错 | 深度推理专长模型 + 该模型支持的单模型最高挡（如 `max`／`xhigh`／`high`） |
-| 常规模块编码、常规代码审查、分片审计与长篇技术润色 | 工程主力模型 + `high` 挡（也可显式传 `--tier max` 拉满） |
-| 短篇文字润色（防过度发挥引发无声放大） | `medium` 挡 |
-| 表面格式、拼写核查或显式省额度任务 | 轻量高速模型 + `low` 挡 |
+| **默认满血模式**（`math`／`direction`／`code`／`review`／`audit`／`gate`） | 只选旗舰专长模型（`Astra`／最新代 `Sol`／`Carbon`）+ 所选模型**单模型纯思考最高挡**（Codex `max`、反重力 `Carbon` `high`）+ 声明最大窗口，绝不自动降级轻量小模型 |
+| **纯文字润色**（`polish`） | 旗舰主力模型 + 短篇 `medium`／长篇 `high`（抑制过度改写，严防 R5 无声放大） |
+| **按需省流模式**（仅当用户明确或模糊提出降挡、省额度、省 token 时启用） | 常规编码／审查／审计用 `high` 挡（`gate` 首轮失败第 2 轮仍可升至 `max` 排错）；仅表面拼写／格式微查切至轻量高速模型（`Luna`／`Hydrogen`）+ `low` 挡 |
 
-## 四、`cae-harness` 常用命令速查
+---
 
-在仓库根目录可直接运行（Windows 用 `python`，WSL／Linux／macOS 用 `python3`；部署后也可在技能目录运行）：
+## 五、`cae-harness` 常用命令速查
+
+在仓库根目录可直接调用（Windows 用 `python`，WSL／Linux／macOS 用 `python3`；部署后也可在技能目录内执行）：
 
 ```sh
-# 1. 只读查看双端模型目录、声明窗口与各场景推荐选路
+# 1. 只读评估本机双端模型目录、声明窗口与各任务推荐选路（零写入）
 python -B template/user-guard/skills/cae-harness/scripts/cae_harness.py assess --caller antigravity
 
-# 2. 反重力调用 Codex 推导数学公式／离散格式（自动选 Astra + max 挡 + 872k 窗口；Codex 额度不足时自动切回反重力本侧）
+# 2. 反重力调 Codex 推导 PDE 离散格式／雅可比矩阵（自动选 Astra + max 挡 + 872k 窗口；配额耗尽自动回退本侧）
 python -B template/user-guard/skills/cae-harness/scripts/cae_harness.py task --caller antigravity --engine codex:default --kind math --tier max --fallback-on-quota --target "<项目目录>" --task-file "<任务单.md>"
 
-# 3. 反重力调用 Codex Sol 实现核心代码并运行验收命令
+# 3. 反重力调 Codex Sol 实现求解器算子并执行守恒律／收敛阶门禁验收
 python -B template/user-guard/skills/cae-harness/scripts/cae_harness.py gate --caller antigravity --worker codex:sol --tier max --fallback-on-quota --target "<项目目录>" --task-file "<任务单.md>" --write-scope "src/*.py" --verify-cmd "python -B -m unittest discover -s tests"
 
-# 4. Codex 调用反重力做技术表述润色（先 dry-run 预演）
+# 4. Codex 调反重力润色论文或技术报告段落（先 --dry-run 预演）
 python -B template/user-guard/skills/cae-harness/scripts/cae_harness.py task --caller codex --engine agy:default --kind polish --tier medium --target "<项目目录>" --task-file "<任务单.md>" --dry-run
 ```
 
-> **Windows 下从 Codex 反向调用 `agy` 的沙箱注意事项**：反重力桌面／主会话调 `codex` 可直接访问宿主机 `.codex` 目录；但若在 Windows 版 Codex 的受限工作区沙箱内反向启动 `agy.exe`，沙箱默认只放行当前项目目录与 `%TEMP%`，会拦截 `agy.exe` 向 `~/.gemini/antigravity-cli` 写入运行锁与会话状态，导致进程卡住直至超时。确需从 Windows Codex 调 `agy` 时，应使用宿主放行 `~/.gemini` 写权限的执行通道，并将 `--timeout` 设为 `300` 秒以上。
+> **Windows 版 Codex 反向调用 `agy.exe` 的沙箱权限说明**：反重力主会话直接启动 `codex` 可正常访问宿主机 `.codex` 目录；但若在 Windows 版 Codex 的受限工作区沙箱内反向启动 `agy.exe`，沙箱默认只放行当前项目目录与 `%TEMP%`，会阻止 `agy.exe` 向 `~/.gemini/antigravity-cli` 写入状态锁导致卡死超时。确需从 Windows Codex 反向调 `agy` 时，须通过放行 `~/.gemini` 写权限的宿主通道运行，并将 `--timeout` 设为 `300` 秒以上。
 
-完整参数与返回结构说明见 [cae-harness 技能文档](template/user-guard/skills/cae-harness/SKILL.md) 与 [协作实践指南](docs/反重力全域工程化最佳实践指南.md)。
+更多实战技巧与参数细节见[工程及科研协作实践指南](docs/反重力全域工程化最佳实践指南.md)与 [`cae-harness` 技能手册](template/user-guard/skills/cae-harness/SKILL.md)。
 
-## 五、安装、升级与生效路径
+---
 
-1. **单反重力（`--app antigravity`）**：安装 `~/.gemini/config/plugins/user-guard` 插件（规则、钩子、只读子代理与技能）。
-2. **单 Codex（`--app codex`）**：同步 `~/.codex/AGENTS.md`（保留用户自定义 `## 工具与本机` 段落）、只读子代理、原话恢复与交接钩子及工作区沙箱基线。
-3. **双端部署（`--app both` 或自动检测）**：一次配齐双端独立工作流与跨端协作技能。
+## 六、安装、升级与回归验证
 
-| 配置项 | 反重力生效位置 | Codex 生效位置 |
-| --- | --- | --- |
-| 全局规则 `R0–R11` | `~/.gemini/config/plugins/user-guard/rules/AGENTS.md` | `~/.codex/AGENTS.md`（保留末尾自定义本机段） |
-| 三个只读子代理 | 插件内 `agents/*.md` | `~/.codex/agents/*.toml` |
-| 压缩恢复与交接钩子 | 插件内 `hooks/` 与 `hooks.json` | `~/.codex/hooks/` 与 `~/.codex/hooks.json` |
-| 跨端协作技能 | 插件内 `skills/cae-harness/` | `~/.codex/skills/cae-harness/` |
-
-### 快速体验与安装
+### 1. 一键探测、预演与安装
 
 ```sh
 git clone https://github.com/Xinyu-Li-1997/Antigravity_Codex_configuration.git
 cd Antigravity_Codex_configuration
 
-# 只读探测本机与 WSL 客户端状态（零写入）
+# 第一步：只读探测本机与 WSL 客户端安装状态（零写入）
 python -B install.py --probe-apps
 
-# 预演安装计划（零写入）
+# 第二步：空跑预演变更计划，查看拟写入的全局路径（零写入）
 python -B install.py --dry-run --yes
 ```
 
-也可以在反重力或 Codex 中打开本仓库，直接对助手说：
+你也可以直接用反重力或 Codex 打开本仓库，把下面这句话发给当前助手自动引导配置：
 
 > 请按仓库 `AGENTS.md` 先探测并预演本机配置，列出拟写入路径，保留我现有的模型选择和本机自定义说明，等我确认后再正式安装。
 
-正式安装入口：Windows 运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1`，Linux／macOS／WSL 运行 `bash install.sh`。常用参数如下：
+确认预演无误后执行正式安装：
+- **Windows（PowerShell）**：`powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1`
+- **Linux／macOS／WSL**：`bash install.sh`
 
-| 参数 | 说明 |
+| 安装器常用参数 | 作用说明 |
 | --- | --- |
-| `--app auto/codex/antigravity/both` | 指定部署目标（默认 `auto` 自动探测） |
-| `--probe-apps` | 只读输出客户端与跨子系统探测 JSON |
-| `--dry-run` | 只打印变更计划，不改任何文件 |
-| `--yes` | 跳过交互确认（适合脚本化或已由用户明确批准的场景） |
-| `--sync-model-defaults` | 将前端默认模型同步为推荐配置（默认升级保留用户已选模型） |
-| `--no-model-config` | 完全跳过模型配置（与 `--sync-model-defaults` 互斥） |
-| `--codex-handoff-mode advisory/enforce/off` | Codex 长会话交接模式（首次安装默认 `advisory` 仅提醒，升级保留原设置） |
-| `--codex-handoff-compactions N` | Codex 严格模式下的压缩次数阈值（默认 `0` 不按次数强停） |
-| `--no-zotero` | 跳过可选的 `zotero-mcp` 文献插件配置 |
+| `--app auto/codex/antigravity/both` | 指定部署范围（默认 `auto` 自动探测已安装客户端） |
+| `--probe-apps` | 只读输出本侧与跨子系统（Windows `<->` WSL）客户端探测 JSON |
+| `--dry-run` | 仅打印拟执行的同步计划，不修改任何磁盘文件 |
+| `--yes` | 跳过交互确认提示（适合已在对话中获用户明确批准后执行） |
+| `--sync-model-defaults` | 将前端默认模型显式更新为推荐配置（默认升级保留用户自选模型） |
+| `--no-model-config` | 完全跳过模型配置逻辑（与 `--sync-model-defaults` 互斥） |
+| `--codex-handoff-mode advisory/enforce/off` | 设置 Codex 长会话交接模式（首次安装默认 `advisory` 仅提醒，升级保留原配置） |
+| `--codex-handoff-compactions N` | Codex `enforce` 模式下的压缩次数阈值（默认 `0` 不按次数强停） |
+| `--no-zotero` | 跳过可选的 `zotero-mcp` 文献检索服务配置 |
 
-## 六、回归测试与版本维护清单
+### 2. 仓库修改后的四步回归清单
 
-更新模型矩阵、钩子逻辑或安装器后，按以下顺序完成验证再提交：
+改动本仓库安装器、钩子或编排脚本后，须依次完成以下检查再提交：
 
-1. **核对目录与文档时效**：运行 `probe`／`assess` 检查最新客户端版本、可用模型、声明窗口与挡位，更新本表日期，未知字段直接标“未知”。
+1. **核对目录时效**：运行 `probe`／`assess` 检查最新客户端版本、模型目录、声明窗口与挡位，未知项如实标“未知”。
 2. **三模式临时沙箱隔离安装**：
    ```sh
    python -B install.py --app codex --codex-home "<临时目录>/codex_home" --no-zotero
    python -B install.py --app antigravity --target-dir "<临时目录>/plugins/user-guard" --no-zotero
    python -B install.py --app both --target-dir "<临时目录>/plugins/user-guard" --codex-home "<临时目录>/codex_home" --no-zotero
    ```
-3. **Windows 与 WSL 双端离线全量回归**：
+3. **全量离线单元测试回归**：
    ```sh
    python -B -X utf8 -m unittest discover -s tests -p "test_*.py" -v
    ```
-4. **宿主实测与脱敏检查**：改动涉及真实宿主协议或模型选路时，补充受控会话实测并记录在[架构与钩子规范](docs/架构设计与生命周期钩子规范.md)中；确认无个人路径、硬件型号和凭据泄露后，征得用户同意再执行 `git commit`／`git push` 及生产环境同步。
+4. **宿主实测与隐私脱敏扫描**：涉及宿主钩子协议或模型选路改动时，补充受控实测并记入[架构设计与生命周期钩子规范](docs/架构设计与生命周期钩子规范.md)；确认不含个人用户名路径、具体硬件型号或密钥凭据后，经用户批准再提交推送或同步生产配置。
 
-## 七、仓库目录结构与开源许可
+---
 
-| 路径 | 职责说明 |
-| --- | --- |
-| `README.md` | 项目总览、协作架构、模型与上下文矩阵、安装与验证入口 |
-| `AGENTS.md` | 供反重力与 Codex 助手读取的本机自举配置与仓库维护规范 |
-| `install.py`、`install.ps1`、`install.sh` | 跨平台安装器、TOML 无损合并、链接越界防护与幂等镜像同步 |
-| `template/user-guard/` | 反重力插件及双端共用的规则、生命周期钩子、只读角色与 `cae-harness` 唯一源码 |
-| `template/codex/` | Codex 钩子模板与原生只读子代理定义（`*.toml`） |
-| `docs/` | [双向协作工程实践指南](docs/反重力全域工程化最佳实践指南.md)与[架构设计及生命周期钩子规范](docs/架构设计与生命周期钩子规范.md) |
-| `tests/` | 覆盖安装器、边界门禁、压缩恢复与跨端编排的离线回归测试套件 |
+## 七、仓库目录导览与开源许可
 
-本仓库仅调用用户从官方渠道安装并登录的 `codex`、`agy` CLI 与可选 `zotero-mcp` 工具，不内置任何第三方中转、私有凭据或绕过官方权限与计费的逻辑。采用 [Apache License 2.0](LICENSE) 开源许可（`Copyright 2026 Xinyu-Li-1997`）。
+```text
+Antigravity_Codex_configuration/
+├── README.md                                 # 仓库总入口：痛点定位、三套部署模式、协作架构与快速上手
+├── AGENTS.md                                 # 供反重力与 Codex 助手共读的四步本机自举配置与维护规范
+├── install.py / install.ps1 / install.sh     # 跨平台安装器：探测预演、TOML 无损合并、越界链接防护与幂等同步
+├── docs/
+│   ├── 反重力全域工程化最佳实践指南.md        # 日常科研与数值求解器开发实战配合指南
+│   └── 架构设计与生命周期钩子规范.md          # 代码分区总览、钩子事件协议、状态机算法与受控实测记录
+├── template/
+│   ├── user-guard/                           # 反重力原生插件及双端同源核心模板
+│   │   ├── plugin.json / hooks.json / README.md
+│   │   ├── rules/AGENTS.md                   # 双端共用的 R0–R11 全局工程与科学计算规则
+│   │   ├── hooks/*.py                        # 原话归档回溯、目录硬边界、防空转刷屏与长会话交接 5 个模块
+│   │   ├── agents/readonly-*.md              # 反重力三个 inherit 只读子代理（通读、审计、数理推导与润色）
+│   │   └── skills/cae-harness/               # 双端 CLI 协作技能手册（SKILL.md）与编排器（cae_harness.py）
+│   └── codex/
+│       ├── hooks.json                        # Codex 五类生命周期事件模板
+│       └── agents/readonly-*.toml            # Codex 三个 read-only 只读子代理定义
+└── tests/                                    # 安装器、边界守卫、压缩恢复与跨端编排全量离线测试套件
+```
+
+本仓库仅调用用户通过官方渠道安装并登录的 `codex`、`agy` CLI 与可选 `zotero-mcp` 工具，不内置任何第三方中转、私有凭据或绕过官方权限与计费的逻辑。采用 [Apache License 2.0](LICENSE) 开源许可（`Copyright 2026 Xinyu-Li-1997`）。

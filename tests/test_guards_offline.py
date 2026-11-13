@@ -40,6 +40,7 @@ class TestGuardsOffline(unittest.TestCase):
         self.tmp_root = Path(self.tmp_obj.name)
         self.plugin_data = self.tmp_root / "plugin_data"
         self.old_plugin_data = os.environ.get("PLUGIN_DATA")
+        self.old_harness_depth = os.environ.pop("CAE_HARNESS_DEPTH", None)
         os.environ["PLUGIN_DATA"] = str(self.plugin_data)
 
     def tearDown(self) -> None:
@@ -47,6 +48,10 @@ class TestGuardsOffline(unittest.TestCase):
             os.environ.pop("PLUGIN_DATA", None)
         else:
             os.environ["PLUGIN_DATA"] = self.old_plugin_data
+        if self.old_harness_depth is None:
+            os.environ.pop("CAE_HARNESS_DEPTH", None)
+        else:
+            os.environ["CAE_HARNESS_DEPTH"] = self.old_harness_depth
         self.tmp_obj.cleanup()
 
     def test_01_status_guard_unchanged_deny_and_updated_allow(self) -> None:

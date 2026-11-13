@@ -177,7 +177,11 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual((math['model'], math['reasoning_effort'], math['tier_reason'], math['profile_source'], math['effort_source']),
                          ('math-model', 'max', 'task_specialty_math_max', 'specialty_deep_reasoning', 'catalog_declared'))
         surface = report['recommendations']['codex']['surface_review']
-        self.assertEqual((surface['model'], surface['reasoning_effort']), ('fast-model', 'low'))
+        self.assertEqual((surface['model'], surface['selected_tier'], surface['reasoning_effort']), ('code-model', 'max', 'xhigh'))
+        eco_review = report['recommendations']['codex']['economy_review']
+        self.assertEqual((eco_review['model'], eco_review['reasoning_effort']), ('code-model', 'high'))
+        eco_surface = report['recommendations']['codex']['economy_surface_review']
+        self.assertEqual((eco_surface['model'], eco_surface['reasoning_effort']), ('fast-model', 'low'))
         matrix = {row['model']: row for row in codex['capability_matrix']}
         self.assertEqual(matrix['code-model']['capacity']['model_default_window_tokens'], 500000)
         self.assertIsNone(matrix['code-model']['capacity']['model_declared_max_window_tokens'])
@@ -332,7 +336,9 @@ assert sys.stdin.readline() == ''
                                                '--target', str(self.root), '--task', '检查结果'))
                 invoke.assert_not_called()
         with patch.dict(os.environ, {'CAE_DEFAULT_TIER': 'ultra'}, clear=True):
-            self.assertEqual(harness.select_task_tier(text='不要使用 ultra，检查结果')[0], 'high')
+            self.assertEqual(harness.select_task_tier(text='不要使用 ultra，检查结果')[0], 'max')
+        with patch.dict(os.environ, {'CAE_DEFAULT_TIER': 'high'}, clear=True):
+            self.assertEqual(harness.select_task_tier(text='检查结果'), ('high', 'env_default_tier'))
 
     def test_explicit_model_has_own_budget_cap(self):
         engines = backends()
@@ -765,7 +771,7 @@ assert sys.stdin.readline() == ''
 
         def runner(command, cwd, input_text, timeout_sec, **kwargs):
             self.assertIn('model_context_window=500000', command)
-            self.assertIn('model_reasoning_effort="high"', command)
+            self.assertIn('model_reasoning_effort="max"', command)
             self.assertEqual(command[command.index('-m') + 1], 'gpt-9-code')
             commands.append(command)
             name = 'solver.f90' if '- solver.f90\n' in input_text else 'more.f90'
@@ -960,14 +966,19 @@ assert sys.stdin.readline() == ''
         c_ultra = harness.resolve_execution_profile(engines, 'codex:default', tier_ultra, '推导', kind='math')
         self.assertEqual((c_ultra['model'], c_ultra['reasoning_effort']), ('model-demanding', 'ultra'))
 
-        # 2. 常规编码与审查：选大窗口工程主力模型 + high 挡；含高阶数值/守恒特征时自动升至 max
+        # 2. 常规编码与审查：默认（选项 A）选大窗口工程旗舰模型 + max 挡；要求省 token/降挡时（选项 B）切为 high 挡
         tier_code, reason_code = harness.select_task_tier('auto', 'code', '整理命令行参数解析辅助函数', 2, 1500)
-        self.assertEqual((tier_code, reason_code), ('high', 'task_routine_high'))
+        self.assertEqual((tier_code, reason_code), ('max', 'default_flagship_max'))
         c_code = harness.resolve_execution_profile(engines, 'codex:default', tier_code, '整理命令行参数解析辅助函数', kind='code', estimated_tokens=1500)
         self.assertEqual((c_code['model'], c_code['reasoning_effort'], c_code['profile_source']),
-                         ('model-workhorse', 'high', 'frontier_catalog'))
+                         ('model-workhorse', 'max', 'frontier_catalog'))
         a_code = harness.resolve_execution_profile(engines, 'agy:default', tier_code, '整理命令行参数解析辅助函数', kind='code', estimated_tokens=1500)
         self.assertEqual((a_code['model'], a_code['reasoning_effort']), ('gemini-7-pro-high', 'high'))
+        tier_code_eco, reason_code_eco = harness.select_task_tier('auto', 'code', '省点 token 整理命令行参数解析辅助函数', 2, 1500)
+        self.assertEqual((tier_code_eco, reason_code_eco), ('high', 'economy_adaptive_high'))
+        c_code_eco = harness.resolve_execution_profile(engines, 'codex:default', tier_code_eco, '省点 token 整理命令行参数解析辅助函数', kind='code', estimated_tokens=1500)
+        self.assertEqual((c_code_eco['model'], c_code_eco['reasoning_effort'], c_code_eco['profile_source']),
+                         ('model-workhorse', 'high', 'frontier_catalog'))
 
         # 否定词不应误触发降挡，且 DGSEM/边界条件审查自动拉满单模型纯思考最高挡并匹配深度推理模型
         tier_neg, reason_neg = harness.select_task_tier('auto', 'review', '不要低档，仔细检查 DGSEM 边界条件与守恒性', 2, 1000)
@@ -1048,9 +1059,11 @@ assert sys.stdin.readline() == ''
 
         self.assertEqual(harness._budget_for_spec(engines, 'codex:demanding'), 270000)
 
-        # 单文件表面拼写检查自动降至 low
-        tier_typo, reason_typo = harness.select_task_tier('auto', 'review', '检查注释错别字与 typo', 1, 300)
-        self.assertEqual((tier_typo, reason_typo), ('low', 'complexity_trivial_surface_task'))
+        # 单文件表面拼写检查默认仍保持旗舰 max；仅在模糊/明确要求省 token 或降挡时降至 low
+        tier_typo_default, reason_typo_default = harness.select_task_tier('auto', 'review', '检查注释错别字与 typo', 1, 300)
+        self.assertEqual((tier_typo_default, reason_typo_default), ('max', 'default_flagship_max'))
+        tier_typo, reason_typo = harness.select_task_tier('auto', 'review', '省点 token 检查注释错别字与 typo', 1, 300)
+        self.assertEqual((tier_typo, reason_typo), ('low', 'economy_trivial_surface_low'))
 
         # 验证 CLI 参数传递：codex 附带 model_reasoning_effort="max"（非 ultra），agy 使用挡位后缀 slug 且不重复附加 --effort
         def check_codex_cmd(command, cwd, input_text, timeout_sec, **kwargs):
@@ -1109,12 +1122,25 @@ assert sys.stdin.readline() == ''
                        'No need to discuss conservation or deadlock',
                        '请不要分析根因及并发，核对输出排版',
                        '避免推导熵稳定格式，整理结果',
-                       '只读核对文档对“最高挡”的描述'):
+                       '只读核对文档对\u201c最高挡\u201d的描述',
+                       '不要省 token，不降档，核对输出排版',
+                       '只读核对文档对\u201c省额度\u201d和\u201c用低档\u201d的描述'):
             with self.subTest(prompt=prompt), patch.dict(os.environ, {'CAE_DEFAULT_TIER': 'ultra'}, clear=True):
-                self.assertEqual(harness.select_task_tier(text=prompt, file_count=80, estimated_tokens=900000)[0], 'high')
-        self.assertEqual(harness.select_task_tier(text='Review a race condition in message dispatch')[0], 'max')
-        self.assertEqual(harness.select_task_tier(text='核对离散守恒性')[0], 'max')
-        self.assertEqual(harness.select_task_tier(text='拼写检查', file_count=12, estimated_tokens=6000)[0], 'low')
+                self.assertEqual(harness.select_task_tier(text=prompt, file_count=80, estimated_tokens=900000),
+                                 ('max', 'default_flagship_max'))
+            with self.subTest(prompt=prompt, env='high'), patch.dict(os.environ, {'CAE_DEFAULT_TIER': 'high'}, clear=True):
+                self.assertEqual(harness.select_task_tier(text=prompt, file_count=80, estimated_tokens=900000),
+                                 ('high', 'env_default_tier'))
+        self.assertEqual(harness.select_task_tier(text='Review a race condition in message dispatch'),
+                         ('max', 'complexity_high_domain_max'))
+        self.assertEqual(harness.select_task_tier(text='核对离散守恒性'),
+                         ('max', 'complexity_high_domain_max'))
+        self.assertEqual(harness.select_task_tier(text='拼写检查', file_count=12, estimated_tokens=6000),
+                         ('max', 'default_flagship_max'))
+        self.assertEqual(harness.select_task_tier(text='省额度拼写检查', file_count=12, estimated_tokens=6000),
+                         ('low', 'economy_trivial_surface_low'))
+        self.assertEqual(harness.select_task_tier(text='省点 token 核对模块接口', file_count=12, estimated_tokens=6000),
+                         ('high', 'economy_adaptive_high'))
         self.assertEqual(harness.select_task_tier('ultra', text='审查')[0], 'ultra')
 
     def test_orchestrator_fixed_configuration_for_slug_display_and_unique_alias(self):
@@ -1168,7 +1194,7 @@ assert sys.stdin.readline() == ''
             code, report = self.capture(harness.cmd_gate, args)
         self.assertEqual(code, 0)
         self.assertEqual(report['rounds_used'], 2)
-        self.assertEqual(report['selected_tier'], 'high')
+        self.assertEqual(report['selected_tier'], 'max')
         self.assertEqual(report['effort_source'], 'fixed_configuration')
         self.assertFalse(report['history'][1]['escalated'])
         self.assertNotIn('--effort', report['history'][1]['invocation']['argv'])
@@ -1195,7 +1221,7 @@ assert sys.stdin.readline() == ''
 
         verify_cmd = f'"{sys.executable}" -B -c "import pathlib,sys; sys.exit(0 if \'x = 2\' in pathlib.Path(\'helper.py\').read_text() else 1)"'
         args = self.args('gate', '--caller', 'antigravity', '--target', str(self.root),
-                         '--task', '整理返回值赋值逻辑', '--write-scope', '*.py', '--verify-cmd', verify_cmd, '--max-rounds', '3')
+                         '--task', '省点 token 整理返回值赋值逻辑', '--write-scope', '*.py', '--verify-cmd', verify_cmd, '--max-rounds', '3')
         with patch.object(harness, '_args_backends', return_value=engines), patch.object(harness, 'run_process', side_effect=fake_run):
             code, report = self.capture(harness.cmd_gate, args)
         self.assertEqual(code, 0)
@@ -1648,6 +1674,64 @@ else:
         self.assertEqual(d_code, harness.EXIT_CODES['quota_exhausted'])
         self.assertEqual(d_out['status'], 'quota_exhausted')
         self.assertNotIn('quota_fallback', d_out)
+
+    def test_default_flagship_max_economy_fallback_and_main_model_independence(self):
+        # 1. 反重力原生只读子代理定义不含硬编码 model 字段，保持 inherit 跟随主对话
+        agents_dir = ROOT / 'template' / 'user-guard' / 'agents'
+        for agent_md in sorted(agents_dir.glob('readonly-*.md')):
+            frontmatter = agent_md.read_text(encoding='utf-8').split('---', 2)[1]
+            self.assertNotRegex(frontmatter, r'(?m)^\s*model\s*:')
+
+        # 2. 不管反重力前端或 Codex 前端当前选什么主控模型，都不影响 cae-harness 选模、挡位与最大窗口
+        base_codex_models = [
+            {'slug': 'gpt-6.1-sol', 'provider': 'openai', 'priority': 1,
+             'context_window': 500000, 'max_context_window': 872000,
+             'supported_efforts': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], 'delegating_efforts': ['ultra']},
+            {'slug': 'gpt-6-astra', 'provider': 'openai', 'priority': 2,
+             'description': 'Frontier intelligence for the most demanding work.',
+             'context_window': 272000, 'max_context_window': 872000,
+             'supported_efforts': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], 'delegating_efforts': ['ultra']},
+            {'slug': 'gpt-6-luna', 'provider': 'openai', 'priority': 3,
+             'description': 'Fast and affordable for easier tasks.',
+             'context_window': 272000, 'max_context_window': 872000,
+             'supported_efforts': ['low', 'medium', 'high', 'max']},
+        ]
+        base_agy_models = [
+            {'slug': 'gemini-4-carbon-high', 'display_name': 'Gemini 4 Carbon (High)'},
+            {'slug': 'gemini-4-carbon-medium', 'display_name': 'Gemini 4 Carbon (Medium)'},
+            {'slug': 'gemini-4-hydrogen-low', 'display_name': 'Gemini 4 Hydrogen (Low)'},
+            {'slug': 'gemini-pro-orchestrator', 'display_name': 'Orchestrator (Carbon)'},
+        ]
+        for frontend_agy_model in ('gemini-pro-orchestrator', 'gemini-4-hydrogen-low', 'claude-sonnet-4', None):
+            for frontend_codex_model in ('gpt-6-luna', 'custom-router', None):
+                engines = backends()
+                engines['codex'].update(model=frontend_codex_model, reasoning_effort='low', models=base_codex_models)
+                engines['agy'].update(model=frontend_agy_model, models=base_agy_models)
+                tier_math, _ = harness.select_task_tier('auto', 'math', '推导高阶格式')
+                tier_code, _ = harness.select_task_tier('auto', 'code', '编写常规辅助函数')
+                tier_typo, _ = harness.select_task_tier('auto', 'review', '检查注释 typo')
+                self.assertEqual((tier_math, tier_code, tier_typo), ('max', 'max', 'max'))
+                p_math = harness.resolve_execution_profile(engines, 'codex:default', tier_math, '推导高阶格式', 'math')
+                p_code = harness.resolve_execution_profile(engines, 'codex:default', tier_code, '编写常规辅助函数', 'code')
+                p_typo = harness.resolve_execution_profile(engines, 'codex:default', tier_typo, '检查注释 typo', 'review')
+                p_agy = harness.resolve_execution_profile(engines, 'agy:default', tier_code, '编写常规辅助函数', 'code')
+                self.assertEqual((p_math['model'], p_math['reasoning_effort'], p_math['capacity']['cli_context_window_tokens']),
+                                 ('gpt-6-astra', 'max', 872000))
+                self.assertEqual((p_code['model'], p_code['reasoning_effort'], p_code['capacity']['cli_context_window_tokens']),
+                                 ('gpt-6.1-sol', 'max', 872000))
+                self.assertEqual((p_typo['model'], p_typo['reasoning_effort']), ('gpt-6.1-sol', 'max'))
+                self.assertEqual((p_agy['model'], p_agy['reasoning_effort']), ('gemini-4-carbon-high', 'high'))
+
+        # 3. 模糊或明确要求降挡／节省 token 时切换选项 B 分级省流；显式点名挡位严格照办
+        for cue in ('省token整理逻辑', '节省 token 审查接口', '降档修改配置', '适当降挡核查日志',
+                    '要不省点 token 整理逻辑', '能不能降档修改配置', 'save tokens review module'):
+            self.assertEqual(harness.select_task_tier('auto', 'code', cue), ('high', 'economy_adaptive_high'))
+        for surface_cue in ('省token检查错别字', '降档检查 typo', '省点额度做格式微调',
+                            '能不能降档检查 typo', '轻量快速扫一下注释'):
+            self.assertEqual(harness.select_task_tier('auto', 'review', surface_cue), ('low', 'economy_trivial_surface_low'))
+        self.assertEqual(harness.select_task_tier('auto', 'math', '降档推导离散格式'), ('high', 'economy_adaptive_high'))
+        self.assertEqual(harness.select_task_tier('auto', 'code', '用中档整理逻辑'), ('medium', 'user_description_medium'))
+        self.assertEqual(harness.select_task_tier('auto', 'review', '不省token，不降档，绝不省额度，检查 typo'), ('max', 'default_flagship_max'))
 
 
 if __name__ == '__main__':

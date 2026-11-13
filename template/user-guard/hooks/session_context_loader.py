@@ -12,11 +12,12 @@ session_context_loader.py - 反重力与 Codex 双端上下文压缩原话回溯
     原子刷新 hooks/state/user-words/<session_id>.md 并通过 hookSpecificOutput.additionalContext 注入原话档案路径与核心指令摘要。
 """
 
+# ① 常量、阈值与宿主依赖
+
 import argparse
 import hashlib
 import json
 import os
-import re
 import sys
 import time
 import traceback
@@ -36,23 +37,10 @@ TRIM_LOG_BYTES = user_words.TRIM_LOG_BYTES
 MAX_TRANSCRIPT_TRACKED_IMAGES = 2000
 ARCHIVE_RETRY_INTERVAL_SEC = 30
 
-STEP_INDEX_RE = re.compile(r'"step_index"\s*:\s*(\d+)')
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 UI_BANNER_PHRASE = "this conversation grew too large, so the history before this point may be missing or incomplete"
 
-
-def _decode_proto_str(raw: Any) -> str:
-    """还原 protojson 参数里带外层引号与转义反斜杠的字符串值。"""
-    s = str(raw or "").strip()
-    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
-        try:
-            decoded = json.loads(s)
-            if isinstance(decoded, str):
-                s = decoded
-        except Exception:
-            s = s[1:-1]
-    return s.strip().strip("\"'")
-
+# ② 目录、日志与压缩状态读写
 
 def get_data_dirs() -> Tuple[Path, Path]:
     return user_words.resolve_data_dirs(HOOKS_DIR)
@@ -112,26 +100,124 @@ def _load_compaction_state(state_file: Path, conversation_id: str) -> Dict[str, 
     if not state_file.exists():
         return default
     try:
-        data = json.loads(state_file.read_text(encoding="utf-8"))
+        data = json.loads(state_file.read_text(encoding="utf-8-sig"))
         if isinstance(data, dict) and data.get("version") == 1 and data.get("conversationId") == conversation_id:
             merged = dict(default)
             merged.update(data)
             if int(data.get("telemetryVersion", 1)) < default["telemetryVersion"]:
                 for key in default.keys() - {"lastInjectedCheckpointStep", "explicitResumeInjected"}:
                     merged[key] = default[key]
-            for key in ("checkpointSteps", "transcriptImageSizes", "transcriptImageAttemptSizes",
-                        "scannedByteOffset", "latestCheckpointStep", "lastInjectedCheckpointStep",
-                        "mediaStepCount", "transcriptImageCallCount", "transcriptImageResultCount",
-                        "latestStepIndex", "latestUserStepIndex", "latestHandoffStepIndex", "latestHandoffInputHash",
-                        "hostBannerStep", "latestGoalStepIndex",
-                        "pendingControlSteps", "controlFullSignature", "controlFullCheckedAt"):
+            for key in default:
                 if type(merged[key]) is not type(default[key]):
                     raise ValueError(f"字段 {key} 格式错误")
+            if (merged["scannedByteOffset"] < 0
+                    or any(type(value) is not int or value < 0 for value in merged["checkpointSteps"])
+                    or any(type(value) is not int or value < 0
+                           for key in ("transcriptImageSizes", "transcriptImageAttemptSizes")
+                           for value in merged[key].values())
+                    or any(not key.isdecimal() or value not in ("user", "reply")
+                           for key, value in merged["pendingControlSteps"].items())):
+                raise ValueError("上下文状态含无效游标或遥测记录")
             return merged
         raise ValueError("会话状态格式或身份错误")
-    except (ValueError, OSError, TypeError) as exc:
+    except (ValueError, OSError, TypeError, RecursionError) as exc:
         log_event("Context:state_error", conversation_id, f"无法读取上下文状态（{exc}），从轨迹重建")
     return default
+
+
+def _agy_source_signatures(transcript_path: Path) -> List[List[int]]:
+    signatures: List[List[int]] = []
+    for path in (transcript_path, transcript_path.parent / "transcript_full.jsonl"):
+        try:
+            stat = path.stat()
+            signatures.append([stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns])
+        except OSError:
+            signatures.append([])
+    return signatures
+
+
+def _append_codex_log(log_path: Path, entry: Dict[str, Any]) -> None:
+    """向 Codex 钩子日志文件写入仅含元数据的 JSONL 记录（附带 2MB 自动滚动裁剪）"""
+    user_words.append_jsonl_log(log_path, entry)
+
+
+# ③ 增量轨迹解析、遥测与迟到控制指令对账
+
+def _decode_proto_str(raw: Any) -> str:
+    """还原 protojson 参数里带外层引号与转义反斜杠的字符串值。"""
+    s = str(raw or "").strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        try:
+            decoded = json.loads(s)
+            if isinstance(decoded, str):
+                s = decoded
+        except (ValueError, RecursionError):
+            s = s[1:-1]
+    return s.strip().strip("\"'")
+
+
+def _reconcile_agy_controls(transcript_path: Path, state: Dict[str, Any], steps: List[Dict[str, Any]]) -> bool:
+    """仅用完整控制事件更新权限。迟到全文按步骤顺序补入，较新已核实命令优先。"""
+    pending = state["pendingControlSteps"]
+    events: Dict[int, Tuple[str, Any]] = {}
+    new_pending = False
+    changed = False
+    for step in steps:
+        step_index = step.get("step_index")
+        if not isinstance(step_index, int):
+            continue
+        if step.get("type") == "USER_INPUT" or step.get("source") == "USER_EXPLICIT":
+            event_kind = "user"
+        elif step.get("type") == "PLANNER_RESPONSE":
+            event_kind = "reply"
+        else:
+            continue
+        truncated_fields = step.get("truncated_fields")
+        if isinstance(truncated_fields, list) and "content" in truncated_fields:
+            pending[str(step_index)] = event_kind
+            new_pending = True
+            if event_kind == "user" and step_index >= state["latestUserStepIndex"]:
+                state.update(latestUserStepIndex=step_index, latestUserInputHash="", latestUserInputPreview="",
+                             latestUserBannerReport=False)
+        else:
+            events[step_index] = (event_kind, step.get("content"))
+            pending.pop(str(step_index), None)
+    if pending:
+        signature = _agy_source_signatures(transcript_path)[1]
+        now = time.time()
+        if (new_pending or signature != state["controlFullSignature"]
+                or now - state["controlFullCheckedAt"] >= ARCHIVE_RETRY_INTERVAL_SEC):
+            full = user_words._load_truncated_contents_map(
+                transcript_path.parent / "transcript_full.jsonl", {int(index) for index in pending},
+            )
+            for index, content in full.items():
+                events[index] = (pending.pop(str(index)), content)
+            state.update(controlFullSignature=signature, controlFullCheckedAt=now)
+            changed = True
+    if not events:
+        return changed
+
+    import handoff_gate
+
+    for index, (kind, content) in sorted(events.items()):
+        if kind == "user":
+            cleaned = user_words.clean_user_content(content)
+            text_hash = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+            if index >= state["latestUserStepIndex"]:
+                preview = cleaned if len(cleaned) <= 4000 else cleaned[:2500] + "\n...\n" + cleaned[-1500:]
+                state.update(latestUserStepIndex=index, latestUserInputPreview=preview,
+                             latestUserInputHash=text_hash,
+                             latestUserBannerReport=handoff_gate.agy_banner_report(cleaned))
+            intent = handoff_gate.agy_handoff_intent(cleaned)
+            if intent and index >= state["latestHandoffStepIndex"]:
+                state.update(latestUserHandoffIntent=intent, latestHandoffStepIndex=index,
+                             latestHandoffInputHash=text_hash)
+            command = user_words.agy_goal_command(cleaned)
+        else:
+            command = False if isinstance(content, str) and user_words.has_goal_cancel_marker(content) else None
+        if command is not None and index >= state["latestGoalStepIndex"]:
+            state.update(latestGoalStepIndex=index, isGoalActive=command)
+    return True
 
 
 def _scan_transcript_incrementally(
@@ -163,30 +249,55 @@ def _scan_transcript_incrementally(
         offset = 0
         changed = True
 
-    if file_size == offset:
-        return _reconcile_agy_controls(transcript_path, state, []) or changed
-
+    parsed_steps: List[Dict[str, Any]] = []
+    latest_scanned_step = -1
+    new_offset = offset
     try:
-        with open(transcript_path, "rb") as f:
-            f.seek(offset)
-            chunk = f.read(file_size - offset)
+        with open(transcript_path, "rb") as stream:
+            # 用打开后的文件身份确定快照，避免轨迹替换时把旧游标用于新文件。
+            opened = os.fstat(stream.fileno())
+            if [opened.st_dev, opened.st_ino] != identity:
+                return changed
+            file_size = opened.st_size
+            stream.seek(max(0, offset - 128))
+            scanned_tail = stream.read(min(128, offset))
+            anchor = hashlib.sha256(scanned_tail).hexdigest()
+            rewritten = (file_size < offset or (offset and state.get("scannedTranscriptAnchor") not in (None, anchor))
+                         or (file_size == offset and state.get("scannedTranscriptMtimeNs") not in (None, opened.st_mtime_ns)))
+            if rewritten:
+                state.update(_default_compaction_state(state["conversationId"]))
+                state.pop("pendingArchive", None)
+                offset = new_offset = 0
+                scanned_tail = b""
+                changed = True
+            if file_size == offset:
+                return _reconcile_agy_controls(transcript_path, state, []) or changed
+            stream.seek(offset)
+            # 逐行读取固定大小的文件快照。保留未完成尾行的起点，下轮从原位置重读；
+            # 不能仅靠末尾的右花括号判断 JSON 完整，也不能按 Unicode 行分隔符拆正文。
+            while stream.tell() < file_size:
+                row_offset = stream.tell()
+                raw_line = stream.readline(file_size - row_offset)
+                try:
+                    step = json.loads(user_words.decode_jsonl_line(raw_line)) if raw_line.strip() else None
+                except (ValueError, RecursionError):
+                    if not raw_line.endswith(b"\n"):
+                        break
+                    step = None
+                new_offset = stream.tell()
+                scanned_tail = (scanned_tail + raw_line)[-128:]
+                if not isinstance(step, dict):
+                    continue
+                step_index = step.get("step_index")
+                if type(step_index) is int:
+                    latest_scanned_step = max(latest_scanned_step, step_index)
+                if (step.get("type") in ("USER_INPUT", "CHECKPOINT", "PLANNER_RESPONSE", "SYSTEM_MESSAGE")
+                        or step.get("source") == "USER_EXPLICIT" or step.get("media") or step.get("tool_calls")):
+                    parsed_steps.append(step)
     except OSError:
         return changed
-
-    if not chunk:
+    if new_offset == offset:
         return changed
-
-    last_nl = chunk.rfind(b"\n")
-    if last_nl != -1:
-        processable = chunk[: last_nl + 1]
-    elif chunk.rstrip().endswith(b"}"):
-        # 兼容未以换行符结尾的完整单行测试样本
-        processable = chunk
-    else:
-        return changed
-
-    new_offset = offset + len(processable)
-    text_block = processable.decode("utf-8", errors="replace")
 
     latest_cp = int(state.get("latestCheckpointStep", -1))
     has_user = bool(state.get("hasExplicitUserInput", False))
@@ -198,7 +309,7 @@ def _scan_transcript_incrementally(
     img_call_count = int(state.get("transcriptImageCallCount", 0))
     img_result_count = int(state.get("transcriptImageResultCount", 0))
     host_banner_step = int(state.get("hostBannerStep", -1))
-    latest_step = int(state.get("latestStepIndex", -1))
+    latest_step = max(int(state.get("latestStepIndex", -1)), latest_scanned_step)
 
     def _stat_image_uri(raw_uri: str, image_map: Dict[str, int], is_image_media: bool = False) -> None:
         if not raw_uri or len(image_map) >= MAX_TRANSCRIPT_TRACKED_IMAGES:
@@ -233,49 +344,6 @@ def _scan_transcript_incrementally(
                     image_map[key] = int(p_obj.stat().st_size)
             except OSError:
                 pass
-
-    parsed_steps: List[Dict[str, Any]] = []
-
-    for raw_line in text_block.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        # 轻量预提取 step_index（跳过大行全文 json.loads）
-        m_step = STEP_INDEX_RE.search(line[:300]) or (STEP_INDEX_RE.search(line) if '"step_index"' in line else None)
-        if m_step:
-            s_num = int(m_step.group(1))
-            if s_num > latest_step:
-                latest_step = s_num
-
-        # 子串快速预筛，仅解析真正承载检查点/用户指令/图片读数/goal 取消/截断警告的行
-        might_be_cp = '"CHECKPOINT"' in line
-        might_be_user = '"USER_INPUT"' in line or '"USER_EXPLICIT"' in line
-        might_be_media = '"media"' in line
-        might_be_read_img = '"read_file"' in line or '"view_file"' in line
-        might_be_goal_cancel = "GOAL_CANCELLED" in line
-        might_be_banner = "conversation grew too large" in line.lower()
-        might_be_trunc_goal = '"PLANNER_RESPONSE"' in line and '"truncated_fields"' in line
-        might_be_sys = '"SYSTEM_MESSAGE"' in line and might_be_banner
-        if not (
-            might_be_cp
-            or might_be_user
-            or might_be_media
-            or might_be_read_img
-            or might_be_goal_cancel
-            or might_be_trunc_goal
-            or might_be_sys
-        ):
-            continue
-
-        try:
-            step = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        if not isinstance(step, dict):
-            continue
-        parsed_steps.append(step)
 
     for step in parsed_steps:
         s_type = step.get("type", "")
@@ -332,7 +400,7 @@ def _scan_transcript_incrementally(
                 if isinstance(tc_args, str):
                     try:
                         tc_args = json.loads(tc_args)
-                    except Exception:
+                    except (ValueError, RecursionError):
                         tc_args = {}
                 if isinstance(tc_args, dict):
                     f_path = _decode_proto_str(tc_args.get("AbsolutePath") or tc_args.get("Path") or tc_args.get("path"))
@@ -343,6 +411,8 @@ def _scan_transcript_incrementally(
     state["scannedByteOffset"] = new_offset
     state["scannedTranscriptName"] = transcript_path.name
     state["scannedTranscriptIdentity"] = identity
+    state["scannedTranscriptAnchor"] = hashlib.sha256(scanned_tail).hexdigest()
+    state["scannedTranscriptMtimeNs"] = opened.st_mtime_ns
     state["latestCheckpointStep"] = latest_cp
     state["hasExplicitUserInput"] = has_user
     state["checkpointSteps"] = sorted(cp_seen)
@@ -358,68 +428,7 @@ def _scan_transcript_incrementally(
     return True
 
 
-def _reconcile_agy_controls(transcript_path: Path, state: Dict[str, Any], steps: List[Dict[str, Any]]) -> bool:
-    """仅用完整控制事件更新权限。迟到全文按步骤顺序补入，较新已核实命令优先。"""
-    pending = state["pendingControlSteps"]
-    events: Dict[int, Tuple[str, Any]] = {}
-    new_pending = False
-    changed = False
-    for step in steps:
-        step_index = step.get("step_index")
-        if not isinstance(step_index, int):
-            continue
-        if step.get("type") == "USER_INPUT" or step.get("source") == "USER_EXPLICIT":
-            event_kind = "user"
-        elif step.get("type") == "PLANNER_RESPONSE":
-            event_kind = "reply"
-        else:
-            continue
-        if "content" in (step.get("truncated_fields") or []):
-            pending[str(step_index)] = event_kind
-            new_pending = True
-            if event_kind == "user" and step_index >= state["latestUserStepIndex"]:
-                state.update(latestUserStepIndex=step_index, latestUserInputHash="", latestUserInputPreview="",
-                             latestUserBannerReport=False)
-        else:
-            events[step_index] = (event_kind, step.get("content"))
-            pending.pop(str(step_index), None)
-    if pending:
-        signature = _agy_source_signatures(transcript_path)[1]
-        now = time.time()
-        if (new_pending or signature != state["controlFullSignature"]
-                or now - state["controlFullCheckedAt"] >= ARCHIVE_RETRY_INTERVAL_SEC):
-            full = user_words._load_truncated_contents_map(
-                transcript_path.parent / "transcript_full.jsonl", {int(index) for index in pending},
-            )
-            for index, content in full.items():
-                events[index] = (pending.pop(str(index)), content)
-            state.update(controlFullSignature=signature, controlFullCheckedAt=now)
-            changed = True
-    if not events:
-        return changed
-
-    import handoff_gate
-
-    for index, (kind, content) in sorted(events.items()):
-        if kind == "user":
-            cleaned = user_words.clean_user_content(content)
-            text_hash = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
-            if index >= state["latestUserStepIndex"]:
-                preview = cleaned if len(cleaned) <= 4000 else cleaned[:2500] + "\n...\n" + cleaned[-1500:]
-                state.update(latestUserStepIndex=index, latestUserInputPreview=preview,
-                             latestUserInputHash=text_hash,
-                             latestUserBannerReport=handoff_gate.agy_banner_report(cleaned))
-            intent = handoff_gate.agy_handoff_intent(cleaned)
-            if intent and index >= state["latestHandoffStepIndex"]:
-                state.update(latestUserHandoffIntent=intent, latestHandoffStepIndex=index,
-                             latestHandoffInputHash=text_hash)
-            command = user_words.agy_goal_command(cleaned)
-        else:
-            command = False if isinstance(content, str) and user_words.has_goal_cancel_marker(content) else None
-        if command is not None and index >= state["latestGoalStepIndex"]:
-            state.update(latestGoalStepIndex=index, isGoalActive=command)
-    return True
-
+# ④ 原话内联摘要与字符预算
 
 def _truncate_single_item(content: str, turn: int, max_chars: int = MAX_INLINE_ITEM_CHARS) -> str:
     if len(content) <= max_chars:
@@ -504,46 +513,7 @@ def build_compaction_system_message(
     return header_text + joined_all
 
 
-def _agy_source_signatures(transcript_path: Path) -> List[List[int]]:
-    signatures: List[List[int]] = []
-    for path in (transcript_path, transcript_path.parent / "transcript_full.jsonl"):
-        try:
-            stat = path.stat()
-            signatures.append([stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns])
-        except OSError:
-            signatures.append([])
-    return signatures
-
-
-def handle_context_check(payload: Dict[str, Any], event_name: str = "PreInvocation") -> Dict[str, Any]:
-    """
-    统一处理 SessionStart 与 PreInvocation 事件：
-    1. 日常无新增 CHECKPOINT：增量游标毫秒级返回 {"injectSteps": []}，零全盘扫描、零重复注入；
-    2. 捕获新增 CHECKPOINT（或显式 compact/resume 信号）：提取全量用户原话落盘并精确注入 1 次。
-    """
-    conversation_id = str(payload.get("conversationId") or "unknown_session").strip()
-    transcript_path_str = payload.get("transcriptPath")
-    explicit_source = str(payload.get("source") or payload.get("eventSource") or "").strip().lower()
-
-    if explicit_source in ("startup", "fresh", "new"):
-        log_event(event_name, conversation_id, f"Explicit {explicit_source} start. Skipping injection.")
-        return {"injectSteps": []}
-
-    if not transcript_path_str or not user_words.valid_session_id(conversation_id):
-        return {"injectSteps": []}
-
-    transcript_path = user_words.resolve_compact_transcript_path(Path(transcript_path_str).expanduser())
-    if not transcript_path.exists() or not transcript_path.is_file():
-        return {"injectSteps": []}
-
-    state_dir, _ = get_data_dirs()
-    try:
-        with user_words.session_state_lock(state_dir, conversation_id):
-            return _handle_context_locked(conversation_id, event_name, explicit_source, transcript_path, state_dir)
-    except (TimeoutError, OSError) as exc:
-        log_event(event_name, conversation_id, f"上下文状态未更新（{exc}）")
-        return {"injectSteps": []}
-
+# ⑤ Antigravity 恢复流程与兼容入口
 
 def _handle_context_locked(conversation_id: str, event_name: str, explicit_source: str,
                            transcript_path: Path, state_dir: Path) -> Dict[str, Any]:
@@ -671,7 +641,36 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
     }
 
 
-# 保持向后兼容函数别名
+def handle_context_check(payload: Dict[str, Any], event_name: str = "PreInvocation") -> Dict[str, Any]:
+    """
+    统一处理 SessionStart 与 PreInvocation 事件：
+    1. 日常无新增 CHECKPOINT：增量游标毫秒级返回 {"injectSteps": []}，零全盘扫描、零重复注入；
+    2. 捕获新增 CHECKPOINT（或显式 compact/resume 信号）：提取全量用户原话落盘并精确注入 1 次。
+    """
+    conversation_id = str(payload.get("conversationId") or "unknown_session").strip()
+    transcript_path_str = payload.get("transcriptPath")
+    explicit_source = str(payload.get("source") or payload.get("eventSource") or "").strip().lower()
+
+    if explicit_source in ("startup", "fresh", "new"):
+        log_event(event_name, conversation_id, f"Explicit {explicit_source} start. Skipping injection.")
+        return {"injectSteps": []}
+
+    if not transcript_path_str or not user_words.valid_session_id(conversation_id):
+        return {"injectSteps": []}
+
+    transcript_path = user_words.resolve_compact_transcript_path(Path(transcript_path_str).expanduser())
+    if not transcript_path.exists() or not transcript_path.is_file():
+        return {"injectSteps": []}
+
+    state_dir, _ = get_data_dirs()
+    try:
+        with user_words.session_state_lock(state_dir, conversation_id):
+            return _handle_context_locked(conversation_id, event_name, explicit_source, transcript_path, state_dir)
+    except (TimeoutError, OSError) as exc:
+        log_event(event_name, conversation_id, f"上下文状态未更新（{exc}）")
+        return {"injectSteps": []}
+
+
 def handle_session_start(payload: Dict[str, Any]) -> Dict[str, Any]:
     return handle_context_check(payload, event_name="SessionStart")
 
@@ -680,22 +679,7 @@ def handle_pre_invocation(payload: Dict[str, Any]) -> Dict[str, Any]:
     return handle_context_check(payload, event_name="PreInvocation")
 
 
-def _append_codex_log(log_path: Path, entry: Dict[str, Any]) -> None:
-    """向 Codex 钩子日志文件写入仅含元数据的 JSONL 记录（附带 2MB 自动滚动裁剪）"""
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        if log_path.exists() and log_path.stat().st_size > MAX_LOG_BYTES:
-            raw = log_path.read_bytes()
-            tail = raw[-TRIM_LOG_BYTES:]
-            nl = tail.find(b"\n")
-            if nl != -1:
-                tail = tail[nl + 1 :]
-            user_words.atomic_write_text(log_path, tail.decode("utf-8", errors="replace"))
-        with open(log_path, "a", encoding="utf-8", newline="\n") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-
+# ⑥ Codex 恢复协议适配
 
 def handle_codex_session_start(
     payload: Dict[str, Any],
@@ -786,6 +770,8 @@ def handle_codex_session_start(
     }
 
 
+# ⑦ 命令行主入口
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Antigravity & Codex Compaction Context Loader Hook")
     parser.add_argument("--client", type=str, default="antigravity", choices=("antigravity", "codex"), help="Host client type")
@@ -794,16 +780,14 @@ def main() -> None:
     parser.add_argument("--log", type=str, default="", help="Optional JSONL log file path override (used by Codex hook)")
     args, _ = parser.parse_known_args()
 
-    input_text = sys.stdin.read().strip()
     payload: Dict[str, Any] = {}
-    if input_text:
-        try:
-            payload = json.loads(input_text)
-        except Exception as e:
-            if args.client == "codex":
-                sys.stderr.write(f"session_context_loader JSON parse error: {e}\n")
-                sys.exit(2)
-            log_event(args.event or "Unknown", "unknown", f"Failed to parse stdin JSON: {e}")
+    try:
+        payload = user_words.read_hook_payload()
+    except (OSError, ValueError) as e:
+        if args.client == "codex":
+            sys.stderr.write(f"session_context_loader JSON parse error: {e}\n")
+            sys.exit(2)
+        log_event(args.event or "Unknown", "unknown", f"Failed to parse stdin JSON: {e}")
 
     if args.client == "codex":
         try:

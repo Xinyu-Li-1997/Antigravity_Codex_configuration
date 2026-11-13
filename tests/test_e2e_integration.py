@@ -61,6 +61,15 @@ def _create_directory_link(link: Path, target: Path) -> None:
 
 
 class TestEndToEndIntegration(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old_harness_depth = os.environ.pop("CAE_HARNESS_DEPTH", None)
+
+    def tearDown(self) -> None:
+        if self._old_harness_depth is None:
+            os.environ.pop("CAE_HARNESS_DEPTH", None)
+        else:
+            os.environ["CAE_HARNESS_DEPTH"] = self._old_harness_depth
+
     def test_01_plugin_manifest_rules_and_agents_compliance(self) -> None:
         """验证插件结构严格符合 Antigravity 官方 Native Plugin 规范"""
         plugin_json = json.loads((ACTIVE_PLUGIN_DIR / "plugin.json").read_text(encoding="utf-8"))

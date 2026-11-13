@@ -15,6 +15,8 @@ Antigravity 适配保留原有遥测与门禁；Codex 独立入口默认仅观�
    - Stop 门禁验收交接完整性（并在开启 /goal 时强制校验 <!-- GOAL_CANCELLED --> 标记），每回合至多阻断 1 次。
 """
 
+# ① 常量、阈值与宿主依赖
+
 import argparse
 import hashlib
 import json
@@ -148,6 +150,29 @@ GIT_LOCAL_COMMIT_SUBCMDS = {"add", "commit"}
 SHELL_WRAPPERS = {"bash", "sh", "zsh", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe", "env"}
 SUBSYSTEM_WRAPPERS = {"wsl", "wsl.exe", "ssh", "ssh.exe", "docker", "docker.exe", "podman"}
 
+MAX_HANDOFF_DOCUMENT_BYTES = 1024 * 1024
+
+# Codex 使用官方事件字段；不读取 Antigravity 的检查点、图片体积或目标终止标记。
+CODEX_EVENTS = {"SessionStart", "PostCompact", "UserPromptSubmit", "PreToolUse", "Stop"}
+CODEX_DRAIN_ACTIONS = 4  # 显式严格模式的收尾动作预算，不表示模型容量。
+CODEX_HANDOFF_REQUEST_RE = re.compile(
+    r"^(?:/handoff|(?:请)?(?:立即)?(?:整理|准备|完成|做好|开始)交接(?:并|后)(?:停机|停止|结束当前对话))[。！!\s]*$",
+    re.IGNORECASE,
+)
+CODEX_OVERRIDE_REQUEST_RE = re.compile(
+    r"^(?:请)?" + OVERRIDE_COMMAND
+    + r"(?:[，,；;、\s]+(?:请)?" + OVERRIDE_COMMAND + r")*[。.!！\s]*$",
+    re.IGNORECASE,
+)
+CODEX_READ_TOOLS = {
+    "read_file", "list_dir", "list_directory", "search_files", "get_goal",
+    "list_agents", "wait_agent", "interrupt_agent", "wait", "request_user_input",
+    "request_user_input_async", "list_mcp_resources", "read_mcp_resource",
+}
+CODEX_DELEGATION_TOOLS = {"spawn_agent", "agent", "followup_task", "send_message", "create_thread"}
+
+
+# ② 会话状态、路径定位与图片请求登记
 
 def default_gate_state(conversation_id: str) -> Dict[str, Any]:
     """生成初始长会话交接门禁状态"""
@@ -192,7 +217,7 @@ def load_gate_state(state_dir: Path, conversation_id: str) -> Dict[str, Any]:
     if not state_file.exists():
         return default
     try:
-        raw = json.loads(state_file.read_text(encoding="utf-8"))
+        raw = json.loads(state_file.read_text(encoding="utf-8-sig"))
         if (not isinstance(raw, dict) or raw.get("conversationId") != conversation_id
                 or raw.get("version") != 1):
             raise ValueError("门禁状态格式或身份错误")
@@ -206,8 +231,14 @@ def load_gate_state(state_dir: Path, conversation_id: str) -> Dict[str, Any]:
                 raise ValueError(f"门禁状态字段 {key} 格式错误")
         if merged["phase"] not in ("normal", "advisory", "drain", "freeze", "overridden"):
             raise ValueError("未知的门禁阶段")
+        if (any(not isinstance(item, str) for key in ("triggers", "stopGateBlockedTurnKeys", "lastAdvisoryTriggers")
+                for item in merged[key])
+                or any(type(value) is not int or value < 0 for value in merged["imageReads"].values())
+                or merged["drainInvocationsRemaining"] < 0 or merged["drainActionsRemaining"] < 0
+                or type(merged["isGoalActive"]) is not bool):
+            raise ValueError("门禁状态含无效预算或遥测记录")
         return merged
-    except (TypeError, ValueError, OSError) as exc:
+    except (TypeError, ValueError, OSError, RecursionError) as exc:
         user_words.append_lifecycle_log(HOOKS_DIR, "HandoffGate:state_error", conversation_id,
                                         f"门禁状态读取失败（{exc}），保留原文件")
         raise
@@ -218,6 +249,12 @@ def save_gate_state(state_dir: Path, conversation_id: str, gate_state: Dict[str,
     user_words.atomic_write_json(_gate_state_path(state_dir, conversation_id), gate_state)
 
 
+def _gate_state_lock(state_dir: Path, conversation_id: str, timeout_sec: float = 1.5,
+                     strict: bool = False) -> ContextManager[None]:
+    """保留既有测试和调用入口，两种模式均须持锁才可进入事务。"""
+    return user_words.session_state_lock(state_dir, conversation_id, timeout_sec)
+
+
 def consume_drain_action(gate_state: Dict[str, Any]) -> bool:
     """共用阶段策略：完成一次获准的收尾动作后扣预算，用尽即冻结。"""
     remaining = max(0, int(gate_state.get("drainActionsRemaining", 0)) - 1)
@@ -225,12 +262,6 @@ def consume_drain_action(gate_state: Dict[str, Any]) -> bool:
     if remaining == 0:
         gate_state["phase"] = "freeze"
     return remaining == 0
-
-
-def _gate_state_lock(state_dir: Path, conversation_id: str, timeout_sec: float = 1.5,
-                     strict: bool = False) -> ContextManager[None]:
-    """保留既有测试和调用入口，两种模式均须持锁才可进入事务。"""
-    return user_words.session_state_lock(state_dir, conversation_id, timeout_sec)
 
 
 def is_image_path(path_str: str) -> bool:
@@ -266,11 +297,7 @@ def _resolve_candidate_path(
 
 
 def _path_key(p: Path) -> str:
-    try:
-        resolved = str(p.resolve())
-    except OSError:
-        resolved = str(p)
-    return resolved.casefold() if os.name == "nt" else resolved
+    return user_words._canonical_path_key(p)
 
 
 def record_image_read(
@@ -293,7 +320,7 @@ def record_image_read(
     target = _resolve_candidate_path(cleaned, cwd=cwd, workspace_paths=workspace_paths)
     key = _path_key(target)
 
-    if key not in img_map and len(img_map) < MAX_TRACKED_IMAGES:
+    if key in img_map or len(img_map) < MAX_TRACKED_IMAGES:
         fsize = 0
         try:
             if target.exists() and target.is_file():
@@ -303,6 +330,535 @@ def record_image_read(
         img_map[key] = fsize
 
     return len(img_map), sum(int(v) for v in img_map.values() if isinstance(v, (int, float)))
+
+
+# ③ Shell 分句、包装器与命令副作用分类
+
+def _split_shell_clauses(cmd_str: str) -> List[str]:
+    """线性扫描引号外的分隔符；& 后台执行和花括号内命令也必须接受检查。"""
+    clauses: List[str] = []
+    buf: List[str] = []
+    quote_ch: Optional[str] = None
+    i = 0
+    n = len(cmd_str)
+    while i < n:
+        ch = cmd_str[i]
+        if quote_ch:
+            buf.append(ch)
+            if ch == "\\" and quote_ch == '"' and i + 1 < n:
+                buf.append(cmd_str[i + 1])
+                i += 2
+                continue
+            if ch == quote_ch:
+                quote_ch = None
+            i += 1
+            continue
+
+        if ch in ("'", '"'):
+            quote_ch = ch
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == "\\" and i + 1 < n and cmd_str[i + 1] in ";&|{}\n\"'":
+            buf.extend((ch, cmd_str[i + 1]))
+            i += 2
+            continue
+
+        if ch in ("\n", ";", "{", "}"):
+            seg = "".join(buf).strip()
+            if seg:
+                clauses.append(seg)
+            buf = []
+            i += 1
+            continue
+
+        if ch in ("&", "|"):
+            if i + 1 < n and cmd_str[i + 1] == ch:
+                seg = "".join(buf).strip()
+                if seg:
+                    clauses.append(seg)
+                buf = []
+                i += 2
+                continue
+            if ch == "|" or (ch == "&" and (i == 0 or cmd_str[i - 1] not in "><")):
+                seg = "".join(buf).strip()
+                if seg:
+                    clauses.append(seg)
+                buf = []
+                i += 1
+                continue
+
+        buf.append(ch)
+        i += 1
+
+    tail = "".join(buf).strip()
+    if tail:
+        clauses.append(tail)
+    return clauses
+
+
+def _safe_split_clause_tokens(clause: str) -> List[str]:
+    try:
+        return shlex.split(clause, posix=(os.name != "nt"))
+    except ValueError:
+        return clause.split()
+
+
+def _strip_token_quotes(tok: str) -> str:
+    s = tok.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        inner = s[1:-1]
+        return inner.replace('\\"', '"') if s[0] == '"' else inner.replace("''", "'")
+    return s
+
+
+def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]]:
+    """剥离前导 env/timeout/wsl/& 等包装；若遇到 bash -lc / powershell -Command 等壳包装则返回内层脚本供递归分类。"""
+    idx = 0
+    n = len(tokens)
+    while idx < n:
+        head_raw = _strip_token_quotes(tokens[idx])
+        head_name = Path(head_raw.replace("\\", "/")).name.lower()
+        if head_raw == "&" or head_name in ("sudo", "command", "env"):
+            idx += 1
+            continue
+        if "=" in head_raw and not head_raw.startswith("-") and "/" not in head_raw and "\\" not in head_raw:
+            idx += 1
+            continue
+        if head_name in ("timeout", "timeout.exe"):
+            idx += 1
+            while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
+                flag_t = _strip_token_quotes(tokens[idx])
+                idx += 1
+                if flag_t in ("-k", "--kill-after", "-s", "--signal") and idx < n:
+                    idx += 1
+            if idx < n:
+                idx += 1
+            continue
+        if head_name in SUBSYSTEM_WRAPPERS:
+            idx += 1
+            while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
+                flag = _strip_token_quotes(tokens[idx])
+                idx += 1
+                if flag in ("--", "-e", "--exec"):
+                    break
+                if flag in ("-d", "--distribution", "-u", "--user", "--cd") and idx < n:
+                    idx += 1
+            continue
+        if head_name in SHELL_WRAPPERS:
+            idx += 1
+            while idx < n:
+                fl = _strip_token_quotes(tokens[idx]).lower()
+                if fl in ("-executionpolicy", "-ep", "-windowstyle", "-w", "-inputformat", "-outputformat") and idx + 1 < n:
+                    idx += 2
+                    continue
+                if fl in ("-c", "/c", "-command") or (
+                    head_name in ("bash", "sh", "zsh") and re.fullmatch(r"-[a-z]*c", fl)
+                ):
+                    idx += 1
+                    if idx >= n:
+                        return [], ""
+                    if n - idx == 1:
+                        return [], _strip_token_quotes(tokens[idx])
+                    rest = [_strip_token_quotes(tokens[idx])] + list(tokens[idx + 1 :])
+                    return [], " ".join(rest)
+                if fl.startswith("-") or (head_name in ("cmd", "cmd.exe") and fl.startswith("/")):
+                    idx += 1
+                    continue
+                break
+            continue
+        break
+    return tokens[idx:], None
+
+
+def _unwrap_clause_tokens(tokens: List[str]) -> List[str]:
+    unwrapped, inner = _unwrap_clause_or_shell(tokens)
+    return _safe_split_clause_tokens(inner) if inner is not None else unwrapped
+
+
+def _git_subcommand(tokens: List[str]) -> Tuple[Optional[str], List[str]]:
+    """跳过 git 全局选项（如 -C dir, --no-pager）提取真实子命令名"""
+    i = 1
+    n = len(tokens)
+    value_opts = {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+    while i < n:
+        tok = _strip_token_quotes(tokens[i])
+        if tok in value_opts:
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        return tok.lower(), [_strip_token_quotes(t) for t in tokens[i + 1 :]]
+    return None, []
+
+
+def _strip_quoted_segments(clause: str) -> str:
+    """屏蔽引号内字符串文本，防止 commit 信息中的 `>` / `>>` 等字符触发重定向误判"""
+    out: List[str] = []
+    quote_ch: Optional[str] = None
+    i = 0
+    n = len(clause)
+    while i < n:
+        ch = clause[i]
+        if quote_ch:
+            if ch == "\\" and quote_ch == '"' and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote_ch:
+                quote_ch = None
+            out.append(" ")
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote_ch = ch
+            out.append(" ")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _extract_cmd_substitutions(clause: str) -> List[str]:
+    """提取非单引号区间的 $(...) 与成对反引号命令替换表达式，防 echo "$(git push)" 类隐蔽执行绕过"""
+    subs: List[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(clause)
+    while i < n:
+        ch = clause[i]
+        if ch == "\\" and not in_single and i + 1 < n:
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single:
+            if ch == "$" and i + 1 < n and clause[i + 1] == "(":
+                depth = 1
+                j = i + 2
+                s_q = False
+                d_q = False
+                while j < n and depth > 0:
+                    c2 = clause[j]
+                    if c2 == "\\" and not s_q and j + 1 < n:
+                        j += 2
+                        continue
+                    if c2 == "'" and not d_q:
+                        s_q = not s_q
+                    elif c2 == '"' and not s_q:
+                        d_q = not d_q
+                    elif not s_q and not d_q:
+                        if c2 == "(":
+                            depth += 1
+                        elif c2 == ")":
+                            depth -= 1
+                    j += 1
+                if depth == 0:
+                    inner = clause[i + 2 : j - 1].strip()
+                    if inner:
+                        subs.append(inner)
+                    i = j
+                    continue
+            if ch == "`" and i + 1 < n:
+                j = clause.find("`", i + 1)
+                if j != -1:
+                    inner = clause[i + 1 : j].strip()
+                    if inner and inner not in ("r", "n", "t", "0"):
+                        subs.append(inner)
+                    i = j + 1
+                    continue
+        i += 1
+    return subs
+
+
+def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0) -> str:
+    """
+    将 run_command 分类为：
+    - blocked_always: cae_harness 新派工、git push、IsDaemon 常驻进程
+    - readonly_inspect: 全部子句为纯只读核对（含 git status/diff/log/show 等）
+    - git_local_commit: 含 git add/commit 且无外部写操作与 push
+    - mutating_other: 其他会改动/运行测试/脚本的命令
+    """
+    if is_daemon:
+        return "blocked_always"
+    if not cmd_str or not cmd_str.strip():
+        return "mutating_other"
+    if _depth > 3:
+        return "mutating_other"
+
+    has_git_commit_or_add = False
+    has_mutating = False
+
+    clauses = _split_shell_clauses(cmd_str)
+    for clause in clauses:
+        for sub_expr in _extract_cmd_substitutions(clause):
+            sub_expr_kind = _classify_run_command(sub_expr, is_daemon=False, _depth=_depth + 1)
+            if sub_expr_kind == "blocked_always":
+                return "blocked_always"
+            if sub_expr_kind == "mutating_other":
+                has_mutating = True
+            elif sub_expr_kind == "git_local_commit":
+                has_git_commit_or_add = True
+
+        unquoted = _strip_quoted_segments(clause)
+        stripped_redirs = re.sub(r"\d?>&1|\d?>\s*/dev/null", "", unquoted)
+        has_redir = bool(re.search(r"(?:>>|>|\bout-file\b|\bset-content\b|\badd-content\b|\btee\b)", stripped_redirs, re.IGNORECASE))
+
+        tokens, inner_script = _unwrap_clause_or_shell(_safe_split_clause_tokens(clause))
+        if inner_script is not None:
+            sub_kind = _classify_run_command(inner_script, is_daemon=False, _depth=_depth + 1)
+            if sub_kind == "blocked_always":
+                return "blocked_always"
+            if sub_kind == "mutating_other" or has_redir:
+                has_mutating = True
+                continue
+            if sub_kind == "git_local_commit":
+                has_git_commit_or_add = True
+                continue
+            continue
+
+        if not tokens:
+            continue
+
+        raw_head = _strip_token_quotes(tokens[0])
+        head_file = Path(raw_head.replace("\\", "/")).name.lower()
+        head = head_file[:-4] if head_file.endswith(".exe") else head_file
+        if any(is_image_path(_strip_token_quotes(argument)) for argument in tokens[1:]) and head in (
+            "cat", "type", "get-content", "gc", "head", "tail", "xxd", "display", "open", "start",
+        ):
+            return "blocked_always"
+
+        if head_file == "cae_harness.py":
+            sub_tokens = [_strip_token_quotes(st) for st in tokens[1:]]
+            if (
+                not has_redir
+                and any(st in ("probe", "--help", "-h", "status") for st in sub_tokens)
+                and not any(st in ("task", "audit", "gate") for st in sub_tokens)
+            ):
+                continue
+            return "blocked_always"
+
+        if head == "git":
+            subcmd, subargs = _git_subcommand(tokens)
+            if subcmd == "push":
+                return "blocked_always"
+            writes_output = any(arg == "--output" or arg.startswith("--output=") for arg in subargs)
+            if subcmd in GIT_READONLY_SUBCMDS and not has_redir and not writes_output:
+                continue
+            branch_lists = not subargs or all(arg.startswith("-") for arg in subargs) or "--list" in subargs
+            if (subcmd == "branch" and branch_lists
+                    and not any(f in subargs for f in ("-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy"))
+                    and not has_redir):
+                continue
+            if subcmd in GIT_LOCAL_COMMIT_SUBCMDS and not has_redir:
+                has_git_commit_or_add = True
+                continue
+            has_mutating = True
+            continue
+
+        if head in READONLY_BINARIES and not has_redir:
+            find_unsafe = ("-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprint", "-fprintf", "-fls")
+            if head == "find" and any(_strip_token_quotes(a) in find_unsafe for a in tokens[1:]):
+                has_mutating = True
+            else:
+                continue
+
+        if head == "py" or head.startswith("python"):
+            py_args = tokens[1:]
+            idx_arg = 0
+            saw_inline_or_mod = False
+            while idx_arg < len(py_args):
+                tok_arg = _strip_token_quotes(py_args[idx_arg])
+                if tok_arg in ("-c", "-m"):
+                    saw_inline_or_mod = True
+                    break
+                if tok_arg in ("-X", "-W", "-Q", "--check-hash-based-pycs"):
+                    idx_arg += 2
+                    continue
+                if tok_arg.startswith("-"):
+                    idx_arg += 1
+                    continue
+                break
+            if saw_inline_or_mod:
+                if re.search(r"cae_harness", clause, re.IGNORECASE):
+                    return "blocked_always"
+                has_mutating = True
+                continue
+            if idx_arg < len(py_args):
+                script_name = Path(_strip_token_quotes(py_args[idx_arg]).replace("\\", "/")).name.lower()
+                if script_name == "cae_harness.py":
+                    sub_tokens = [_strip_token_quotes(st) for st in py_args[idx_arg + 1 :]]
+                    if (
+                        not has_redir
+                        and any(st in ("probe", "--help", "-h", "status") for st in sub_tokens)
+                        and not any(st in ("task", "audit", "gate") for st in sub_tokens)
+                    ):
+                        continue
+                    return "blocked_always"
+
+        has_mutating = True
+
+    if has_mutating:
+        return "mutating_other"
+    if has_git_commit_or_add:
+        return "git_local_commit"
+    return "readonly_inspect"
+
+
+# ④ 交接文档快照、基线与结构校验
+
+def _is_handoff_target(
+    raw_path: str,
+    conversation_id: str,
+    cwd: Optional[str],
+    workspace_paths: Optional[List[str]],
+) -> bool:
+    if not raw_path or not raw_path.strip():
+        return False
+    target = _resolve_candidate_path(raw_path, cwd=cwd, workspace_paths=workspace_paths)
+    norm = str(target).replace("\\", "/")
+    norm_low = norm.lower()
+    name = target.name
+
+    # 允许 Antigravity 当前对话 brain Artifact 目录写交接文档（排除系统文件与媒体上传目录）
+    if conversation_id and f"/brain/{conversation_id.lower()}/" in norm_low:
+        if "/.system_generated/" in norm_low or "/.user_uploaded/" in norm_low:
+            return False
+        if name.endswith("_user_words.md"):
+            return False
+        if target.suffix.lower() in {".md", ".txt", ".json"}:
+            return True
+
+    # 项目目录内交接文件仅放行纯文本文档后缀（严禁将 src/resume_solver.py 或 handoff/solver.cpp 等源码误判为交接文档）
+    if target.suffix.lower() not in {".md", ".markdown", ".txt", ".rst"}:
+        return False
+
+    if "/handoff/" in norm_low or norm_low.endswith("/handoff"):
+        return True
+    if HANDOFF_FILENAME_RE.search(name):
+        return True
+    return False
+
+
+def _handoff_document_snapshot(path: Path, *, include_text: bool = False) -> Optional[Dict[str, Any]]:
+    try:
+        resolved = str(path.resolve())
+        if not path.exists():
+            return {"path": resolved, "sha256": ""}
+        if not path.is_file():
+            return None
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            data = stream.read(MAX_HANDOFF_DOCUMENT_BYTES + 1)
+            after = os.fstat(stream.fileno())
+        if len(data) > MAX_HANDOFF_DOCUMENT_BYTES:
+            return None
+        current = path.stat()
+        if (str(path.resolve()) != resolved
+                or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                or (current.st_dev, current.st_ino) != (after.st_dev, after.st_ino)):
+            return None
+        snapshot = {"path": resolved, "sha256": hashlib.sha256(data).hexdigest()}
+        if include_text:
+            snapshot["text"] = data.decode("utf-8-sig")
+        return snapshot
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _record_handoff_baseline(state: Dict[str, Any], path: Path) -> None:
+    baselines = state.setdefault("handoffFileBaselines", {})
+    key = str(path.absolute())
+    if key not in baselines:
+        snapshot = _handoff_document_snapshot(path)
+        if snapshot is not None:
+            baselines[key] = snapshot
+
+
+def _has_valid_handoff_file(gate_state: Dict[str, Any]) -> bool:
+    for raw_path, baseline in gate_state.get("handoffFileBaselines", {}).items():
+        current = _handoff_document_snapshot(Path(raw_path), include_text=True)
+        if (isinstance(baseline, dict) and current and current.get("path") == baseline.get("path")
+                and current.get("sha256") != baseline.get("sha256")
+                and _handoff_structure_present(current.get("text") or "")):
+            return True
+    return False
+
+
+def _reply_has_handoff_prompt(reply_text: str) -> bool:
+    lines = reply_text.rstrip().splitlines()
+    plain_lines = list(user_words.markdown_unquoted_lines(reply_text.rstrip()))
+    for idx, line in enumerate(plain_lines):
+        heading, *body = re.split(r"[:：]", line, maxsplit=1)
+        cleaned_heading = heading.strip("#*【】[] \t")
+        cleaned_heading = re.sub(
+            r"^(?:[-*+]\s+|\(?[0-9一二三四五六七八九十]+[.)、．]\s*)",
+            "",
+            cleaned_heading,
+        ).strip("#*【】[] \t")
+        if not PROMPT_MARKER_RE.fullmatch(cleaned_heading):
+            continue
+        if body and len(body[0].strip()) >= 15:
+            return True
+        non_empty_seen = 0
+        for pos in range(idx + 1, len(lines)):
+            if not lines[pos].strip():
+                continue
+            if lines[pos].lstrip().startswith("#"):
+                break
+            fence = user_words.MARKDOWN_FENCE_RE.match(lines[pos])
+            if fence:
+                content = []
+                for body_line in lines[pos + 1:]:
+                    ending = user_words.MARKDOWN_FENCE_RE.match(body_line)
+                    if ending and ending[1][0] == fence[1][0] and len(ending[1]) >= len(fence[1]) and not ending[2].strip():
+                        return len("\n".join(content).strip()) >= 15
+                    content.append(body_line)
+                return False
+            non_empty_seen += 1
+            candidate = plain_lines[pos].strip()
+            if len(candidate) >= 15 and not lines[pos].lstrip().startswith(">") and not candidate.endswith((":", "：")):
+                return True
+            if non_empty_seen <= 2 and candidate.endswith((":", "：")):
+                continue
+            break
+    return False
+
+
+def _handoff_structure_present(text: str) -> bool:
+    """核对交接文档结构，内容是否属实仍需对照源证据。"""
+    prose = "\n".join(user_words.markdown_unquoted_lines(text))
+    return (_reply_has_handoff_prompt(text)
+            and bool(re.search(r"已验证|已完成|进展|verified|completed", prose, re.IGNORECASE))
+            and bool(re.search(r"未完成|待办|下一步|剩余|remaining|next steps", prose, re.IGNORECASE))
+            and bool(re.search(r"git|提交|工作区|workspace", prose, re.IGNORECASE)))
+
+
+# ⑤ Antigravity 遥测、阶段迁移与工具门禁
+
+def agy_handoff_intent(user_text: str) -> str:
+    """识别独立指令句，按最后一条直接指令处理，忽略引用与代码。"""
+    intent = ""
+    for line in user_words.markdown_unquoted_lines(user_text):
+        if AGY_OVERRIDE_REQUEST_RE.fullmatch(line):
+            intent = "override"
+        elif AGY_HANDOFF_REQUEST_RE.fullmatch(line):
+            intent = "handoff"
+    return intent
+
+
+def agy_banner_report(user_text: str) -> bool:
+    return any(AGY_BANNER_REPORT_RE.fullmatch(line) for line in user_words.markdown_unquoted_lines(user_text))
 
 
 def _merge_telemetry(
@@ -373,21 +929,6 @@ def _merge_telemetry(
         "hostBannerStep": int(compaction_state.get("hostBannerStep", -1)),
         "isGoalActive": bool(compaction_state.get("isGoalActive", False)),
     }
-
-
-def agy_handoff_intent(user_text: str) -> str:
-    """识别独立指令句，按最后一条直接指令处理，忽略引用与代码。"""
-    intent = ""
-    for line in user_words.markdown_unquoted_lines(user_text):
-        if AGY_OVERRIDE_REQUEST_RE.fullmatch(line):
-            intent = "override"
-        elif AGY_HANDOFF_REQUEST_RE.fullmatch(line):
-            intent = "handoff"
-    return intent
-
-
-def agy_banner_report(user_text: str) -> bool:
-    return any(AGY_BANNER_REPORT_RE.fullmatch(line) for line in user_words.markdown_unquoted_lines(user_text))
 
 
 def _evaluate_triggers(tel: Dict[str, Any], user_text: str) -> Tuple[List[str], List[str]]:
@@ -718,410 +1259,6 @@ def evaluate_pre_invocation_locked(
     }
 
 
-def _is_handoff_target(
-    raw_path: str,
-    conversation_id: str,
-    cwd: Optional[str],
-    workspace_paths: Optional[List[str]],
-) -> bool:
-    if not raw_path or not raw_path.strip():
-        return False
-    target = _resolve_candidate_path(raw_path, cwd=cwd, workspace_paths=workspace_paths)
-    norm = str(target).replace("\\", "/")
-    norm_low = norm.lower()
-    name = target.name
-
-    # 允许 Antigravity 当前对话 brain Artifact 目录写交接文档（排除系统文件与媒体上传目录）
-    if conversation_id and f"/brain/{conversation_id.lower()}/" in norm_low:
-        if "/.system_generated/" in norm_low or "/.user_uploaded/" in norm_low:
-            return False
-        if name.endswith("_user_words.md"):
-            return False
-        if target.suffix.lower() in {".md", ".txt", ".json"}:
-            return True
-
-    # 项目目录内交接文件仅放行纯文本文档后缀（严禁将 src/resume_solver.py 或 handoff/solver.cpp 等源码误判为交接文档）
-    if target.suffix.lower() not in {".md", ".markdown", ".txt", ".rst"}:
-        return False
-
-    if "/handoff/" in norm_low or norm_low.endswith("/handoff"):
-        return True
-    if HANDOFF_FILENAME_RE.search(name):
-        return True
-    return False
-
-
-def _split_shell_clauses(cmd_str: str) -> List[str]:
-    """按顶层分隔符 (; / && / || / | / 换行) 拆分 Shell 子句，尊重引号嵌套"""
-    clauses: List[str] = []
-    buf: List[str] = []
-    quote_ch: Optional[str] = None
-    i = 0
-    n = len(cmd_str)
-    while i < n:
-        ch = cmd_str[i]
-        if quote_ch:
-            buf.append(ch)
-            if ch == "\\" and quote_ch == '"' and i + 1 < n:
-                buf.append(cmd_str[i + 1])
-                i += 2
-                continue
-            if ch == quote_ch:
-                quote_ch = None
-            i += 1
-            continue
-
-        if ch in ("'", '"'):
-            quote_ch = ch
-            buf.append(ch)
-            i += 1
-            continue
-
-        if ch in ("\n", ";"):
-            seg = "".join(buf).strip()
-            if seg:
-                clauses.append(seg)
-            buf = []
-            i += 1
-            continue
-
-        if ch in ("&", "|"):
-            if i + 1 < n and cmd_str[i + 1] == ch:
-                seg = "".join(buf).strip()
-                if seg:
-                    clauses.append(seg)
-                buf = []
-                i += 2
-                continue
-            if ch == "|":
-                seg = "".join(buf).strip()
-                if seg:
-                    clauses.append(seg)
-                buf = []
-                i += 1
-                continue
-
-        buf.append(ch)
-        i += 1
-
-    tail = "".join(buf).strip()
-    if tail:
-        clauses.append(tail)
-    return clauses
-
-
-def _safe_split_clause_tokens(clause: str) -> List[str]:
-    try:
-        return shlex.split(clause, posix=(os.name != "nt"))
-    except ValueError:
-        return clause.split()
-
-
-def _strip_token_quotes(tok: str) -> str:
-    s = tok.strip()
-    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
-        inner = s[1:-1]
-        return inner.replace('\\"', '"') if s[0] == '"' else inner.replace("''", "'")
-    return s
-
-
-def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]]:
-    """剥离前导 env/timeout/wsl/& 等包装；若遇到 bash -lc / powershell -Command 等壳包装则返回内层脚本供递归分类。"""
-    idx = 0
-    n = len(tokens)
-    while idx < n:
-        head_raw = _strip_token_quotes(tokens[idx])
-        head_name = Path(head_raw.replace("\\", "/")).name.lower()
-        if head_raw == "&" or head_name in ("sudo", "command", "env"):
-            idx += 1
-            continue
-        if "=" in head_raw and not head_raw.startswith("-") and "/" not in head_raw and "\\" not in head_raw:
-            idx += 1
-            continue
-        if head_name in ("timeout", "timeout.exe"):
-            idx += 1
-            while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
-                flag_t = _strip_token_quotes(tokens[idx])
-                idx += 1
-                if flag_t in ("-k", "--kill-after", "-s", "--signal") and idx < n:
-                    idx += 1
-            if idx < n:
-                idx += 1
-            continue
-        if head_name in SUBSYSTEM_WRAPPERS:
-            idx += 1
-            while idx < n and _strip_token_quotes(tokens[idx]).startswith("-"):
-                flag = _strip_token_quotes(tokens[idx])
-                idx += 1
-                if flag in ("--", "-e", "--exec"):
-                    break
-                if flag in ("-d", "--distribution", "-u", "--user", "--cd") and idx < n:
-                    idx += 1
-            continue
-        if head_name in SHELL_WRAPPERS:
-            idx += 1
-            while idx < n:
-                fl = _strip_token_quotes(tokens[idx]).lower()
-                if fl in ("-executionpolicy", "-ep", "-windowstyle", "-w", "-inputformat", "-outputformat") and idx + 1 < n:
-                    idx += 2
-                    continue
-                if fl in ("-c", "/c", "-command") or (
-                    head_name in ("bash", "sh", "zsh") and re.fullmatch(r"-[a-z]*c", fl)
-                ):
-                    idx += 1
-                    if idx >= n:
-                        return [], ""
-                    if n - idx == 1:
-                        return [], _strip_token_quotes(tokens[idx])
-                    rest = [_strip_token_quotes(tokens[idx])] + list(tokens[idx + 1 :])
-                    return [], " ".join(rest)
-                if fl.startswith("-") or (head_name in ("cmd", "cmd.exe") and fl.startswith("/")):
-                    idx += 1
-                    continue
-                break
-            continue
-        break
-    return tokens[idx:], None
-
-
-def _unwrap_clause_tokens(tokens: List[str]) -> List[str]:
-    unwrapped, inner = _unwrap_clause_or_shell(tokens)
-    return _safe_split_clause_tokens(inner) if inner is not None else unwrapped
-
-
-def _git_subcommand(tokens: List[str]) -> Tuple[Optional[str], List[str]]:
-    """跳过 git 全局选项（如 -C dir, --no-pager）提取真实子命令名"""
-    i = 1
-    n = len(tokens)
-    value_opts = {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
-    while i < n:
-        tok = _strip_token_quotes(tokens[i])
-        if tok in value_opts:
-            i += 2
-            continue
-        if tok.startswith("-"):
-            i += 1
-            continue
-        return tok.lower(), [_strip_token_quotes(t) for t in tokens[i + 1 :]]
-    return None, []
-
-
-def _strip_quoted_segments(clause: str) -> str:
-    """屏蔽引号内字符串文本，防止 commit 信息中的 `>` / `>>` 等字符触发重定向误判"""
-    out: List[str] = []
-    quote_ch: Optional[str] = None
-    i = 0
-    n = len(clause)
-    while i < n:
-        ch = clause[i]
-        if quote_ch:
-            if ch == "\\" and quote_ch == '"' and i + 1 < n:
-                i += 2
-                continue
-            if ch == quote_ch:
-                quote_ch = None
-            out.append(" ")
-            i += 1
-            continue
-        if ch in ("'", '"'):
-            quote_ch = ch
-            out.append(" ")
-            i += 1
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
-
-
-def _extract_cmd_substitutions(clause: str) -> List[str]:
-    """提取非单引号区间的 $(...) 与成对反引号命令替换表达式，防 echo "$(git push)" 类隐蔽执行绕过"""
-    subs: List[str] = []
-    in_single = False
-    in_double = False
-    i = 0
-    n = len(clause)
-    while i < n:
-        ch = clause[i]
-        if ch == "\\" and not in_single and i + 1 < n:
-            i += 2
-            continue
-        if ch == "'" and not in_double:
-            in_single = not in_single
-            i += 1
-            continue
-        if ch == '"' and not in_single:
-            in_double = not in_double
-            i += 1
-            continue
-        if not in_single:
-            if ch == "$" and i + 1 < n and clause[i + 1] == "(":
-                depth = 1
-                j = i + 2
-                s_q = False
-                d_q = False
-                while j < n and depth > 0:
-                    c2 = clause[j]
-                    if c2 == "\\" and not s_q and j + 1 < n:
-                        j += 2
-                        continue
-                    if c2 == "'" and not d_q:
-                        s_q = not s_q
-                    elif c2 == '"' and not s_q:
-                        d_q = not d_q
-                    elif not s_q and not d_q:
-                        if c2 == "(":
-                            depth += 1
-                        elif c2 == ")":
-                            depth -= 1
-                    j += 1
-                if depth == 0:
-                    inner = clause[i + 2 : j - 1].strip()
-                    if inner:
-                        subs.append(inner)
-                    i = j
-                    continue
-            if ch == "`" and i + 1 < n:
-                j = clause.find("`", i + 1)
-                if j != -1:
-                    inner = clause[i + 1 : j].strip()
-                    if inner and not inner.startswith(("r", "n", "t", "0")):
-                        subs.append(inner)
-                    i = j + 1
-                    continue
-        i += 1
-    return subs
-
-
-def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0) -> str:
-    """
-    将 run_command 分类为：
-    - blocked_always: cae_harness 新派工、git push、IsDaemon 常驻进程
-    - readonly_inspect: 全部子句为纯只读核对（含 git status/diff/log/show 等）
-    - git_local_commit: 含 git add/commit 且无外部写操作与 push
-    - mutating_other: 其他会改动/运行测试/脚本的命令
-    """
-    if is_daemon:
-        return "blocked_always"
-    if not cmd_str or not cmd_str.strip():
-        return "mutating_other"
-    if _depth > 3:
-        return "mutating_other"
-
-    has_git_commit_or_add = False
-    has_mutating = False
-
-    clauses = _split_shell_clauses(cmd_str)
-    for clause in clauses:
-        for sub_expr in _extract_cmd_substitutions(clause):
-            sub_expr_kind = _classify_run_command(sub_expr, is_daemon=False, _depth=_depth + 1)
-            if sub_expr_kind == "blocked_always":
-                return "blocked_always"
-            if sub_expr_kind == "mutating_other":
-                has_mutating = True
-            elif sub_expr_kind == "git_local_commit":
-                has_git_commit_or_add = True
-
-        unquoted = _strip_quoted_segments(clause)
-        stripped_redirs = re.sub(r"\d?>&1|\d?>\s*/dev/null", "", unquoted)
-        has_redir = bool(re.search(r"(?:>>|>|\bout-file\b|\bset-content\b|\badd-content\b|\btee\b)", stripped_redirs, re.IGNORECASE))
-
-        tokens, inner_script = _unwrap_clause_or_shell(_safe_split_clause_tokens(clause))
-        if inner_script is not None:
-            sub_kind = _classify_run_command(inner_script, is_daemon=False, _depth=_depth + 1)
-            if sub_kind == "blocked_always":
-                return "blocked_always"
-            if sub_kind == "mutating_other" or has_redir:
-                has_mutating = True
-                continue
-            if sub_kind == "git_local_commit":
-                has_git_commit_or_add = True
-                continue
-            continue
-
-        if not tokens:
-            continue
-
-        raw_head = _strip_token_quotes(tokens[0])
-        head_file = Path(raw_head.replace("\\", "/")).name.lower()
-        head = head_file[:-4] if head_file.endswith(".exe") else head_file
-        if any(is_image_path(_strip_token_quotes(argument)) for argument in tokens[1:]) and head in (
-            "cat", "type", "get-content", "gc", "head", "tail", "xxd", "display", "open", "start",
-        ):
-            return "blocked_always"
-
-        if head_file == "cae_harness.py":
-            sub_tokens = [_strip_token_quotes(st) for st in tokens[1:]]
-            if (
-                not has_redir
-                and any(st in ("probe", "--help", "-h", "status") for st in sub_tokens)
-                and not any(st in ("task", "audit", "gate") for st in sub_tokens)
-            ):
-                continue
-            return "blocked_always"
-
-        if head == "git":
-            subcmd, subargs = _git_subcommand(tokens)
-            if subcmd == "push":
-                return "blocked_always"
-            if subcmd in GIT_READONLY_SUBCMDS and not has_redir:
-                continue
-            if subcmd == "branch" and not any(f in subargs for f in ("-d", "-D", "-m", "-M", "-c", "-C")) and not has_redir:
-                continue
-            if subcmd in GIT_LOCAL_COMMIT_SUBCMDS and not has_redir:
-                has_git_commit_or_add = True
-                continue
-            has_mutating = True
-            continue
-
-        if head in READONLY_BINARIES and not has_redir:
-            find_unsafe = ("-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprint", "-fprintf", "-fls")
-            if head == "find" and any(_strip_token_quotes(a) in find_unsafe for a in tokens[1:]):
-                has_mutating = True
-            else:
-                continue
-
-        if head == "py" or head.startswith("python"):
-            py_args = tokens[1:]
-            idx_arg = 0
-            saw_inline_or_mod = False
-            while idx_arg < len(py_args):
-                tok_arg = _strip_token_quotes(py_args[idx_arg])
-                if tok_arg in ("-c", "-m"):
-                    saw_inline_or_mod = True
-                    break
-                if tok_arg in ("-X", "-W", "-Q", "--check-hash-based-pycs"):
-                    idx_arg += 2
-                    continue
-                if tok_arg.startswith("-"):
-                    idx_arg += 1
-                    continue
-                break
-            if saw_inline_or_mod:
-                if re.search(r"cae_harness", clause, re.IGNORECASE):
-                    return "blocked_always"
-                has_mutating = True
-                continue
-            if idx_arg < len(py_args):
-                script_name = Path(_strip_token_quotes(py_args[idx_arg]).replace("\\", "/")).name.lower()
-                if script_name == "cae_harness.py":
-                    sub_tokens = [_strip_token_quotes(st) for st in py_args[idx_arg + 1 :]]
-                    if (
-                        not has_redir
-                        and any(st in ("probe", "--help", "-h", "status") for st in sub_tokens)
-                        and not any(st in ("task", "audit", "gate") for st in sub_tokens)
-                    ):
-                        continue
-                    return "blocked_always"
-
-        has_mutating = True
-
-    if has_mutating:
-        return "mutating_other"
-    if has_git_commit_or_add:
-        return "git_local_commit"
-    return "readonly_inspect"
-
-
 def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
                               *, boundary_blocked: bool = False) -> Optional[Dict[str, Any]]:
     """在同一会话锁中检查阶段并更新状态。"""
@@ -1133,10 +1270,10 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
     compaction_state = {}
     if compaction_state_file.is_file():
         try:
-            compaction_state = json.loads(compaction_state_file.read_text(encoding="utf-8"))
+            compaction_state = json.loads(compaction_state_file.read_text(encoding="utf-8-sig"))
             if not isinstance(compaction_state, dict) or compaction_state.get("conversationId") != conversation_id:
                 raise ValueError("压缩状态格式或身份错误")
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, RecursionError) as exc:
             if not _gate_state_path(state_dir, conversation_id).exists():
                 raise
             user_words.append_lifecycle_log(HOOKS_DIR, "PreToolUse:state_error", conversation_id,
@@ -1329,96 +1466,6 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
     return None
 
 
-MAX_HANDOFF_DOCUMENT_BYTES = 1024 * 1024
-
-
-def _handoff_document_snapshot(path: Path, *, include_text: bool = False) -> Optional[Dict[str, Any]]:
-    try:
-        resolved = str(path.resolve())
-        if not path.exists():
-            return {"path": resolved, "sha256": ""}
-        if not path.is_file():
-            return None
-        with path.open("rb") as stream:
-            data = stream.read(MAX_HANDOFF_DOCUMENT_BYTES + 1)
-        if len(data) > MAX_HANDOFF_DOCUMENT_BYTES:
-            return None
-        snapshot = {"path": resolved, "sha256": hashlib.sha256(data).hexdigest()}
-        if include_text:
-            snapshot["text"] = data.decode("utf-8-sig")
-        return snapshot
-    except (OSError, UnicodeDecodeError, RuntimeError):
-        return None
-
-
-def _record_handoff_baseline(state: Dict[str, Any], path: Path) -> None:
-    baselines = state.setdefault("handoffFileBaselines", {})
-    key = str(path.absolute())
-    if key not in baselines:
-        snapshot = _handoff_document_snapshot(path)
-        if snapshot is not None:
-            baselines[key] = snapshot
-
-
-def _has_valid_handoff_file(gate_state: Dict[str, Any]) -> bool:
-    for raw_path, baseline in gate_state.get("handoffFileBaselines", {}).items():
-        current = _handoff_document_snapshot(Path(raw_path), include_text=True)
-        if (isinstance(baseline, dict) and current and current.get("path") == baseline.get("path")
-                and current.get("sha256") != baseline.get("sha256")
-                and _handoff_structure_present(current.get("text") or "")):
-            return True
-    return False
-
-
-def _reply_has_handoff_prompt(reply_text: str) -> bool:
-    lines = reply_text.strip().splitlines()
-    plain_lines = list(user_words.markdown_unquoted_lines(reply_text.strip()))
-    for idx, line in enumerate(plain_lines):
-        heading, *body = re.split(r"[:：]", line, maxsplit=1)
-        cleaned_heading = heading.strip("#*【】[] \t")
-        cleaned_heading = re.sub(
-            r"^(?:[-*+]\s+|\(?[0-9一二三四五六七八九十]+[.)、．]\s*)",
-            "",
-            cleaned_heading,
-        ).strip("#*【】[] \t")
-        if not PROMPT_MARKER_RE.fullmatch(cleaned_heading):
-            continue
-        if body and len(body[0].strip()) >= 15:
-            return True
-        non_empty_seen = 0
-        for pos in range(idx + 1, len(lines)):
-            if not lines[pos].strip():
-                continue
-            if lines[pos].lstrip().startswith("#"):
-                break
-            fence = user_words.MARKDOWN_FENCE_RE.match(lines[pos])
-            if fence:
-                content = []
-                for body_line in lines[pos + 1:]:
-                    ending = user_words.MARKDOWN_FENCE_RE.match(body_line)
-                    if ending and ending[1][0] == fence[1][0] and len(ending[1]) >= len(fence[1]) and not ending[2].strip():
-                        return len("\n".join(content).strip()) >= 15
-                    content.append(body_line)
-                return False
-            non_empty_seen += 1
-            candidate = plain_lines[pos].strip()
-            if len(candidate) >= 15 and not lines[pos].lstrip().startswith(">") and not candidate.endswith((":", "：")):
-                return True
-            if non_empty_seen <= 2 and candidate.endswith((":", "：")):
-                continue
-            break
-    return False
-
-
-def _handoff_structure_present(text: str) -> bool:
-    """核对交接文档结构，内容是否属实仍需对照源证据。"""
-    prose = "\n".join(user_words.markdown_unquoted_lines(text))
-    return (_reply_has_handoff_prompt(text)
-            and bool(re.search(r"已验证|已完成|进展|verified|completed", prose, re.IGNORECASE))
-            and bool(re.search(r"未完成|待办|下一步|剩余|remaining|next steps", prose, re.IGNORECASE))
-            and bool(re.search(r"git|提交|工作区|workspace", prose, re.IGNORECASE)))
-
-
 def check_stop_handoff_locked(
     payload: Dict[str, Any],
     state_dir: Path,
@@ -1441,13 +1488,13 @@ def check_stop_handoff_locked(
         comp_file = state_dir / f"{conversation_id}_compaction.json"
         if comp_file.exists():
             try:
-                comp = json.loads(comp_file.read_text(encoding="utf-8"))
+                comp = json.loads(comp_file.read_text(encoding="utf-8-sig"))
                 if isinstance(comp, dict):
                     u_step = int(comp.get("latestUserStepIndex", -1))
                     u_hash = str(comp.get("latestUserInputHash") or "")
                     if u_step >= 0 and u_hash:
                         turn_key = f"turn_{u_step}_{u_hash[:12]}"
-            except Exception:
+            except (OSError, ValueError, TypeError, RecursionError):
                 pass
 
     blocked_keys: List[str] = gate_state.setdefault("stopGateBlockedTurnKeys", [])
@@ -1495,25 +1542,7 @@ def check_stop_handoff_locked(
     }
 
 
-# Codex 使用官方事件字段；不读取 Antigravity 的检查点、图片体积或目标终止标记。
-CODEX_EVENTS = {"SessionStart", "PostCompact", "UserPromptSubmit", "PreToolUse", "Stop"}
-CODEX_DRAIN_ACTIONS = 4  # 显式严格模式的收尾动作预算，不表示模型容量。
-CODEX_HANDOFF_REQUEST_RE = re.compile(
-    r"^(?:/handoff|(?:请)?(?:立即)?(?:整理|准备|完成|做好|开始)交接(?:并|后)(?:停机|停止|结束当前对话))[。！!\s]*$",
-    re.IGNORECASE,
-)
-CODEX_OVERRIDE_REQUEST_RE = re.compile(
-    r"^(?:请)?" + OVERRIDE_COMMAND
-    + r"(?:[，,；;、\s]+(?:请)?" + OVERRIDE_COMMAND + r")*[。.!！\s]*$",
-    re.IGNORECASE,
-)
-CODEX_READ_TOOLS = {
-    "read_file", "list_dir", "list_directory", "search_files", "get_goal",
-    "list_agents", "wait_agent", "interrupt_agent", "wait", "request_user_input",
-    "request_user_input_async", "list_mcp_resources", "read_mcp_resource",
-}
-CODEX_DELEGATION_TOOLS = {"spawn_agent", "agent", "followup_task", "send_message", "create_thread"}
-
+# ⑥ Codex 压缩事件对账与独立协议适配
 
 def _codex_notice(phase: str, count: int, mode: str) -> str:
     prefix = f"【Codex 长会话交接：{phase}】已登记的压缩次数下界为 {count}。模式 {mode}。"
@@ -1542,6 +1571,8 @@ def _scan_codex_compactions(transcript: Path, ledger: Dict[str, Any]) -> Optiona
             stat = os.fstat(stream.fileno())
             identity = [stat.st_dev, stat.st_ino]
             cursor = ledger["files"].get(path_key, {})
+            if not isinstance(cursor, dict):
+                raise ValueError("压缩轨迹游标必须为对象")
             offset = cursor.get("offset", 0)
             if type(offset) is not int or offset < 0:
                 raise ValueError("压缩轨迹游标格式错误")
@@ -1550,6 +1581,12 @@ def _scan_codex_compactions(transcript: Path, ledger: Dict[str, Any]) -> Optiona
             if (cursor.get("identity") != identity or offset > stat.st_size or anchor != cursor.get("anchor")):
                 cursor = {"identity": identity, "activeTurn": "", "pendingRecord": "", "occurrences": {}}
                 offset = 0
+            if (not isinstance(cursor.get("occurrences"), dict)
+                    or any(type(count) is not int or count < 0 for count in cursor["occurrences"].values())
+                    or not isinstance(cursor.get("activeTurn"), str)
+                    or not isinstance(cursor.get("pendingRecord"), str)
+                    or (cursor["pendingRecord"] and cursor["pendingRecord"] not in records)):
+                raise ValueError("压缩轨迹关联状态格式错误")
             stream.seek(offset)
             while stream.tell() < stat.st_size:
                 row_offset = stream.tell()
@@ -1565,7 +1602,7 @@ def _scan_codex_compactions(transcript: Path, ledger: Dict[str, Any]) -> Optiona
                     continue
                 try:
                     entry = json.loads(raw)
-                except (ValueError, UnicodeDecodeError):
+                except (ValueError, RecursionError):
                     cursor["unreadable"] = True
                     continue
                 if not isinstance(entry, dict) or not isinstance(entry.get("payload"), dict):
@@ -1633,6 +1670,11 @@ def _reconcile_codex_compactions(payload: Dict[str, Any], transcript: Path, stat
     if not isinstance(ledger, dict) or any(not isinstance(ledger.get(key), dict)
                                           for key in ("files", "records", "observations")):
         raise ValueError("压缩对账状态格式错误，保留原文件")
+    if (any(not isinstance(row, dict) or not isinstance(row.get("turn"), str)
+            or not isinstance(row.get("turnSource"), str) for row in ledger["records"].values())
+            or any(not isinstance(row, dict) or not isinstance(row.get("turn"), str)
+                   for row in ledger["observations"].values())):
+        raise ValueError("压缩对账记录格式错误，保留原文件")
 
     paths = [transcript]
     issues: List[str] = []
@@ -1725,7 +1767,7 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
     event = str(payload.get("hook_event_name") or "")
     if event not in CODEX_EVENTS or mode == "off":
         return {}
-    if mode not in ("advisory", "enforce") or isinstance(compact_limit, bool) or compact_limit < 0:
+    if mode not in ("advisory", "enforce") or type(compact_limit) is not int or compact_limit < 0:
         raise ValueError("无效的 Codex 交接策略")
     sid, transcript, identity_error, skip = user_words.codex_hook_session(payload)
     if skip:
@@ -1736,11 +1778,20 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
     with user_words.session_state_lock(state_dir, sid):
         state_path = _gate_state_path(state_dir, sid)
         if state_path.exists():
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state = json.loads(state_path.read_text(encoding="utf-8-sig"))
             if (not isinstance(state, dict) or state.get("client") != "codex" or state.get("version") != 1
                     or state.get("conversationId") != sid or not isinstance(state.get("observedEvents"), list)
                     or state.get("phase") not in ("normal", "advisory", "drain", "freeze", "overridden")):
                 raise ValueError("Codex 门禁状态格式不兼容，保留原文件")
+            for key, expected in (("drainActionsRemaining", int), ("overrideUntilCount", int),
+                                  ("lastUserEvent", str), ("stopCorrectionRequested", bool), ("handoffRecorded", bool)):
+                if type(state.get(key)) is not expected:
+                    raise ValueError(f"Codex 门禁状态字段 {key} 格式错误")
+            if state["drainActionsRemaining"] < 0:
+                raise ValueError("Codex 排空动作预算不能为负数")
+            for key in ("toolDecisions", "handoffFileBaselines"):
+                if key in state and not isinstance(state[key], dict):
+                    raise ValueError(f"Codex 门禁状态字段 {key} 必须为对象")
         else:
             state = {"client": "codex", "version": 1, "conversationId": sid, "phase": "normal",
                      "compactionKeys": [], "compactionCount": 0, "observedEvents": [],
@@ -1822,6 +1873,8 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
         return response
 
 
+# ⑦ 命令行主入口
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Codex 长会话交接事件适配；反重力使用既有模块接口")
     parser.add_argument("--client", choices=("codex",), required=True)
@@ -1830,9 +1883,7 @@ def main() -> None:
     parser.add_argument("--state-dir", default=str(HOOKS_DIR / "state" / "handoff"))
     args = parser.parse_args()
     try:
-        payload = json.loads(sys.stdin.read())
-        if not isinstance(payload, dict):
-            raise ValueError("事件必须为 JSON 对象")
+        payload = user_words.read_hook_payload()
         response = handle_codex_handoff(payload, Path(args.state_dir), args.mode, args.compact_limit)
     except Exception as exc:
         # 状态/协议异常时不伪装已受保护，不在失败的钩子中无限继续。

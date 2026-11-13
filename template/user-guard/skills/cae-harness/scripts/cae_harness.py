@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
+
+
 """Codex / Antigravity 双向任务、分片审计与可执行验收。"""
+
+
 import argparse
 import base64
 import collections
@@ -8,7 +12,10 @@ import datetime
 import fnmatch
 import hashlib
 import json
+import math
+import ntpath
 import os
+import posixpath
 import queue
 import re
 import shutil
@@ -21,34 +28,48 @@ import threading
 import time
 import uuid
 from pathlib import Path
-
 try:
     import tomllib
 except ImportError:  # Python 3.9 / 3.10
     tomllib = None
 
-for _name in ('stdin', 'stdout', 'stderr'):
-    _stream = getattr(sys, _name, None)
-    if hasattr(_stream, 'reconfigure'):
-        _stream.reconfigure(encoding='utf-8', errors='replace')
+
+# ════════════════════════════════════════════════════════════════════════════
+# ① 全局常量、异常与回执 JSON Schema
+# ════════════════════════════════════════════════════════════════════════════
+
 
 SOURCE_EXTENSIONS = {'.f90', '.f95', '.f03', '.f08', '.f', '.for', '.c', '.cpp', '.cc', '.cxx', '.cu', '.cuh',
                      '.h', '.hpp', '.hh', '.py', '.jl', '.m', '.rs', '.go', '.ts', '.js', '.cmake', '.toml',
                      '.yaml', '.yml', '.json', '.md', '.tex', '.bib', '.rst', '.txt', '.lean', '.inc',
                      '.sh', '.bash', '.ps1', '.cfg', '.ini'}
+
+
 IGNORED_DIRS = {'.git', '.hg', '.svn', '__pycache__', '.pytest_cache', 'node_modules', '.venv', 'venv',
                 'env', 'build', 'dist', 'target', '.idea', '.vscode', '.gemini', '.antigravity-ide'}
+
+
 EXIT_CODES = {'ok': 0, 'failed': 1, 'scope_violation': 1, 'verification_failed': 2,
               'partial': 3, 'invalid_output': 4, 'quota_exhausted': 5, 'timeout': 124, 'cancelled': 130}
+
+
 QUOTA_ERROR_RE = re.compile(
     r"(?:hit your usage limit|usage limit|insufficient_quota|exceeded your current quota|"
     r"purchase more credits|billing_hard_limit_reached|quota[ _-]?exceeded|quota[ _-]?exhausted|"
     r"out of quota|out of credits|resource_exhausted|daily limit exceeded)",
     re.IGNORECASE,
 )
+
+
 EFFORT_LADDER = ('minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
+
+
 TIER_CHOICES = ('auto', 'ultra', 'max', 'xhigh', 'high', 'medium', 'low')
+
+
 CATALOG_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
+
 HIGH_COMPLEXITY_CUES = (
     '守恒', 'conservation', '通量', '通量重构', '黎曼', 'riemann', '雅可比', 'jacobian',
     '熵稳定', 'entropy stability', 'dgsem', 'weno', '高阶格式', '间断伽辽金',
@@ -58,8 +79,24 @@ HIGH_COMPLEXITY_CUES = (
     '根因', 'root cause', '死锁', 'deadlock', '竞态', 'race condition', '并发', 'concurrency',
     '数值耗散', '激波',
 )
+
+
 TRIVIAL_SURFACE_CUES = ('错别字', 'typo', '拼写', '缩进', '空行', '注释微调', '文案微调', '格式微调')
+
+
+ECONOMY_DOWNGRADE_CUES = (
+    '降挡', '降档', '降一挡', '降一档', '适当降挡', '适当降档', '降低挡位', '降低档位',
+    '省额度', '省点额度', '省些额度', '节省额度', '节约额度', '省着点额度',
+    '省token', '省 token', '省点token', '省点 token', '省些token', '省些 token',
+    '节省token', '节省 token', '节省点token', '节省点 token', '节省一点token', '节省一点 token',
+    '节约token', '节约 token', '省算力', '节省算力', '省开销', '节省开销', '轻量快速',
+    'save tokens', 'save token', 'save quota', 'lower tier', 'lower effort',
+)
+
+
 QUOTA_LOCK = threading.RLock()
+
+
 AUDIT_JSON_SCHEMA = {
     'type': 'object', 'properties': {
         'summary': {'type': 'string'},
@@ -76,15 +113,101 @@ AUDIT_JSON_SCHEMA = {
         'additionalProperties': False}},
     }, 'required': ['summary', 'findings', 'read_files', 'unread_files'], 'additionalProperties': False,
 }
+
+
 TASK_JSON_SCHEMA = {
     'type': 'object', 'properties': {'summary': {'type': 'string'}, 'content': {'type': 'string'},
         'evidence': {'type': 'array', 'items': {'type': 'string'}},
         'unverified': {'type': 'array', 'items': {'type': 'string'}}},
     'required': ['summary', 'content', 'evidence', 'unverified'], 'additionalProperties': False,
 }
+
+
 _CANCELLED = threading.Event()
+
+
 _EVENT_LOCK = threading.Lock()
+
+
 _SESSION_QUOTA_BLOCKED = {}
+
+
+_CODEX_TOML_KEYS = {'model', 'model_reasoning_effort', 'model_context_window', 'model_auto_compact_token_limit'}
+
+
+_TOML_LINE_TOKEN = re.compile(r'''"""(?:\\[\s\S]|(?!"{3})[\s\S])*"""|'{3}[\s\S]*?'{3}|"(?:\\.|[^"\\\n])*"|'[^'\n]*'|#[^\n]*|[\[\]{}\n]''')
+
+
+_TOML_INTEGER = re.compile(r'(?:[+-]?(?:0|[1-9](?:_?[0-9])*)|0x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0o[0-7](?:_?[0-7])*|0b[01](?:_?[01])*)')
+
+
+_CUE_BOUNDARIES = re.compile(r'[，。；、,;.!?！？\n]+|\b(?:but|however|instead)\b|但是|而是|而只', re.I)
+
+
+_NEGATION = re.compile(
+    r"(?:不(?:要|用|必|需|须|能|可|得|会|想|愿|再|应|打算|准备|允许|降|省|节|考虑|讨论|涉及|检查|核查|分析|推导|证明|处理|复核|验证)|"
+    r"无需|无须|禁止|排除|避免|跳过|别|勿|莫)[^，。；、,;.!?！？\n]{0,12}$|"
+    r"(?:^|(?<![要能好行成可会]))不\s*$|"
+    r"\b(?:no|not|never|without|exclude|skip|avoid|don't|cannot|can't)\b(?:\s+[\w-]+){0,5}\s*$", re.I)
+
+
+ROUTER_MODEL_TAGS = {'orchestrator', 'router', 'auto'}
+
+
+FAST_MODEL_TAGS = {'lite', 'mini', 'fast', 'flash', 'hydrogen', 'luna'}
+
+
+NON_AI_MODEL_STOPWORDS = {
+    'turbulence', 'rans', 'les', 'dns', 'sst', 'kepsilon', 'komega', 'spalart', 'allmaras',
+    'epsilon', 'navier', 'stokes', 'euler', 'boltzmann', 'bgk', 'muscl', 'tvd', 'godunov',
+    'smagorinsky', 'vreman', 'courant', 'knudsen', 'reynolds', 'prandtl', 'mach',
+    'weno', 'cweno', 'eno', 'dg', 'dgsem', 'fvm', 'fem', 'fdm', 'cfd', 'cae', 'eos',
+    'riemann', 'roe', 'hll', 'hllc', 'hlle', 'ausm', 'rusanov', 'rk', 'bdf', 'cfl',
+    'model', 'models', 'default', 'auto', 'cli', 'lite', 'lightweight',
+    'codex', 'antigravity', 'agy', 'openai', 'google', 'gemini', 'gpt',
+}
+
+
+PROMPT_MODEL_HINT_PATTERNS = (
+    re.compile(
+        r'(?:请)?(?:使用|调用|采用|切到|切换至|指定|选用|改用|用)\s*'
+        r'((?:混动\s*)?[A-Za-z][A-Za-z0-9._()（） -]{1,40}?|混动(?:路由(?:器)?)?)\s*'
+        r'(?:AI\s*)?(?:模型|路由(?:器)?|引擎)',
+        re.IGNORECASE,
+    ),
+    re.compile(r'(?:指定模型|执行模型|目标模型)\s*[:=：]\s*([A-Za-z][A-Za-z0-9._()（）-]{1,40})', re.IGNORECASE),
+    re.compile(
+        r'(?:请)?(?:使用|调用|采用|切到|切换至|指定|选用|改用|用)\s*'
+        r'(?:混动\s*)?(orchestrator(?:\s*[-()（）A-Za-z0-9]+)?)',
+        re.IGNORECASE,
+    ),
+)
+
+
+PHYSICAL_SUBSTANCE_TAGS = {
+    'hydrogen', 'carbon', 'argon', 'oxygen', 'nitrogen', 'helium', 'methane', 'air', 'water', 'soot',
+}
+
+
+PHYSICS_MODEL_CONTEXT_RE = re.compile(
+    r'(?:计算|模拟|仿真|求解|离散|预测|分析|爆轰|燃烧|反应|组分|流场|传热|热流|'
+    r'detonation|combustion|reaction|species|flow|chemistry|flame)',
+    re.IGNORECASE,
+)
+
+
+_AGY_AUTH_REQUIRED = re.compile(
+    r'\b(?:please (?:sign in|log in|login)|not (?:signed|logged) in|authentication required|'
+    r'login required|sign-in required|unauthenticated)\b', re.I)
+
+
+_QUOTA_EVENT_NAME = re.compile(r'^[0-9a-f]{32}\.json$')
+
+
+MAX_INTEROP_STAGE_BYTES = 64 * 1024 * 1024
+
+
+STAGED_PROMPT_SUFFIX = '\n[跨端只读工作区说明] 当前目录已按原相对路径只读镜像目标文件，请直接在当前目录下按相对路径读取。'
 
 
 class HarnessError(RuntimeError):
@@ -99,6 +222,11 @@ class OutputParseError(HarnessError):
         super().__init__(message, 'invalid_output')
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# ② 基础配置、跨平台路径与 WSL 互操作工具
+# ════════════════════════════════════════════════════════════════════════════
+
+
 def emit_event(event, **fields):
     with _EVENT_LOCK:
         print(json.dumps({'event': event, **fields}, ensure_ascii=False), file=sys.stderr, flush=True)
@@ -109,11 +237,6 @@ def _read_json(path):
         return json.loads(path.read_text(encoding='utf-8-sig'))
     except (OSError, ValueError):
         return {}
-
-
-_CODEX_TOML_KEYS = {'model', 'model_reasoning_effort', 'model_context_window', 'model_auto_compact_token_limit'}
-_TOML_LINE_TOKEN = re.compile(r'''"""(?:\\[\s\S]|(?!"{3})[\s\S])*"""|'{3}[\s\S]*?'{3}|"(?:\\.|[^"\\\n])*"|'[^'\n]*'|#[^\n]*|[\[\]{}\n]''')
-_TOML_INTEGER = re.compile(r'(?:[+-]?(?:0|[1-9](?:_?[0-9])*)|0x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0o[0-7](?:_?[0-7])*|0b[01](?:_?[01])*)')
 
 
 def _toml_simple_string(raw):
@@ -198,7 +321,11 @@ def _positive_int(value):
 
 
 def _local_command(args, cwd=None):
-    proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
+    try:
+        proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
+                              encoding='utf-8', errors='replace', timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HarnessError(f'本地查询无法完成: {args[0]}', stderr=str(exc)) from exc
     if proc.returncode:
         raise HarnessError(f'本地查询失败: {args[0]}')
     return proc.stdout.strip()
@@ -308,6 +435,191 @@ def _agy_home(binary):
     return Path.home() / '.gemini', False
 
 
+def resolve_caller(value):
+    if value != 'auto':
+        return value
+    inherited = os.environ.get('CAE_HARNESS_CALLER', '')
+    return inherited if inherited in ('codex', 'antigravity') else 'caller'
+
+
+def _engine_parts(spec):
+    prefix, _, model = spec.partition(':')
+    if prefix not in ('codex', 'agy'):
+        raise HarnessError('本协作机制仅支持 agy 和 codex 后端')
+    if model == '1m':
+        emit_event('deprecated_model_alias', engine=prefix, alias='1m', replacement='default')
+        model = 'default'
+    return prefix, model if model and model != 'default' else ''
+
+
+def choose_engine(backends, caller, explicit=''):
+    if explicit:
+        name, _ = _engine_parts(explicit)
+    elif caller in ('codex', 'antigravity'):
+        name = 'agy' if caller == 'codex' else 'codex'
+        explicit = name + ':default'
+    else:
+        raise HarnessError('请指定 --caller，或指定 --engine/--worker/--left')
+    if not backends.get(name, {}).get('available'):
+        raise HarnessError(f'未发现所选后端 {name}，请配置对应运行环境')
+    return explicit
+
+
+def _is_link(path):
+    attributes = getattr(path.lstat(), 'st_file_attributes', 0)
+    return path.is_symlink() or bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _ps_literal(text):
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _stage_wsl_readonly_workspace(target_dir, stage_root, rel_files=None):
+    """将纯 Linux 文件镜像到 Windows 临时盘；清单不能逃出原目标树。"""
+    target_dir = target_dir.resolve()
+    stage_dir = stage_root / 'workspace'
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    if rel_files is None:
+        records = collect_target_files(target_dir)
+    else:
+        records = []
+        for rel in rel_files:
+            rel = _scope_patterns([rel])[0]
+            src = target_dir / rel
+            try:
+                src.resolve().relative_to(target_dir)
+                # 叶文件正常也可能经过目录链接，逐级检查阻止镜像树外材料。
+                ancestors = [src] + list(src.parents)[:len(src.relative_to(target_dir).parts) - 1]
+                if any(_is_link(path) for path in ancestors) or not src.is_file():
+                    raise HarnessError(f'只读镜像不接受文件或目录链接: {rel}')
+                records.append({'path': src, 'rel_path': rel, 'bytes': src.stat().st_size})
+            except (OSError, ValueError) as exc:
+                raise HarnessError(f'无法在目标目录内镜像文件: {rel}') from exc
+    if sum(item['bytes'] for item in records) > MAX_INTEROP_STAGE_BYTES:
+        raise HarnessError('WSL 纯 Linux 路径只读镜像超出 64MB 上限，请缩小 --target 范围或在 WSL 安装原生 codex')
+    windows_names = {}
+    for item in records:
+        parts = Path(item['rel_path']).parts
+        for index, part in enumerate(parts, 1):
+            if (re.search(r'[<>:"|?*\x00-\x1f]', part) or part.endswith((' ', '.'))
+                    or re.fullmatch(r'(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?', part, re.I)):
+                raise HarnessError(f'源文件名无法在 Windows 镜像中无损表示: {item["rel_path"]}')
+            spelling = '/'.join(parts[:index])
+            key = spelling.casefold()
+            if key in windows_names and windows_names[key] != spelling:
+                raise HarnessError(f'源路径在 Windows 镜像中发生大小写冲突: {windows_names[key]} / {spelling}')
+            windows_names[key] = spelling
+    for item in records:
+        try:
+            item['path'].resolve().relative_to(target_dir)
+        except (OSError, ValueError) as exc:
+            raise HarnessError(f'镜像源已离开目标目录: {item["rel_path"]}') from exc
+        dst = stage_dir / item['rel_path']
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(item['path'], dst)
+    return stage_dir
+
+
+def _rewrite_staged_paths(parsed, stage_dir):
+    # Windows 可改变回执中的大小写；使用镜像里保留的原拼写还原 ext4 路径。
+    original_paths = {}
+    for directory, _dirs, files in os.walk(stage_dir):
+        for name in files:
+            relative = (Path(directory) / name).relative_to(stage_dir).as_posix()
+            original_paths[relative.casefold()] = relative
+
+    prefixes = [(str(stage_dir).replace('\\', '/').rstrip('/') + '/', os.name == 'nt'),
+                (str(stage_dir.resolve()).replace('\\', '/').rstrip('/') + '/', os.name == 'nt')]
+    if _is_posix() and shutil.which('wslpath'):
+        try:
+            prefixes.append((_wsl_path(stage_dir, windows=True).replace('\\', '/').rstrip('/') + '/', True))
+        except HarnessError:
+            pass
+
+    def _clean(raw_path):
+        norm = raw_path.strip().replace('\\', '/')
+        for prefix, case_insensitive in prefixes:
+            value = norm.casefold() if case_insensitive else norm
+            base = prefix.casefold() if case_insensitive else prefix
+            if value.startswith(base):
+                relative = posixpath.normpath(norm[len(prefix):])
+                return original_paths.get(relative.casefold(), relative)
+        return original_paths.get(posixpath.normpath(norm).casefold(), raw_path)
+
+    if 'read_files' in parsed:
+        parsed['read_files'] = [_clean(item) for item in parsed['read_files']]
+    if 'unread_files' in parsed:
+        parsed['unread_files'] = [{**item, 'file': _clean(item['file'])} for item in parsed['unread_files']]
+    if 'findings' in parsed:
+        parsed['findings'] = [{**item, 'file': _clean(item['file'])} for item in parsed['findings']]
+    return parsed
+
+
+def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None):
+    """监督进程写入本次真实 Windows PID，供 WSL 定向清理进程树。"""
+    pid_file = temp_dir / 'native.pid'
+    if input_text is None:
+        pipes = [
+            '$output = $p.StandardOutput.BaseStream.CopyToAsync([Console]::OpenStandardOutput())',
+            '$errors = $p.StandardError.BaseStream.CopyToAsync([Console]::OpenStandardError())',
+            'while ($null -ne ($line = [Console]::ReadLine())) {',
+            '$p.StandardInput.WriteLine($line)', '$p.StandardInput.Flush()', '}',
+            '$p.StandardInput.Close()', '$p.WaitForExit()', '$output.Wait()', '$errors.Wait()',
+        ]
+    else:
+        prompt_file = temp_dir / 'input.txt'
+        prompt_file.write_text(input_text, encoding='utf-8')
+        pipes = [
+            '$output = $p.StandardOutput.ReadToEndAsync()', '$errors = $p.StandardError.ReadToEndAsync()',
+            '$inputBytes = [IO.File]::ReadAllBytes(' + _ps_literal(_wsl_path(prompt_file)) + ')',
+            '$p.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)', '$p.StandardInput.BaseStream.Flush()',
+            '$p.StandardInput.Close()', '$p.WaitForExit()',
+            '[Console]::Out.Write($output.Result)', '[Console]::Error.Write($errors.Result)',
+        ]
+    args = subprocess.list2cmdline(command[1:])
+    env_lines = ["$info.EnvironmentVariables['CAE_HARNESS_DEPTH'] = '1'"]
+    if codex_home:
+        env_lines.insert(0, "$info.EnvironmentVariables['CODEX_HOME'] = " + _ps_literal(_wsl_path(Path(codex_home))))
+    script = '\n'.join([
+        "$ErrorActionPreference='Stop'",
+        "$ProgressPreference='SilentlyContinue'",
+        '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)',
+        '[IO.File]::WriteAllText(' + _ps_literal(_wsl_path(pid_file.with_suffix('.pending'))) + ', [string]$PID)',
+        '[IO.File]::Move(' + _ps_literal(_wsl_path(pid_file.with_suffix('.pending'))) + ', ' + _ps_literal(_wsl_path(pid_file)) + ')',
+        '$info = New-Object System.Diagnostics.ProcessStartInfo',
+        '$info.FileName = ' + _ps_literal(_wsl_path(Path(command[0]))),
+        '$info.Arguments = ' + _ps_literal(args),
+        '$info.WorkingDirectory = ' + _ps_literal(_wsl_path(work_dir)),
+        '$info.UseShellExecute = $false', '$info.CreateNoWindow = $true',
+        '$info.RedirectStandardInput = $true', '$info.RedirectStandardOutput = $true', '$info.RedirectStandardError = $true',
+        '$info.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)',
+        '$info.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)',
+        *env_lines,
+        '$p = New-Object System.Diagnostics.Process', '$p.StartInfo = $info',
+        '$started = $false', '$completed = $false', '$exitCode = 1', 'try {',
+        '[void]$p.Start()', '$started = $true',
+        *pipes,
+        '$exitCode = $p.ExitCode', '$completed = $true', '} finally {',
+        'if ($started -and -not $completed) { & taskkill.exe /T /F /PID $p.Id | Out-Null }',
+        '$p.Dispose()', '}', 'exit $exitCode',
+    ])
+    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    return ['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], pid_file
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ③ 模型目录、语义线索、挡位策略与执行画像
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _tokens_lower(text):
+    return set(re.split(r'[^a-z0-9]+', str(text or '').lower())) - {''}
+
+
+def _alias_tokens(text):
+    return set(re.findall(r'[a-z0-9]+(?:\.[a-z0-9]+)*', str(text or '').lower()))
+
+
 def _model_records(cache):
     items = cache.get('models', []) if isinstance(cache, dict) else cache
     if not isinstance(items, list):
@@ -401,214 +713,23 @@ def _model_category(prefix, record):
     return 'unknown'
 
 
-def _select_codex_frontier_record(models):
-    native = [record for record in models if _model_category('codex', record) == 'native']
-    return min(native, key=_catalog_order) if native else {}
-
-
 def _model_specialty(record):
     specialty = str(record.get('model_specialty') or record.get('modelSpecialty') or '').lower()
     description = str(record.get('description') or '').lower()
     if specialty in ('fast', 'lightweight', 'speed') or _tokens_lower(record.get('slug')) & FAST_MODEL_TAGS or re.search(
             r'\b(?:fast and affordable|easier tasks|lightweight)\b', description):
         return 'fast'
-    if specialty in ('deep', 'reasoning', 'deep_reasoning') or re.search(
+    if specialty in ('deep', 'reasoning', 'deep_reasoning') or 'astra' in _tokens_lower(record.get('slug')) or re.search(
             r'\b(?:most demanding|frontier intelligence|deepest reasoning|hardest problems)\b', description):
         return 'deep'
     return 'engineering'
 
 
-def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_tokens):
-    models = [item for item in info.get('models', []) if _model_category('codex', item) == 'native']
-    eligible = sorted((item for item in models if not _only_delegating_efforts(item, tier)), key=_catalog_order)
-    if not eligible:
-        return {}, 'no_non_delegating_effort' if models else 'no_native_catalog_candidate'
-
-    def budget(record):
-        return _execution_budget('codex', info, record)['input_budget_tokens']
-
-    if tier == 'low' and not _has_negated_cue(prompt_text, ('轻量', '极速', 'lite', 'mini', 'fast', 'flash')):
-        fast = [item for item in eligible if _model_specialty(item) == 'fast' and estimated_tokens <= budget(item)]
-        if fast:
-            return fast[0], 'specialty_fast_lightweight'
-    if (kind in ('math', 'direction') or (kind == 'review' and tier in ('max', 'xhigh', 'ultra')
-                                         and _has_positive_cue(prompt_text, HIGH_COMPLEXITY_CUES))):
-        deep = [item for item in eligible if _model_specialty(item) == 'deep' and estimated_tokens <= budget(item)]
-        if deep:
-            return deep[0], 'specialty_deep_reasoning'
-    workhorse = [item for item in eligible if _model_specialty(item) == 'engineering'] or eligible
-    fitting = [item for item in workhorse if estimated_tokens <= budget(item)]
-    if not fitting and kind in ('audit', 'code', 'gate'):
-        return max(workhorse, key=budget), 'largest_engineering_budget'
-    return (fitting or workhorse)[0], 'frontier_catalog'
-
-
-def _match_effort_level(supported, target_tier, delegating_efforts=None):
-    valid = [item for item in supported if item in EFFORT_LADDER]
-    if target_tier != 'ultra':
-        blocked = set(delegating_efforts or ()) | {'ultra'}
-        valid = [item for item in valid if item not in blocked]
-    if not valid:
-        return None
-    if target_tier in ('max', 'ultra'):
-        return max(valid, key=EFFORT_LADDER.index)
-    target_rank = EFFORT_LADDER.index(target_tier)
-    at_or_below = [item for item in valid if EFFORT_LADDER.index(item) <= target_rank]
-    return max(at_or_below, key=EFFORT_LADDER.index) if at_or_below else min(valid, key=EFFORT_LADDER.index)
-
-
-def _only_delegating_efforts(record, tier):
-    efforts = record.get('supported_efforts') or []
-    return bool(efforts and tier != 'ultra' and not _match_effort_level(efforts, tier, record.get('delegating_efforts')))
-
-
-def _require_execution_profile(profile):
-    error = profile.get('execution_blocked_reason')
-    if error:
-        raise HarnessError(error, execution_profile=profile)
-
-
-_CUE_BOUNDARIES = re.compile(r'[，。；、,;.!?！？\n]+|\b(?:but|however|instead)\b|但是|而是|而只', re.I)
-_NEGATION = re.compile(
-    r"(?:不(?:要|用|必|需|须|考虑|讨论|涉及|检查|核查|分析|推导|证明|处理|复核|验证)|"
-    r"无需|无须|禁止|排除|避免|跳过|别|勿|莫)[^，。；、,;.!?！？\n]{0,12}$|"
-    r"\b(?:no|not|without|exclude|skip|avoid|don't)\b(?:\s+[\w-]+){0,5}\s*$", re.I)
-
-
-def _semantic_text(text):
-    return re.sub(r'(?m)^\s*>[^\n]*|\x60{3}[\s\S]*?\x60{3}|\x60[^\x60\n]*\x60|'
-                  r'“[^”]*”|‘[^’]*’|"[^"\n]*"|(?<!\w)\x27[^\x27\n]*\x27(?!\w)',
-                  ' ', str(text or ''))
-
-
-def _cue_pattern(cue):
-    if cue.isascii():
-        return r'(?<![A-Za-z0-9_])' + re.escape(cue) + r'(?![A-Za-z0-9_])'
-    return re.escape(cue)
-
-
-def _has_cue(text, cues, *, negated=False):
-    pattern = re.compile('|'.join(_cue_pattern(cue) for cue in cues), re.I)
-    for clause in _CUE_BOUNDARIES.split(_semantic_text(text)):
-        for match in pattern.finditer(clause):
-            if bool(_NEGATION.search(clause[:match.start()])) == negated:
-                return True
-    return False
-
-
-def _has_negated_cue(text, cues):
-    return _has_cue(text, cues, negated=True)
-
-
-def _has_positive_cue(text, cues):
-    return _has_cue(text, cues)
-
-
-def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1, estimated_tokens=0):
-    """输入大小决定容量，任务性质决定默认推理挡位。"""
-    if requested_tier and requested_tier != 'auto':
-        return requested_tier, 'explicit_tier_flag'
-    sample = (text or '').strip()
-    prose_requests = {
-        'max': ('用最高挡', '用最高档', '选最高挡', '选最高档', '用最大挡', '用最大档', '使用 max 挡', 'use max effort'),
-        'xhigh': ('用超高挡', '用超高档', '使用 xhigh 挡', 'use xhigh effort'),
-        'low': ('用低挡', '用低档', '低挡快速', '低档快速', '省额度', '省 token', 'use low effort'),
-        'medium': ('用中挡', '用中档', '使用 medium 挡', 'use medium effort'),
-        'high': ('用高挡', '用高档', '使用 high 挡', 'use high effort'),
-    }
-    for level, cues in prose_requests.items():
-        if _has_positive_cue(sample, cues):
-            return level, 'user_description_' + level
-    if kind in ('math', 'direction'):
-        return 'max', f'task_specialty_{kind}_max'
-    if kind == 'polish' and not _has_positive_cue(sample, ('证明', '推导', '根因', 'prove', 'derive')):
-        if file_count <= 3 and estimated_tokens <= 4_000 and len(sample) <= 2_500:
-            return 'medium', 'complexity_lightweight_polish'
-        return 'high', 'complexity_long_polish'
-    if _has_positive_cue(sample, HIGH_COMPLEXITY_CUES):
-        return 'max', 'complexity_high_domain_max'
-    if (kind in ('review', 'code', 'audit') and _has_positive_cue(sample, TRIVIAL_SURFACE_CUES)
-            and not _has_positive_cue(sample, ('兼容', '回归', '正确性', '安全', '功能', '全量审计', 'verify', 'regression'))):
-        return 'low', 'complexity_trivial_surface_task'
-    env_tier = os.environ.get('CAE_DEFAULT_TIER', '').strip().lower()
-    if env_tier in TIER_CHOICES and env_tier not in ('auto', 'ultra'):
-        return env_tier, 'env_default_tier'
-    return 'high', 'task_routine_high'
-
-
-ROUTER_MODEL_TAGS = {'orchestrator', 'router', 'auto'}
-FAST_MODEL_TAGS = {'lite', 'mini', 'fast', 'flash', 'hydrogen'}
-NON_AI_MODEL_STOPWORDS = {
-    'turbulence', 'rans', 'les', 'dns', 'sst', 'kepsilon', 'komega', 'spalart', 'allmaras',
-    'epsilon', 'navier', 'stokes', 'euler', 'boltzmann', 'bgk', 'muscl', 'tvd', 'godunov',
-    'smagorinsky', 'vreman', 'courant', 'knudsen', 'reynolds', 'prandtl', 'mach',
-    'weno', 'cweno', 'eno', 'dg', 'dgsem', 'fvm', 'fem', 'fdm', 'cfd', 'cae', 'eos',
-    'riemann', 'roe', 'hll', 'hllc', 'hlle', 'ausm', 'rusanov', 'rk', 'bdf', 'cfl',
-    'model', 'models', 'default', 'auto', 'cli', 'lite', 'lightweight',
-    'codex', 'antigravity', 'agy', 'openai', 'google', 'gemini', 'gpt',
-}
-PROMPT_MODEL_HINT_PATTERNS = (
-    re.compile(
-        r'(?:请)?(?:使用|调用|采用|切到|切换至|指定|选用|改用|用)\s*'
-        r'((?:混动\s*)?[A-Za-z][A-Za-z0-9._()（） -]{1,40}?|混动(?:路由(?:器)?)?)\s*'
-        r'(?:AI\s*)?(?:模型|路由(?:器)?|引擎)',
-        re.IGNORECASE,
-    ),
-    re.compile(r'(?:指定模型|执行模型|目标模型)\s*[:=：]\s*([A-Za-z][A-Za-z0-9._()（）-]{1,40})', re.IGNORECASE),
-    re.compile(
-        r'(?:请)?(?:使用|调用|采用|切到|切换至|指定|选用|改用|用)\s*'
-        r'(?:混动\s*)?(orchestrator(?:\s*[-()（）A-Za-z0-9]+)?)',
-        re.IGNORECASE,
-    ),
-)
-
-
-PHYSICAL_SUBSTANCE_TAGS = {
-    'hydrogen', 'carbon', 'argon', 'oxygen', 'nitrogen', 'helium', 'methane', 'air', 'water', 'soot',
-}
-PHYSICS_MODEL_CONTEXT_RE = re.compile(
-    r'(?:计算|模拟|仿真|求解|离散|预测|分析|爆轰|燃烧|反应|组分|流场|传热|热流|'
-    r'detonation|combustion|reaction|species|flow|chemistry|flame)',
-    re.IGNORECASE,
-)
-
-
-def _extract_prompt_model_hint(prompt_text):
-    text = _semantic_text(prompt_text).strip()
-    if not text:
-        return ''
-    stop_words = NON_AI_MODEL_STOPWORDS - ROUTER_MODEL_TAGS
-    for pattern in PROMPT_MODEL_HINT_PATTERNS:
-        for match in pattern.finditer(text):
-            prefix = _CUE_BOUNDARIES.split(text[:match.start()])[-1]
-            if _NEGATION.search(prefix):
-                continue
-            cand = re.sub(r'\s+', ' ', match.group(1)).strip()
-            if not cand:
-                continue
-            tokens = [tok for tok in re.findall(r'[a-z0-9]+', cand.lower()) if tok]
-            collapsed = re.sub(r'[^a-z0-9]+', '', cand.lower())
-            if collapsed in stop_words or any(tok in stop_words for tok in tokens):
-                continue
-            if collapsed in PHYSICAL_SUBSTANCE_TAGS:
-                has_ai_qualifier = bool(re.search(r'(?:\bAI\b|\bagy\b|\bcodex\b|\bgemini\b|\borchestrator\b|[()（）])', match.group(0), re.IGNORECASE))
-                tail_ctx = text[match.end():min(len(text), match.end() + 24)]
-                head_ctx = text[max(0, match.start() - 16):match.start()]
-                if not has_ai_qualifier and (
-                    PHYSICS_MODEL_CONTEXT_RE.search(tail_ctx) or PHYSICS_MODEL_CONTEXT_RE.search(head_ctx)
-                ):
-                    continue
-            if tokens or '混动' in cand:
-                return cand
-    return ''
-
-
-def _tokens_lower(text):
-    return set(re.split(r'[^a-z0-9]+', str(text or '').lower())) - {''}
-
-
-def _alias_tokens(text):
-    return set(re.findall(r'[a-z0-9]+(?:\.[a-z0-9]+)*', str(text or '').lower()))
+def _codex_versioned_line(slug):
+    match = re.match(r'^gpt-(\d+(?:\.\d+)*)-([a-z][a-z0-9-]*)$', str(slug or '').strip().lower())
+    if not match:
+        return None, None
+    return tuple(int(part) for part in match.group(1).split('.')), match.group(2)
 
 
 def _unique_model_matches(query, models):
@@ -623,13 +744,6 @@ def _exact_model_record(models, query):
     value = query.lower()
     return _unique_model_matches(query, [item for item in models if item['slug'].lower() == value]) or _unique_model_matches(
         query, [item for item in models if str(item.get('display_name') or '').lower() == value])
-
-
-def _codex_versioned_line(slug):
-    match = re.match(r'^gpt-(\d+(?:\.\d+)*)-([a-z][a-z0-9-]*)$', str(slug or '').strip().lower())
-    if not match:
-        return None, None
-    return tuple(int(part) for part in match.group(1).split('.')), match.group(2)
 
 
 def _resolve_explicit_codex_record(models, explicit_model):
@@ -673,6 +787,26 @@ def _agy_family_order(name):
     return tuple(-v for v in (version + (0, 0, 0))[:3]), priority, name
 
 
+def _match_effort_level(supported, target_tier, delegating_efforts=None):
+    """max 表示目录声明的最高非委派挡；仅显式 ultra 可以放行委派挡。"""
+    valid = [item for item in supported if item in EFFORT_LADDER]
+    if target_tier != 'ultra':
+        blocked = set(delegating_efforts or ()) | {'ultra'}
+        valid = [item for item in valid if item not in blocked]
+    if not valid:
+        return None
+    if target_tier in ('max', 'ultra'):
+        return max(valid, key=EFFORT_LADDER.index)
+    target_rank = EFFORT_LADDER.index(target_tier)
+    at_or_below = [item for item in valid if EFFORT_LADDER.index(item) <= target_rank]
+    return max(at_or_below, key=EFFORT_LADDER.index) if at_or_below else min(valid, key=EFFORT_LADDER.index)
+
+
+def _only_delegating_efforts(record, tier):
+    efforts = record.get('supported_efforts') or []
+    return bool(efforts and tier != 'ultra' and not _match_effort_level(efforts, tier, record.get('delegating_efforts')))
+
+
 def _match_agy_family(family, tier):
     return family.get(_match_effort_level(family, tier), {})
 
@@ -708,6 +842,131 @@ def _resolve_explicit_agy_record(models, query, tier):
                 wants_composite and not terms and composite):
             candidates.append(item)
     return _unique_model_matches(query, candidates), 'explicit_fuzzy_model'
+
+
+def _semantic_text(text):
+    return re.sub(r'(?m)^\s*>[^\n]*|\x60{3}[\s\S]*?\x60{3}|\x60[^\x60\n]*\x60|'
+                  r'“[^”]*”|‘[^’]*’|"[^"\n]*"|(?<![A-Za-z0-9_])\x27[^\x27\n]*\x27(?![A-Za-z0-9_])',
+                  ' ', str(text or ''))
+
+
+def _cue_is_negated(prefix):
+    # “能不能降档”“要不省点”是在提议；不能因其中一个“不”反转意图。
+    prefix = re.sub(r'(?<!不)(?:能不能|可不可以|要不|不妨|何不)', ' ', prefix)
+    return bool(_NEGATION.search(prefix))
+
+
+def _cue_pattern(cue):
+    escaped = re.escape(cue)
+    # 中英文混写中的空白不影响意图，例如“省  token”和“save   tokens”。
+    escaped = escaped.replace(r'\ ', r'\s+')
+    if cue.isascii():
+        return r'(?<![A-Za-z0-9_])' + escaped + r'(?![A-Za-z0-9_])'
+    return escaped
+
+
+def _has_cue(text, cues, *, negated=False):
+    if not cues:
+        return False
+    pattern = re.compile('|'.join(_cue_pattern(cue) for cue in cues), re.I)
+    for clause in _CUE_BOUNDARIES.split(_semantic_text(text)):
+        for match in pattern.finditer(clause):
+            if _cue_is_negated(clause[:match.start()]) == negated:
+                return True
+    return False
+
+
+def _has_negated_cue(text, cues):
+    return _has_cue(text, cues, negated=True)
+
+
+def _has_positive_cue(text, cues):
+    return _has_cue(text, cues)
+
+
+def _extract_prompt_model_hint(prompt_text):
+    text = _semantic_text(prompt_text).strip()
+    if not text:
+        return ''
+    stop_words = NON_AI_MODEL_STOPWORDS - ROUTER_MODEL_TAGS
+    for pattern in PROMPT_MODEL_HINT_PATTERNS:
+        for match in pattern.finditer(text):
+            prefix = _CUE_BOUNDARIES.split(text[:match.start()])[-1]
+            if _cue_is_negated(prefix):
+                continue
+            cand = re.sub(r'\s+', ' ', match.group(1)).strip()
+            if not cand:
+                continue
+            tokens = [tok for tok in re.findall(r'[a-z0-9]+', cand.lower()) if tok]
+            collapsed = re.sub(r'[^a-z0-9]+', '', cand.lower())
+            # 通用名称与 CFD 格式名称应排除，完整 gpt/gemini 型号则保留。
+            provider_qualifiers = {'gpt', 'gemini', 'codex', 'agy', 'openai', 'google'}
+            if collapsed in stop_words or any(tok in stop_words - provider_qualifiers for tok in tokens):
+                continue
+            if collapsed in PHYSICAL_SUBSTANCE_TAGS:
+                has_ai_qualifier = bool(re.search(r'(?:\bAI\b|\bagy\b|\bcodex\b|\bgemini\b|\borchestrator\b|[()（）])', match.group(0), re.IGNORECASE))
+                tail_ctx = text[match.end():min(len(text), match.end() + 24)]
+                head_ctx = text[max(0, match.start() - 16):match.start()]
+                if not has_ai_qualifier and (
+                    PHYSICS_MODEL_CONTEXT_RE.search(tail_ctx) or PHYSICS_MODEL_CONTEXT_RE.search(head_ctx)
+                ):
+                    continue
+            if tokens or '混动' in cand:
+                return cand
+    return ''
+
+
+def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1, estimated_tokens=0):
+    """默认满血；显式挡位、省流意图与非 ultra 环境默认值可覆盖自动策略。"""
+    if requested_tier and requested_tier != 'auto':
+        return requested_tier, 'explicit_tier_flag'
+    sample = (text or '').strip()
+    prose_requests = {
+        'max': ('用最高挡', '用最高档', '选最高挡', '选最高档', '用最大挡', '用最大档', '使用 max 挡', 'use max effort'),
+        'xhigh': ('用超高挡', '用超高档', '选超高挡', '选超高档', '使用 xhigh 挡', 'use xhigh effort'),
+        'low': ('用低挡', '用低档', '选低挡', '选低档', '低挡快速', '低档快速', '降到低挡', '降到低档',
+                '最低挡', '最低档', '使用 low 挡', 'use low effort'),
+        'medium': ('用中挡', '用中档', '选中挡', '选中档', '降到中挡', '降到中档', '使用 medium 挡', 'use medium effort'),
+        'high': ('用高挡', '用高档', '选高挡', '选高档', '降到高挡', '降到高档', '使用 high 挡', 'use high effort'),
+    }
+    for level, cues in prose_requests.items():
+        if _has_positive_cue(sample, cues):
+            return level, 'user_description_' + level
+    env_tier = os.environ.get('CAE_DEFAULT_TIER', '').strip().lower()
+    if env_tier in TIER_CHOICES and env_tier not in ('auto', 'ultra'):
+        return env_tier, 'env_default_tier'
+    if kind == 'polish' and not _has_positive_cue(sample, ('证明', '推导', '根因', 'prove', 'derive')):
+        if file_count <= 3 and estimated_tokens <= 4_000 and len(sample) <= 2_500:
+            return 'medium', 'complexity_lightweight_polish'
+        return 'high', 'complexity_long_polish'
+    if _has_positive_cue(sample, ECONOMY_DOWNGRADE_CUES):
+        if (kind in ('review', 'code', 'audit')
+                and (_has_positive_cue(sample, TRIVIAL_SURFACE_CUES)
+                     or _has_positive_cue(sample, ('轻量快速', '快速扫', '简单扫', '快速看')))
+                and not _has_positive_cue(sample, HIGH_COMPLEXITY_CUES)
+                and not _has_positive_cue(sample, ('兼容', '回归', '正确性', '安全', '功能', '全量审计', 'verify', 'regression'))):
+            return 'low', 'economy_trivial_surface_low'
+        if (kind in ('math', 'direction') or _has_positive_cue(sample, HIGH_COMPLEXITY_CUES)) and not _has_positive_cue(
+                sample, ('降挡', '降档', '降一挡', '降一档', '适当降挡', '适当降档', '降低挡位', '降低档位', 'lower tier', 'lower effort')):
+            return 'max', f'task_specialty_{kind}_max' if kind in ('math', 'direction') else 'complexity_high_domain_max'
+        return 'high', 'economy_adaptive_high'
+    if kind in ('math', 'direction'):
+        return 'max', f'task_specialty_{kind}_max'
+    if _has_positive_cue(sample, HIGH_COMPLEXITY_CUES):
+        return 'max', 'complexity_high_domain_max'
+    return 'max', 'default_flagship_max'
+
+
+def _execution_side(info):
+    return info.get('execution_side') or (
+        'windows' if info.get('windows_interop') or not _is_posix() else 'posix')
+
+
+def _execution_environment(info):
+    return {'side': _execution_side(info), 'windows_interop': bool(info.get('windows_interop')),
+            'binary': info.get('binary'), 'config_home': info.get('config_home'),
+            'authentication_status': info.get('authentication_status', 'not_checked'),
+            'fallback_from': info.get('fallback_from')}
 
 
 def _execution_budget(prefix, info, record):
@@ -750,18 +1009,6 @@ def _execution_budget(prefix, info, record):
     }
 
 
-def _execution_side(info):
-    return info.get('execution_side') or (
-        'windows' if info.get('windows_interop') or not _is_posix() else 'posix')
-
-
-def _execution_environment(info):
-    return {'side': _execution_side(info), 'windows_interop': bool(info.get('windows_interop')),
-            'binary': info.get('binary'), 'config_home': info.get('config_home'),
-            'authentication_status': info.get('authentication_status', 'not_checked'),
-            'fallback_from': info.get('fallback_from')}
-
-
 def _profile(prefix, info, spec, slug, record, tier, source, effort=None, cli_effort=None,
              effort_source='unknown', error=None):
     catalog = info.get('model_catalog') or {}
@@ -795,6 +1042,12 @@ def _profile(prefix, info, spec, slug, record, tier, source, effort=None, cli_ef
     }
 
 
+def _require_execution_profile(profile):
+    error = profile.get('execution_blocked_reason')
+    if error:
+        raise HarnessError(error, execution_profile=profile)
+
+
 def _codex_profile(info, spec, record, slug, tier, source):
     effort = _match_effort_level(record.get('supported_efforts', []), tier, record.get('delegating_efforts'))
     if _only_delegating_efforts(record, tier):
@@ -821,7 +1074,53 @@ def _agy_profile(info, spec, record, slug, tier, source):
                     'catalog_variant' if record and variant else 'unverified_request' if variant else 'unknown', error)
 
 
-def resolve_execution_profile(backends, spec, tier='high', prompt_text='', kind='review', estimated_tokens=0):
+def _select_codex_frontier_record(models):
+    native = [record for record in models if _model_category('codex', record) == 'native']
+    return min(native, key=_catalog_order) if native else {}
+
+
+def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_tokens):
+    models = [item for item in info.get('models', []) if _model_category('codex', item) == 'native']
+    eligible = sorted((item for item in models if not _only_delegating_efforts(item, tier)), key=_catalog_order)
+    # 同一产品线只自动采用最新一代；目录优先级仍用于不同产品线之间的选择。
+    latest = {}
+    for item in eligible:
+        version, line = _codex_versioned_line(item['slug'])
+        if version is not None:
+            latest[line] = max(latest.get(line, ()), version)
+    current = []
+    for item in eligible:
+        version, line = _codex_versioned_line(item['slug'])
+        if version is None or version == latest[line]:
+            current.append(item)
+    eligible = current
+    if not eligible:
+        return {}, 'no_non_delegating_effort' if models else 'no_native_catalog_candidate'
+
+    def budget(record):
+        return _execution_budget('codex', info, record)['input_budget_tokens']
+
+    if tier == 'low' and not _has_negated_cue(prompt_text, ('轻量', '极速', 'lite', 'mini', 'fast', 'flash', 'luna')):
+        fast = [item for item in eligible if _model_specialty(item) == 'fast' and estimated_tokens <= budget(item)]
+        if fast:
+            return fast[0], 'specialty_fast_lightweight'
+    if (kind in ('math', 'direction') or (kind == 'review' and tier != 'low'
+                                         and _has_positive_cue(prompt_text, HIGH_COMPLEXITY_CUES))):
+        deep = [item for item in eligible if _model_specialty(item) == 'deep' and estimated_tokens <= budget(item)]
+        if deep:
+            return deep[0], 'specialty_deep_reasoning'
+    # 满血模式不能因主力目录缺失而静默切到轻量模型。
+    non_lightweight = [item for item in eligible if _model_specialty(item) != 'fast']
+    workhorse = [item for item in non_lightweight if _model_specialty(item) == 'engineering'] or non_lightweight
+    if not workhorse:
+        return {}, 'no_native_catalog_candidate'
+    fitting = [item for item in workhorse if estimated_tokens <= budget(item)]
+    if not fitting and kind in ('audit', 'code', 'gate'):
+        return max(workhorse, key=budget), 'largest_engineering_budget'
+    return (fitting or workhorse)[0], 'frontier_catalog'
+
+
+def resolve_execution_profile(backends, spec, tier='max', prompt_text='', kind='review', estimated_tokens=0):
     prefix, explicit_model = _engine_parts(spec)
     info = backends.get(prefix, {})
     models = info.get('models', [])
@@ -858,13 +1157,18 @@ def resolve_execution_profile(backends, spec, tier='high', prompt_text='', kind=
         eligible = sorted((name for name in families if _match_agy_family(families[name], tier)), key=_agy_family_order)
         if eligible:
             is_fast = lambda name: bool(_tokens_lower(name) & FAST_MODEL_TAGS)
-            normal = [name for name in eligible if not is_fast(name)] or eligible
+            normal = [name for name in eligible if not is_fast(name)]
+            forbid_lightweight = _has_negated_cue(prompt_text, ('轻量', '极速', 'lite', 'mini', 'fast', 'flash', 'hydrogen', '氢'))
+            if not normal and (tier != 'low' or forbid_lightweight):
+                return _profile(prefix, info, spec, None, {}, tier, 'no_native_catalog_candidate',
+                                error='未找到原生旗舰模型，请刷新目录或显式指定模型。')
+            normal = normal or eligible
             chosen, source = normal[0], 'frontier_catalog'
-            if tier == 'low' and not _has_negated_cue(prompt_text, ('轻量', '极速', 'lite', 'mini', 'fast', 'flash', 'hydrogen', '氢')):
+            if tier == 'low' and not forbid_lightweight:
                 fast = [name for name in eligible if is_fast(name)]
                 if fast:
                     chosen, source = fast[0], 'specialty_fast_lightweight'
-            elif kind in ('math', 'direction') or (kind == 'review' and tier in ('xhigh', 'max', 'ultra')
+            elif kind in ('math', 'direction') or (kind == 'review' and tier != 'low'
                                                   and _has_positive_cue(prompt_text, HIGH_COMPLEXITY_CUES)):
                 top_gen = _agy_family_order(normal[0])[0]
                 top_normal = [name for name in normal if _agy_family_order(name)[0] == top_gen]
@@ -918,6 +1222,12 @@ def _read_codex_catalog(home, now):
     return models, catalog
 
 
+def _current_catalog(info):
+    catalog = info.get('model_catalog') or {}
+    return bool(info.get('models') and catalog.get('model_count') and catalog.get('fetched_at')
+                and catalog.get('freshness') == 'within_assessment_window')
+
+
 def _refresh_codex_listing(info, batch):
     _enforce_preflight_quota({'codex': info}, ('codex:default',), batch=batch)
     try:
@@ -957,12 +1267,6 @@ def _refresh_codex_listing(info, batch):
                 verified_status='model_listing_only', capability_source='model_list_and_same_side_cache')
 
 
-def _current_catalog(info):
-    catalog = info.get('model_catalog') or {}
-    return bool(info.get('models') and catalog.get('model_count') and catalog.get('fetched_at')
-                and catalog.get('freshness') == 'within_assessment_window')
-
-
 def _agy_config(root):
     cli_path = root / 'antigravity-cli' / 'settings.json'
     app_path = root / 'config' / 'config.json'
@@ -978,8 +1282,10 @@ def _agy_config(root):
 
 def _agy_cached_records(data):
     models = data.get('models') if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return []
     return [item for item in models if isinstance(item, dict) and isinstance(item.get('slug'), str)
-            and item['slug'].strip()] if isinstance(models, list) else []
+            and item['slug'].strip()]
 
 
 def _agy_info(binary, requested, now=None):
@@ -998,11 +1304,6 @@ def _agy_info(binary, requested, now=None):
             'budget_source': 'explicit_planning_budget' if requested else 'policy_estimate_120000',
             'capability_source': 'local_settings_and_cache' if models else 'local_settings',
             'capacity_notice': '宿主压缩阈值未核实，规划预算不表示无压缩容量。'}
-
-
-_AGY_AUTH_REQUIRED = re.compile(
-    r'\b(?:please (?:sign in|log in|login)|not (?:signed|logged) in|authentication required|'
-    r'login required|sign-in required|unauthenticated)\b', re.I)
 
 
 def _can_fallback_agy(info):
@@ -1093,7 +1394,10 @@ def probe_backends(codex_input_budget=None, agy_input_budget=None, discover_mode
     config = _top_level_toml(config_file)
     models, catalog = _read_codex_catalog(home, now)
     interactive_model = config.get('model')
-    selected = next((item for item in models if item['slug'] == interactive_model), {}) if interactive_model else _select_codex_frontier_record(models)
+    if interactive_model:
+        selected = next((item for item in models if item['slug'] == interactive_model), {})
+    else:
+        selected = _select_codex_frontier_record(models)
     configured = _positive_int(config.get('model_context_window'))
     cached_default = _positive_int(selected.get('context_window'))
     cached_max = _positive_int(selected.get('max_context_window'))
@@ -1142,6 +1446,49 @@ def probe_backends(codex_input_budget=None, agy_input_budget=None, discover_mode
     return result_map
 
 
+def _capability_matrix(prefix, info):
+    models = info['models']
+    families = _agy_families(models) if prefix == 'agy' else {}
+    rows = []
+    for record in sorted(models, key=_catalog_order):
+        slug = record['slug']
+        category = _model_category(prefix, record)
+        if prefix == 'agy':
+            family, variant = _agy_slug_tier(slug)
+            efforts = sorted(families.get(family, {}), key=EFFORT_LADDER.index) if family else []
+        else:
+            family, variant = None, None
+            efforts = list(record.get('supported_efforts') or [])
+        rows.append({
+            'model': slug, 'display_name': record.get('display_name'), 'category': category,
+            'auto_candidate': category == 'native',
+            'family': family or None, 'variant_effort': variant or None,
+            'declared_efforts': efforts, 'declared_default_effort': record.get('default_reasoning_level'),
+            'effort_source': ('fixed_configuration' if category == 'fixed_composite' else
+                              'agy_catalog_slug_suffix' if variant else
+                              'codex_client_cache_reasoning_levels' if efforts else 'unknown'),
+            'fixed_configuration': 'same_agent_planning_review_and_execution' if category == 'fixed_composite' else None,
+            'capacity': _execution_budget(prefix, info, record),
+            'catalog_source': info['model_catalog'].get('source'),
+            'catalog_fetched_at': info['model_catalog'].get('fetched_at'),
+            'catalog_freshness': info['model_catalog'].get('freshness'),
+            'runtime_verified': False,
+        })
+    return rows
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ④ 额度冷却持久化、熔断门禁与回退资格
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class _QuotaBatch:
+    def __init__(self, retry=False):
+        self.retry = retry
+        self.initial_cooldown = {}
+        self.blocked = {}
+
+
 def _is_quota_exhausted(text):
     return bool(text and QUOTA_ERROR_RE.search(text))
 
@@ -1161,16 +1508,19 @@ def _parse_quota_reset(text, now=None):
             try:
                 epoch = datetime.datetime.strptime(cleaned, fmt).timestamp()
                 break
-            except ValueError:
+            except (ValueError, OverflowError, OSError):
                 continue
         if epoch is None:
             try:
                 epoch = datetime.datetime.fromisoformat(cleaned.replace('Z', '+00:00')).timestamp()
-            except ValueError:
+            except (ValueError, OverflowError, OSError):
                 rel = re.fullmatch(r'(?:(\d+)\s*h)?\s*(?:(\d+)\s*m(?:in)?)?\s*(?:(\d+)\s*s(?:ec)?)?', cleaned, re.IGNORECASE)
                 if rel and any(rel.groups()):
-                    hrs, mins, secs = (int(val or 0) for val in rel.groups())
-                    epoch = now_ts + hrs * 3600 + mins * 60 + secs
+                    try:
+                        hrs, mins, secs = (int(val or 0) for val in rel.groups())
+                        epoch = now_ts + hrs * 3600 + mins * 60 + secs
+                    except (ValueError, OverflowError):
+                        epoch = None
     if epoch is not None and now_ts < epoch <= now_ts + 45 * 86400:
         until, source = epoch, 'parsed_reset_time'
     else:
@@ -1178,18 +1528,13 @@ def _parse_quota_reset(text, now=None):
     return {'reset_hint': hint or None, 'cooldown_until_epoch': round(until, 3), 'cooldown_source': source}
 
 
-class _QuotaBatch:
-    def __init__(self, retry=False):
-        self.retry = retry
-        self.initial_cooldown = {}
-        self.blocked = {}
-
-
 def _quota_scope(prefix, info):
     home = info.get('config_home')
     side = _execution_side(info)
     scope = str(Path(home).resolve()) if home else str(info.get('binary') or '')
-    return prefix, side, scope.casefold() if side == 'windows' else scope
+    if side == 'windows':
+        scope = ntpath.normpath(scope).replace('\\', '/').casefold()
+    return prefix, side, scope
 
 
 def _quota_state_path(prefix, info, *, legacy=False):
@@ -1203,15 +1548,30 @@ def _quota_state_path(prefix, info, *, legacy=False):
     return base / 'cache' / filename
 
 
-_QUOTA_EVENT_NAME = re.compile(r'^[0-9a-f]{32}\.json$')
-
-
 def _quota_events_dir(state_path):
     return state_path.with_suffix('.events')
 
 
 def _quota_ack_name(record):
     return hashlib.sha256(json.dumps(record, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest() + '.json'
+
+
+def _quota_identity(record):
+    if not record:
+        return None
+    return _quota_ack_name(record)
+
+
+def _publish_quota_record(path, record):
+    # Each failure owns a unique path. Publish it atomically so a reader
+    # cannot mistake partially written JSON for an absent cooldown.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_name('.' + uuid.uuid4().hex + '.pending')
+    try:
+        pending.write_text(json.dumps(record, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        os.replace(pending, path)
+    finally:
+        pending.unlink(missing_ok=True)
 
 
 def _read_quota_cooldowns(prefix, info, now=None, *, cleanup_expired=False):
@@ -1235,15 +1595,16 @@ def _read_quota_cooldowns(prefix, info, now=None, *, cleanup_expired=False):
         if data.get('execution_side', _execution_side(info)) != _execution_side(info):
             continue
         until = data.get('cooldown_until_epoch')
-        if type(until) not in (int, float) or not now_ts < until:
+        if (type(until) not in (int, float) or (type(until) is float and not math.isfinite(until))
+                or not now_ts < until):
             if cleanup_expired and immutable:
                 try:
                     path.unlink()
                 except OSError:
                     pass
             continue
-        # Older versions replace a fixed path. Acknowledging its exact value
-        # avoids a check-then-unlink race with those writers.
+        # 旧版写固定路径。按记录全文的摘要确认成功，只确认本次见过的值，
+        # 不删除可能已被另一进程替换为新失败记录的固定路径。
         if not immutable and (events / 'acknowledged' / _quota_ack_name(data)).is_file():
             continue
         found.append((path, data))
@@ -1266,17 +1627,18 @@ def _load_active_quota_cooldown(prefix, info, now=None, *, cleanup_expired=True)
 
 
 def _active_quota_record(prefix, info, files=None):
-    key = _quota_scope(prefix, info)
-    in_session = _SESSION_QUOTA_BLOCKED.get(key)
-    if in_session and time.time() >= in_session['cooldown_until_epoch']:
-        _SESSION_QUOTA_BLOCKED.pop(key, None)
-        in_session = None
-    if files is None:
-        files = _read_quota_cooldowns(prefix, info)
-    records = [record for _path, record in files]
-    if in_session:
-        records.append(in_session)
-    return max(records, key=lambda record: record['cooldown_until_epoch'], default=None)
+    with QUOTA_LOCK:
+        key = _quota_scope(prefix, info)
+        in_session = _SESSION_QUOTA_BLOCKED.get(key)
+        if in_session and time.time() >= in_session['cooldown_until_epoch']:
+            _SESSION_QUOTA_BLOCKED.pop(key, None)
+            in_session = None
+        if files is None:
+            files = _read_quota_cooldowns(prefix, info)
+        records = [record for _path, record in files]
+        if in_session:
+            records.append(in_session)
+        return max(records, key=lambda record: record['cooldown_until_epoch'], default=None)
 
 
 def _record_quota_exhausted(prefix, info, detail, now=None, *, batch=None):
@@ -1299,24 +1661,6 @@ def _record_quota_exhausted(prefix, info, detail, now=None, *, batch=None):
             except OSError:
                 info['quota_cache_write_failed'] = True
     return record
-
-
-def _publish_quota_record(path, record):
-    # Each failure owns a unique path. Publish it atomically so a reader
-    # cannot mistake partially written JSON for an absent cooldown.
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pending = path.with_name('.' + uuid.uuid4().hex + '.pending')
-    try:
-        pending.write_text(json.dumps(record, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-        os.replace(pending, path)
-    finally:
-        pending.unlink(missing_ok=True)
-
-
-def _quota_identity(record):
-    if not record:
-        return None
-    return _quota_ack_name(record)
 
 
 def _mark_quota_success(prefix, info, batch):
@@ -1390,202 +1734,284 @@ def _enforce_preflight_quota(backends, specs, retry_quota=False, *, batch=None):
                                **_quota_user_choices(prefix, cooldown))
 
 
-def resolve_caller(value):
-    if value != 'auto':
-        return value
-    inherited = os.environ.get('CAE_HARNESS_CALLER', '')
-    return inherited if inherited in ('codex', 'antigravity') else 'caller'
+def _local_fallback_engine(caller, engine, backends):
+    fallback = {'antigravity': 'agy:default', 'codex': 'codex:default'}.get(caller)
+    if not fallback:
+        return None
+    cur_prefix, _ = _engine_parts(engine)
+    fb_prefix, _ = _engine_parts(fallback)
+    if cur_prefix == fb_prefix or not backends.get(fb_prefix, {}).get('available'):
+        return None
+    return fallback
 
 
-def _engine_parts(spec):
-    prefix, _, model = spec.partition(':')
-    if prefix not in ('codex', 'agy'):
-        raise HarnessError('本协作机制仅支持 agy 和 codex 后端')
-    if model == '1m':
-        emit_event('deprecated_model_alias', engine=prefix, alias='1m', replacement='default')
-        model = 'default'
-    return prefix, model if model and model != 'default' else ''
+def _quota_fallback_record(from_engine, to_engine, details):
+    details = details or {}
+    return {
+        'from_engine': from_engine,
+        'to_engine': to_engine,
+        'reason': 'quota_exhausted',
+        'preflight_blocked': bool(details.get('preflight_blocked')),
+        'quota_cooldown': details.get('quota_cooldown'),
+    }
 
 
-def choose_engine(backends, caller, explicit=''):
-    if explicit:
-        name, _ = _engine_parts(explicit)
-    elif caller in ('codex', 'antigravity'):
-        name = 'agy' if caller == 'codex' else 'codex'
-        explicit = name + ':default'
-    else:
-        raise HarnessError('请指定 --caller，或指定 --engine/--worker/--left')
-    if not backends.get(name, {}).get('available'):
-        raise HarnessError(f'未发现所选后端 {name}，请配置对应运行环境')
-    return explicit
+def _quota_can_replay(details, invocation):
+    return (bool(details.get('preflight_blocked')) or invocation.get('startup_only') is True
+            or not invocation.get('invocation_started', invocation.get('launch_attempted', False)))
 
 
-def estimate_tokens_from_bytes(num_bytes):
-    return max(1, (num_bytes + 2) // 3) if num_bytes else 0
+# ════════════════════════════════════════════════════════════════════════════
+# ⑤ 进程树监督、JSON 流解析、App-Server RPC 与无头执行
+# ════════════════════════════════════════════════════════════════════════════
 
 
-def _is_link(path):
-    attributes = getattr(path.lstat(), 'st_file_attributes', 0)
-    return path.is_symlink() or bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+class _WindowsJob:
+    """为本次子进程单独持有 Job；挂起创建、先纳管后恢复，封住派生竞态。"""
 
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
 
-def collect_target_files(target, skipped_files=None):
-    target = target.resolve()
-    skipped = skipped_files if skipped_files is not None else []
-    candidates = [target] if target.is_file() else []
-    if target.is_dir():
-        for root, dirs, files in os.walk(target):
-            dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS and not d.startswith('.'))
-            for name in list(dirs):
-                directory = Path(root) / name
-                if _is_link(directory):
-                    skipped.append({'file': directory.relative_to(target).as_posix(), 'reason': 'directory_link'})
-                    dirs.remove(name)
-            candidates.extend(Path(root) / name for name in sorted(files)
-                              if Path(name).suffix.lower() in SOURCE_EXTENSIONS or name in ('CMakeLists.txt', 'Makefile', 'makefile'))
-    records = []
-    for path in candidates:
-        rel = path.name if target.is_file() else path.relative_to(target).as_posix()
-        if _is_link(path):
-            skipped.append({'file': rel, 'reason': 'symbolic_link'})
-            continue
+        class ThreadEntry(ctypes.Structure):
+            _fields_ = [('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD),
+                        ('th32ThreadID', wintypes.DWORD), ('th32OwnerProcessID', wintypes.DWORD),
+                        ('tpBasePri', wintypes.LONG), ('tpDeltaPri', wintypes.LONG), ('dwFlags', wintypes.DWORD)]
+
+        self.ctypes = ctypes
+        self.entry_type = ThreadEntry
+        self.api = ctypes.WinDLL('kernel32', use_last_error=True)
+        signatures = (
+            ('CreateJobObjectW', wintypes.HANDLE, (ctypes.c_void_p, wintypes.LPCWSTR)),
+            ('AssignProcessToJobObject', wintypes.BOOL, (wintypes.HANDLE, wintypes.HANDLE)),
+            ('TerminateJobObject', wintypes.BOOL, (wintypes.HANDLE, wintypes.UINT)),
+            ('CloseHandle', wintypes.BOOL, (wintypes.HANDLE,)),
+            ('CreateToolhelp32Snapshot', wintypes.HANDLE, (wintypes.DWORD, wintypes.DWORD)),
+            ('Thread32First', wintypes.BOOL, (wintypes.HANDLE, ctypes.POINTER(ThreadEntry))),
+            ('Thread32Next', wintypes.BOOL, (wintypes.HANDLE, ctypes.POINTER(ThreadEntry))),
+            ('OpenThread', wintypes.HANDLE, (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)),
+            ('ResumeThread', wintypes.DWORD, (wintypes.HANDLE,)),
+        )
+        for name, result, arguments in signatures:
+            function = getattr(self.api, name)
+            function.restype, function.argtypes = result, arguments
+        self.handle = self.api.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def attach(self, proc):
+        # Popen 保留的句柄具有创建时的权限，受限令牌重新 OpenProcess 可能被拒绝。
+        if not self.api.AssignProcessToJobObject(self.handle, int(proc._handle)):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        snapshot = self.api.CreateToolhelp32Snapshot(0x00000004, 0)  # TH32CS_SNAPTHREAD
+        if snapshot == self.ctypes.c_void_p(-1).value:
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
         try:
-            size = path.stat().st_size
-            with path.open('rb') as stream:
-                stream.read(1)
-        except OSError as exc:
-            skipped.append({'file': rel, 'reason': 'unreadable', 'detail': str(exc)})
-            continue
-        if not size:
-            skipped.append({'file': rel, 'reason': 'empty_file'})
-            continue
-        records.append({'path': path, 'rel_path': rel, 'bytes': size, 'tokens': estimate_tokens_from_bytes(size)})
-    return records
+            entry = self.entry_type()
+            entry.dwSize = self.ctypes.sizeof(entry)
+            available = self.api.Thread32First(snapshot, self.ctypes.byref(entry))
+            while available:
+                if entry.th32OwnerProcessID == proc.pid:
+                    thread = self.api.OpenThread(0x0002, False, entry.th32ThreadID)  # THREAD_SUSPEND_RESUME
+                    if not thread:
+                        raise self.ctypes.WinError(self.ctypes.get_last_error())
+                    try:
+                        if self.api.ResumeThread(thread) == 0xFFFFFFFF:
+                            raise self.ctypes.WinError(self.ctypes.get_last_error())
+                    finally:
+                        self.api.CloseHandle(thread)
+                    return
+                available = self.api.Thread32Next(snapshot, self.ctypes.byref(entry))
+            raise OSError('未找到挂起子进程的主线程')
+        finally:
+            self.api.CloseHandle(snapshot)
+
+    def terminate(self):
+        if self.handle and not self.api.TerminateJobObject(self.handle, 1):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+
+    def close(self):
+        if self.handle:
+            self.api.CloseHandle(self.handle)
+            self.handle = None
 
 
-def _audit_estimate(files, file_tokens, focus, interop=False):
-    prompt = _build_audit_prompt({'files': files}, focus)
-    schema_bytes = len(json.dumps(AUDIT_JSON_SCHEMA, ensure_ascii=False).encode('utf-8'))
-    interop_bytes = len(STAGED_PROMPT_SUFFIX.encode('utf-8')) if interop else 0
-    overhead = estimate_tokens_from_bytes(len(prompt.encode('utf-8')) + schema_bytes + interop_bytes)
-    return {'estimated_file_tokens': file_tokens, 'estimated_prompt_tokens': overhead,
-            'estimated_tokens': file_tokens + overhead}
+def _process_options():
+    if os.name == 'nt':
+        return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW | 0x00000004}
+    return {'start_new_session': True}
 
 
-def build_shards(file_records, max_shard_tokens, *, input_budget=None, focus='', interop=False):
-    if max_shard_tokens <= 0:
-        raise HarnessError('分片预算必须为正数')
-    budget = input_budget if input_budget is not None else max_shard_tokens
-    soft = min(max_shard_tokens, budget)
-    shards, files, file_tokens = [], [], 0
-    base_bytes = len(_build_audit_prompt({'files': []}, focus).encode('utf-8'))
-    base_bytes += len(json.dumps(AUDIT_JSON_SCHEMA, ensure_ascii=False).encode('utf-8'))
-    if interop:
-        base_bytes += len(STAGED_PROMPT_SUFFIX.encode('utf-8'))
-    path_bytes = 0
-    for record in file_records:
-        name = record['rel_path']
-        size = len(('- ' + name).encode('utf-8'))
-        if record['tokens'] + estimate_tokens_from_bytes(base_bytes + size) > budget:
-            raise HarnessError(f'单文件与审查提示词超出输入预算: {name}')
-        combined = file_tokens + record['tokens'] + estimate_tokens_from_bytes(base_bytes + path_bytes + size + bool(files))
-        if files and combined > soft:
-            shards.append({'shard_id': len(shards) + 1, 'files': files, **_audit_estimate(files, file_tokens, focus, interop)})
-            files, file_tokens, path_bytes = [], 0, 0
-        path_bytes += size + bool(files)
-        files.append(name)
-        file_tokens += record['tokens']
-    if files:
-        shards.append({'shard_id': len(shards) + 1, 'files': files, **_audit_estimate(files, file_tokens, focus, interop)})
-    return shards
+def _note_cleanup_errors(failure, errors):
+    if isinstance(failure, HarnessError):
+        failure.details.setdefault('cleanup_errors', []).extend(errors)
+    elif hasattr(failure, 'add_note'):
+        failure.add_note('资源回收未验证: ' + '; '.join(errors))
+    else:
+        failure.cleanup_errors = list(errors)
 
 
-def _budget_for_spec(backends, spec):
-    return resolve_execution_profile(backends, spec, kind='audit')['capacity']['input_budget_tokens']
+def _close_process_streams(proc):
+    errors = []
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None and not stream.closed:
+            try:
+                stream.close()
+            except (OSError, ValueError) as exc:
+                errors.append('Pipe close failed: ' + str(exc))
+    if os.name == 'nt' and proc.returncode is not None:
+        proc._handle.Close()
+    return errors
 
 
-def _audit_engines(backends, dual_blind, left_override, right_override, allow_unconfigured, caller):
-    if not left_override and caller == 'caller':
-        available = [name for name in ('codex', 'agy') if backends.get(name, {}).get('available')]
-        if not available:
-            if allow_unconfigured:
-                return None, None
-            raise HarnessError('未发现 agy 或 codex 后端')
-        left_override = available[0] + ':default'
-    left = choose_engine(backends, caller, left_override)
-    right = None
-    if dual_blind:
-        name, _ = _engine_parts(left)
-        right = right_override or ('agy:default' if name == 'codex' else 'codex:default')
-        choose_engine(backends, caller, right)
-        if left == right:
-            raise HarnessError('双路审查需要两个不同引擎或显式模型')
-    return left, right
+def _start_process(command, cwd=None, env=None, shell=False):
+    job = _WindowsJob() if os.name == 'nt' else None
+    proc = None
+    try:
+        proc = subprocess.Popen(command, cwd=str(cwd) if cwd is not None else None, env=env, shell=shell,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding='utf-8', errors='replace', **_process_options())
+        if job is not None:
+            proc._cae_job = job
+            job.attach(proc)
+        return proc
+    except BaseException as exc:
+        # 即使事件输出、入 Job 或恢复线程失败，也不能遗留一个挂起进程。
+        cleanup_errors = []
+        try:
+            if proc is not None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired) as cleanup_error:
+                    cleanup_errors.append(str(cleanup_error))
+                finally:
+                    cleanup_errors.extend(_close_process_streams(proc))
+        finally:
+            if job is not None:
+                job.close()
+        if cleanup_errors:
+            if isinstance(exc, Exception):
+                raise HarnessError('子进程启动失败且资源回收未完成', stderr=str(exc), cleanup_errors=cleanup_errors) from exc
+            _note_cleanup_errors(exc, cleanup_errors)
+        raise
 
 
-def select_audit_plan(total_tokens, file_records, backends, strategy='auto', dual_blind=True,
-                      left_override='', right_override='', shard_tokens=120_000, allow_unconfigured=False, caller='caller',
-                      *, focus='', profiles=None, engines=None):
-    requested_strategy = strategy
-    if strategy == 'whole-1m':
-        strategy = 'single-pass'
-    left, right = engines if engines is not None else _audit_engines(
-        backends, dual_blind, left_override, right_override, allow_unconfigured, caller)
-    if not left:
-        return {'mode': 'unconfigured', 'caller': caller, 'handoff_to_caller': True,
-                'total_files': len(file_records), 'total_estimated_tokens': total_tokens,
-                'left_engine': None, 'right_engine': None, 'left_units': [], 'right_units': [],
-                'skipped_files': [], 'execution_profiles': {}, 'notice': '未发现 agy 或 codex，当前只提供未就绪计划。'}
-    if profiles is None:
-        tier, _ = select_task_tier(kind='audit', text=focus)
-        profiles = {side: resolve_execution_profile(backends, spec, tier, focus, 'audit',
-                                                     _audit_estimate([record['rel_path'] for record in file_records],
-                                                                     total_tokens, focus)['estimated_tokens'])
-                    for side, spec in (('left', left), ('right', right)) if spec}
-    if right and profiles['left']['model'] and profiles['left']['spec'] == profiles['right']['spec']:
-        raise HarnessError('双路选路最终指向同一个模型；请为其中一路指定其他模型。')
-    plan = {'mode': strategy, 'requested_strategy': requested_strategy, 'caller': caller, 'handoff_to_caller': True,
-            'total_files': len(file_records), 'total_estimated_tokens': total_tokens,
-            'dual_blind': bool(right), 'left_engine': left, 'right_engine': right, 'skipped_files': [],
-            'execution_profiles': profiles, 'soft_shard_target_tokens': shard_tokens,
-            'coverage_notice': '清单是计划覆盖范围，实际读取完整性仍由回执与证据核实。',
-            'budget_notice': '按每 3 字节约 1 token 估算文件、审查提示词、清单与 JSON Schema，另保留策略余量；不表示分词器实测容量。',
-            'independence_notice': '不同进程独立审查，模型家族及错误独立性尚未验证。'}
-    all_files = [record['rel_path'] for record in file_records]
-    whole = strategy != 'sharded'
-    for side, spec in (('left', left), ('right', right)):
-        units_key = side + '_units'
-        plan[units_key] = []
-        if not spec:
-            continue
-        profile = profiles[side]
-        cap = profile['capacity']['input_budget_tokens']
-        interop = profile['execution_environment']['windows_interop']
-        all_estimate = _audit_estimate(all_files, total_tokens, focus, interop)
-        if strategy != 'sharded' and all_estimate['estimated_tokens'] <= cap:
-            plan[units_key] = [{'shard_id': 1, 'files': all_files, **all_estimate, 'single_pass_planned': True}]
-            continue
-        whole = False
-        if strategy == 'single-pass':
-            raise HarnessError(f'{spec} 文件与提示词超出单次预算，请选择 sharded 或调整有依据的预算。',
-                               execution_profile=profile, **all_estimate)
-        usable = []
-        for record in file_records:
-            estimate = _audit_estimate([record['rel_path']], record['tokens'], focus, interop)
-            if estimate['estimated_tokens'] > cap:
-                plan['skipped_files'].append({'file': record['rel_path'], 'engine': spec, 'side': side,
-                                             'reason': 'over_input_budget', **estimate, 'budget_tokens': cap})
+def _terminate_tree(proc, native_pid_file=None):
+    errors = []
+    if native_pid_file and proc.poll() is None and not getattr(proc, '_cae_native_tree_terminated', False):
+        deadline = time.monotonic() + 2
+        while not native_pid_file.exists() and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        try:
+            native_pid = int(native_pid_file.read_text(encoding='utf-8-sig').strip())
+            if native_pid <= 0:
+                raise ValueError('native PID invalid')
+            cleanup = subprocess.run(['taskkill.exe', '/T', '/F', '/PID', str(native_pid)], capture_output=True, timeout=10)
+            if cleanup.returncode:
+                errors.append('Windows process tree termination returned nonzero')
             else:
-                usable.append(record)
-        plan[units_key] = [{**unit, 'single_pass_planned': False,
-                            'exceeds_soft_shard_target': unit['estimated_tokens'] > shard_tokens}
-                           for unit in build_shards(usable, shard_tokens, input_budget=cap, focus=focus, interop=interop)]
-    plan['mode'] = 'single-pass' if whole else 'sharded'
-    if not whole:
-        plan['coverage_notice'] += ' 跨分片依赖未在同一个上下文内联合核查。'
-    if requested_strategy == 'whole-1m':
-        plan['deprecation_notice'] = 'whole-1m 兼容映射至 single-pass，不表示百万 token 或无压缩能力。'
-    return plan
+                proc._cae_native_tree_terminated = True
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            errors.append('Windows process tree cleanup unverified: ' + str(exc))
+    try:
+        if getattr(proc, '_cae_job', None) is not None:
+            proc._cae_job.terminate()
+        elif os.name == 'nt':
+            cleanup = subprocess.run(['taskkill.exe', '/T', '/F', '/PID', str(proc.pid)], capture_output=True,
+                                     timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+            if cleanup.returncode and proc.poll() is None:
+                errors.append('Local process tree termination returned nonzero')
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        errors.append('Local process tree cleanup unverified: ' + str(exc))
+    return errors
+
+
+def _reap_process(proc, native_pid_file=None):
+    """先清本次进程树，再 wait 回收直接子进程；最后一次 kill 后也必须 wait。"""
+    errors = _terminate_tree(proc, native_pid_file)
+    try:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        errors.append('Child process reaping unverified: ' + str(exc))
+    finally:
+        job = getattr(proc, '_cae_job', None)
+        if job is not None:
+            job.close()
+    return errors
+
+
+def run_process(command, cwd, input_text=None, timeout_sec=600, env=None, shell=False, native_pid_file=None):
+    if _CANCELLED.is_set():
+        raise HarnessError('任务已取消', 'cancelled')
+    deadline = time.monotonic() + timeout_sec
+    proc = _start_process(command, cwd, env, shell)
+    completed = queue.Queue(maxsize=1)
+    failure = None
+
+    def communicate():
+        # Windows 的 communicate(timeout=...) 仍会同步写 stdin；由独立线程承受管道背压。
+        try:
+            completed.put((proc.communicate(input=input_text), None))
+        except (OSError, ValueError) as exc:
+            completed.put((None, exc))
+
+    communicator = threading.Thread(target=communicate, name='cae-process-io', daemon=True)
+    try:
+        emit_event('process_started', pid=proc.pid)
+        communicator.start()
+        while True:
+            if _CANCELLED.is_set():
+                raise HarnessError('任务已取消', 'cancelled')
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HarnessError('子进程超时', 'timeout', timeout_sec=timeout_sec)
+            try:
+                output, communication_error = completed.get(timeout=min(remaining, 0.05))
+                if communication_error is not None:
+                    raise communication_error
+                out, err = output
+                break
+            except queue.Empty:
+                if proc.poll() is not None:
+                    # 父进程退出不等于管道 EOF，后代可能仍持有写端。
+                    cleanup_errors = _terminate_tree(proc, native_pid_file)
+                    if cleanup_errors:
+                        raise HarnessError('父进程退出后无法核实后代清理', cleanup_errors=cleanup_errors)
+        if _CANCELLED.is_set():
+            raise HarnessError('任务已取消', 'cancelled')
+        emit_event('process_finished', pid=proc.pid, returncode=proc.returncode)
+        return subprocess.CompletedProcess(command, proc.returncode, out, err)
+    except BaseException as exc:
+        failure = exc
+        if isinstance(exc, HarnessError):
+            exc.details['process_started'] = True
+        raise
+    finally:
+        cleanup_errors = _reap_process(proc, native_pid_file)
+        if communicator.ident is not None:
+            communicator.join(timeout=5)
+        if communicator.is_alive():
+            cleanup_errors.append('Child pipe reader/writer did not stop')
+        else:
+            cleanup_errors.extend(_close_process_streams(proc))
+        if cleanup_errors:
+            if failure is not None:
+                if isinstance(failure, Exception) and not isinstance(failure, HarnessError):
+                    raise HarnessError(str(failure), cleanup_errors=cleanup_errors) from failure
+                _note_cleanup_errors(failure, cleanup_errors)
+            elif failure is None:
+                raise HarnessError('子进程资源回收未完成', cleanup_errors=cleanup_errors)
+
+
+def _cancel_signal(_signum, _frame):
+    _CANCELLED.set()
 
 
 def _validate_schema(value, schema, location='result'):
@@ -1612,51 +2038,63 @@ def _validate_schema(value, schema, location='result'):
             _validate_schema(item, schema['items'], f'{location}[{index}]')
 
 
-def _extract_json_object(raw_text, schema=None):
-    schema = schema or AUDIT_JSON_SCHEMA
-    raw = raw_text.strip()
+def _check_output_status(parsed):
+    """只解释协议错误，不把工具读出的额度说明当作后端额度错误。"""
+    finished_reason = str(parsed.get('finished_reason', '')).lower()
+    if finished_reason == 'print_timeout':
+        raise HarnessError('后端输出因超时截断', 'timeout', finished_reason=finished_reason)
+    if finished_reason in ('interrupted', 'cancelled', 'canceled'):
+        raise HarnessError('后端执行被中断', 'cancelled', finished_reason=finished_reason)
+    status = str(parsed.get('status', '')).lower()
+    if status == 'timeout':
+        raise HarnessError('后端返回超时回执', 'timeout', backend_status=status)
+    if status in ('cancelled', 'canceled', 'interrupted'):
+        raise HarnessError('后端返回取消回执', 'cancelled', backend_status=status)
+    event_error = parsed.get('event', parsed.get('type')) == 'error'
+    if (event_error or finished_reason == 'error' or parsed.get('is_error') or parsed.get('error')
+            or status in ('error', 'failed', 'partial', 'incomplete')):
+        error = str(parsed.get('error') or parsed.get('message') or '')[-2000:]
+        error_status = 'quota_exhausted' if _is_quota_exhausted(error) else 'failed'
+        raise HarnessError('后端返回错误回执', error_status, backend_status=status or 'error',
+                           finished_reason=finished_reason, error=error)
+
+
+def _decode_output_json(raw_text):
+    raw = raw_text.strip().lstrip('\ufeff')
     if not raw:
         raise OutputParseError('子任务输出为空')
     try:
-        parsed = json.loads(raw)
-    except ValueError:
-        events = []
+        return json.loads(raw)
+    except RecursionError as exc:
+        raise OutputParseError('JSON 嵌套过深') from exc
+    except ValueError as exc:
+        fence = re.fullmatch(r'```(?:json)?\s*(\{[\s\S]*\})\s*```', raw)
         try:
+            if fence:
+                return json.loads(fence.group(1))
             events = [json.loads(line) for line in raw.splitlines() if line.strip()]
-        except ValueError:
-            fence = re.fullmatch(r'```(?:json)?\s*(\{[\s\S]*\})\s*```', raw)
-            if not fence:
-                raise OutputParseError('子任务输出不是合法 JSON')
-            try:
-                parsed = json.loads(fence.group(1))
-            except ValueError as exc:
-                raise OutputParseError('JSON 代码块无效') from exc
-        if events:
-            results = [item for item in events if isinstance(item, dict) and item.get('event') == 'result']
-            if len(results) != 1:
-                raise OutputParseError('输出流必须包含一个最终 result 回执')
-            parsed = results[0]
+        except (ValueError, RecursionError) as decode_error:
+            raise OutputParseError('子任务输出不是合法 JSON') from decode_error
+        results = []
+        for event in events:
+            if not isinstance(event, dict):
+                raise OutputParseError('输出流事件必须为对象') from exc
+            _check_output_status(event)
+            if event.get('event') == 'result':
+                results.append(event)
+        if len(results) != 1:
+            raise OutputParseError('输出流必须包含一个最终 result 回执') from exc
+        return results[0]
+
+
+def _extract_json_object(raw_text, schema=None):
+    schema = schema or AUDIT_JSON_SCHEMA
+    parsed = _decode_output_json(raw_text)
+    # 字典和字符串包装共用深度上限，字符串解包不能递归重置计数。
     for _ in range(8):
         if not isinstance(parsed, dict):
             raise OutputParseError('最终回执必须为对象')
-        finished_reason = str(parsed.get('finished_reason', '')).lower()
-        if finished_reason == 'print_timeout':
-            raise HarnessError('后端输出因超时截断', 'timeout', finished_reason=finished_reason)
-        if finished_reason in ('interrupted', 'cancelled', 'canceled'):
-            raise HarnessError('后端执行被中断', 'cancelled', finished_reason=finished_reason)
-        if finished_reason == 'error':
-            err_msg = str(parsed.get('error', ''))[:1000]
-            err_status = 'quota_exhausted' if _is_quota_exhausted(err_msg) else 'failed'
-            raise HarnessError('后端返回错误结束原因', err_status, finished_reason=finished_reason, error=err_msg)
-        status = str(parsed.get('status', '')).lower()
-        if status == 'timeout':
-            raise HarnessError('后端返回超时回执', 'timeout', backend_status=status)
-        if status in ('cancelled', 'canceled', 'interrupted'):
-            raise HarnessError('后端返回取消回执', 'cancelled', backend_status=status)
-        if parsed.get('is_error') or parsed.get('error') or status in ('error', 'failed', 'partial', 'incomplete'):
-            err_msg = str(parsed.get('error', ''))[:1000]
-            err_status = 'quota_exhausted' if _is_quota_exhausted(err_msg) else 'failed'
-            raise HarnessError('后端返回错误回执', err_status, backend_status=status or 'error', error=err_msg)
+        _check_output_status(parsed)
         if all(key in parsed for key in schema['required']):
             _validate_schema(parsed, schema)
             if not parsed['summary'].strip():
@@ -1673,233 +2111,48 @@ def _extract_json_object(raw_text, schema=None):
                 next_value = parsed[key]
                 break
         if isinstance(next_value, str):
-            return _extract_json_object(next_value, schema)
+            next_value = _decode_output_json(next_value)
         if next_value is None:
             break
         parsed = next_value
     raise OutputParseError('回执缺少符合指定结构的结果')
 
 
-def _terminate_tree(proc, native_pid_file=None):
-    errors = []
-    if native_pid_file:
-        deadline = time.monotonic() + 2
-        while not native_pid_file.exists() and proc.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
-        try:
-            native_pid = int(native_pid_file.read_text(encoding='utf-8-sig').strip())
-            if native_pid <= 0:
-                raise ValueError('native PID invalid')
-            cleanup = subprocess.run(['taskkill.exe', '/T', '/F', '/PID', str(native_pid)], capture_output=True, timeout=10)
-            if cleanup.returncode:
-                errors.append('Windows process tree termination returned nonzero')
-        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-            errors.append('Windows process tree cleanup unverified: ' + str(exc))
-    try:
-        if os.name == 'nt':
-            cleanup = subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)], capture_output=True, timeout=10)
-            if cleanup.returncode and proc.poll() is None:
-                errors.append('Local process tree termination returned nonzero')
-        else:
-            os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        errors.append('Local process tree cleanup unverified: ' + str(exc))
-    return errors
-
-
-def run_process(command, cwd, input_text=None, timeout_sec=600, env=None, shell=False, native_pid_file=None):
-    if _CANCELLED.is_set():
-        raise HarnessError('任务已取消', 'cancelled')
-    options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
-    proc = subprocess.Popen(command, cwd=str(cwd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, encoding='utf-8', errors='replace', env=env, shell=shell, **options)
-    emit_event('process_started', pid=proc.pid)
-    started = time.monotonic()
-    first_input = input_text
-    try:
-        while True:
-            if _CANCELLED.is_set():
-                raise HarnessError('任务已取消', 'cancelled')
-            remaining = timeout_sec - (time.monotonic() - started)
-            if remaining <= 0:
-                raise HarnessError('子进程超时', 'timeout', timeout_sec=timeout_sec)
+def _read_rpc_lines(stream, inbox, stopped=None):
+    def publish(line):
+        while stopped is None or not stopped.is_set():
             try:
-                out, err = proc.communicate(input=first_input, timeout=min(remaining, 0.25))
-                break
-            except subprocess.TimeoutExpired:
-                first_input = None
-        if _CANCELLED.is_set():
-            raise HarnessError('任务已取消', 'cancelled')
-        emit_event('process_finished', pid=proc.pid, returncode=proc.returncode)
-        return subprocess.CompletedProcess(command, proc.returncode, out, err)
-    except BaseException as exc:
-        cleanup_errors = _terminate_tree(proc, native_pid_file)
-        if isinstance(exc, HarnessError):
-            exc.details['process_started'] = True
-            if cleanup_errors:
-                exc.details['cleanup_errors'] = cleanup_errors
-        try:
-            proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        raise
-
-
-def _cancel_signal(_signum, _frame):
-    _CANCELLED.set()
-
-
-def _ps_literal(text):
-    return "'" + text.replace("'", "''") + "'"
-
-
-MAX_INTEROP_STAGE_BYTES = 64 * 1024 * 1024
-STAGED_PROMPT_SUFFIX = '\n[跨端只读工作区说明] 当前目录已按原相对路径只读镜像目标文件，请直接在当前目录下按相对路径读取。'
-
-
-def _stage_wsl_readonly_workspace(target_dir, stage_root, rel_files=None):
-    stage_dir = stage_root / 'workspace'
-    stage_dir.mkdir(parents=True, exist_ok=True)
-    if rel_files is None:
-        records = collect_target_files(target_dir)
-    else:
-        records = []
-        for rel in rel_files:
-            src = target_dir / rel
-            if _is_link(src) or not src.is_file():
+                inbox.put(line, timeout=0.05)
+                return
+            except queue.Full:
                 continue
-            records.append({'path': src, 'rel_path': rel, 'bytes': src.stat().st_size})
-    if sum(item['bytes'] for item in records) > MAX_INTEROP_STAGE_BYTES:
-        raise HarnessError('WSL 纯 Linux 路径只读镜像超出 64MB 上限，请缩小 --target 范围或在 WSL 安装原生 codex')
-    for item in records:
-        dst = stage_dir / item['rel_path']
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(item['path'], dst)
-    return stage_dir
 
-
-def _rewrite_staged_paths(parsed, stage_dir):
-    prefixes = [str(stage_dir).replace('\\', '/').rstrip('/') + '/',
-                str(stage_dir.resolve()).replace('\\', '/').rstrip('/') + '/']
-    if _is_posix() and shutil.which('wslpath'):
-        try:
-            prefixes.append(_wsl_path(stage_dir, windows=True).replace('\\', '/').rstrip('/') + '/')
-        except HarnessError:
-            pass
-
-    def _clean(raw_path):
-        norm = raw_path.strip().replace('\\', '/')
-        for prefix in prefixes:
-            if norm.lower().startswith(prefix.lower()):
-                return norm[len(prefix):]
-        return raw_path
-
-    if 'read_files' in parsed:
-        parsed['read_files'] = [_clean(item) for item in parsed['read_files']]
-    if 'unread_files' in parsed:
-        parsed['unread_files'] = [{**item, 'file': _clean(item['file'])} for item in parsed['unread_files']]
-    if 'findings' in parsed:
-        parsed['findings'] = [{**item, 'file': _clean(item['file'])} for item in parsed['findings']]
-    return parsed
-
-
-def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None):
-    """监督进程写入本次真实 Windows PID，供 WSL 定向清理进程树。"""
-    pid_file = temp_dir / 'native.pid'
-    if input_text is None:
-        pipes = [
-            '$output = $p.StandardOutput.BaseStream.CopyToAsync([Console]::OpenStandardOutput())',
-            '$errors = $p.StandardError.BaseStream.CopyToAsync([Console]::OpenStandardError())',
-            'while ($null -ne ($line = [Console]::ReadLine())) {',
-            '$p.StandardInput.WriteLine($line)', '$p.StandardInput.Flush()', '}',
-            '$p.StandardInput.Close()', '$p.WaitForExit()', '$output.Wait()', '$errors.Wait()',
-        ]
-    else:
-        prompt_file = temp_dir / 'input.txt'
-        prompt_file.write_text(input_text, encoding='utf-8')
-        pipes = [
-            '$output = $p.StandardOutput.ReadToEndAsync()', '$errors = $p.StandardError.ReadToEndAsync()',
-            '$inputBytes = [IO.File]::ReadAllBytes(' + _ps_literal(_wsl_path(prompt_file)) + ')',
-            '$p.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)', '$p.StandardInput.BaseStream.Flush()',
-            '$p.StandardInput.Close()', '$p.WaitForExit()',
-            '[Console]::Out.Write($output.Result)', '[Console]::Error.Write($errors.Result)',
-        ]
-    args = subprocess.list2cmdline(command[1:])
-    env_lines = ["$info.EnvironmentVariables['CAE_HARNESS_DEPTH'] = '1'"]
-    if codex_home:
-        env_lines.insert(0, "$info.EnvironmentVariables['CODEX_HOME'] = " + _ps_literal(_wsl_path(Path(codex_home))))
-    script = '\n'.join([
-        "$ErrorActionPreference='Stop'",
-        "$ProgressPreference='SilentlyContinue'",
-        '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)',
-        '[IO.File]::WriteAllText(' + _ps_literal(_wsl_path(pid_file.with_suffix('.pending'))) + ', [string]$PID)',
-        '[IO.File]::Move(' + _ps_literal(_wsl_path(pid_file.with_suffix('.pending'))) + ', ' + _ps_literal(_wsl_path(pid_file)) + ')',
-        '$info = New-Object System.Diagnostics.ProcessStartInfo',
-        '$info.FileName = ' + _ps_literal(_wsl_path(Path(command[0]))),
-        '$info.Arguments = ' + _ps_literal(args),
-        '$info.WorkingDirectory = ' + _ps_literal(_wsl_path(work_dir)),
-        '$info.UseShellExecute = $false', '$info.CreateNoWindow = $true',
-        '$info.RedirectStandardInput = $true', '$info.RedirectStandardOutput = $true', '$info.RedirectStandardError = $true',
-        '$info.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)',
-        '$info.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)',
-        *env_lines,
-        '$p = New-Object System.Diagnostics.Process', '$p.StartInfo = $info',
-        '$started = $false', '$completed = $false', '$exitCode = 1', 'try {',
-        '[void]$p.Start()', '$started = $true',
-        *pipes,
-        '$exitCode = $p.ExitCode', '$completed = $true', '} finally {',
-        'if ($started -and -not $completed) { & taskkill.exe /T /F /PID $p.Id | Out-Null }',
-        '$p.Dispose()', '}', 'exit $exitCode',
-    ])
-    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
-    return ['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], pid_file
-
-
-def _read_rpc_lines(stream, inbox):
     try:
         for line in stream:
-            inbox.put(line)
+            if stopped is not None and stopped.is_set():
+                break
+            publish(line)
     except (OSError, ValueError):
         pass
     finally:
-        inbox.put(None)
-
-
-def _query_codex_listing(info, timeout_sec=30):
-    if _CANCELLED.is_set():
-        raise HarnessError('任务已取消', 'cancelled')
-    home = info.get('config_home')
-    binary = info.get('binary')
-    if not home or not binary:
-        raise HarnessError('未发现 Codex 或其配置目录，无法刷新模型列表')
-    command = [binary, 'app-server', '--stdio']
-    if info.get('windows_interop'):
-        if not shutil.which('powershell.exe') or not shutil.which('taskkill.exe'):
-            raise HarnessError('WSL 跨端查询需要 powershell.exe 与 taskkill.exe 进行进程监督')
-        windows_temp = _wsl_path(Path(_windows_env('TEMP')), windows=False)
-        with tempfile.TemporaryDirectory(prefix='cae-harness-', dir=windows_temp) as temp:
-            cwd = Path(temp)
-            command, pid_file = _interop_command(command, cwd, cwd, None, home)
-            return _query_codex_stdio(command, cwd, None, pid_file, timeout_sec)
-    env = os.environ.copy()
-    env.update(CODEX_HOME=home, CAE_HARNESS_DEPTH='1')
-    return _query_codex_stdio(command, None, env, None, timeout_sec)
+        publish(None)
 
 
 def _query_codex_stdio(command, cwd, env, native_pid_file, timeout_sec):
-    options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
+    if _CANCELLED.is_set():
+        raise HarnessError('任务已取消', 'cancelled')
     deadline = time.monotonic() + timeout_sec
     try:
-        proc = subprocess.Popen(command, cwd=cwd, env=env, **options,
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, encoding='utf-8', errors='replace')
+        proc = _start_process(command, cwd, env)
     except OSError as exc:
         raise HarnessError('无法启动 Codex 模型目录查询', stderr=str(exc)) from exc
-    inbox = queue.Queue()
+    inbox = queue.Queue(maxsize=128)
+    outbox = queue.Queue()
+    writer_errors = queue.Queue(maxsize=1)
+    stopped = threading.Event()
     errors = collections.deque(maxlen=8)
-    stdout_reader = threading.Thread(target=_read_rpc_lines, args=(proc.stdout, inbox), daemon=True)
+    stdout_reader = threading.Thread(target=_read_rpc_lines, args=(proc.stdout, inbox, stopped),
+                                     name='cae-rpc-stdout', daemon=True)
 
     def drain_stderr():
         try:
@@ -1908,14 +2161,29 @@ def _query_codex_stdio(command, cwd, env, native_pid_file, timeout_sec):
         except (OSError, ValueError):
             pass
 
-    stderr_reader = threading.Thread(target=drain_stderr, daemon=True)
-    stdout_reader.start()
-    stderr_reader.start()
+    stderr_reader = threading.Thread(target=drain_stderr, name='cae-rpc-stderr', daemon=True)
+
+    def write_requests():
+        try:
+            while True:
+                message = outbox.get()
+                if message is None:
+                    break
+                proc.stdin.write(message)
+                proc.stdin.flush()
+        except (OSError, ValueError) as exc:
+            writer_errors.put(exc)
+        finally:
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+    stdin_writer = threading.Thread(target=write_requests, name='cae-rpc-stdin', daemon=True)
     failure = None
 
     def send(message):
-        proc.stdin.write(json.dumps(message) + '\n')
-        proc.stdin.flush()
+        outbox.put(json.dumps(message) + '\n')
 
     def rpc(number, method, params):
         send({'id': number, 'method': method, 'params': params})
@@ -1925,6 +2193,12 @@ def _query_codex_stdio(command, cwd, env, native_pid_file, timeout_sec):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise HarnessError('Codex 模型目录查询超时', 'timeout')
+            try:
+                write_error = writer_errors.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                raise HarnessError('Codex 模型目录通信失败', stderr=str(write_error)) from write_error
             try:
                 line = inbox.get(timeout=min(remaining, 0.25))
             except queue.Empty:
@@ -1944,6 +2218,9 @@ def _query_codex_stdio(command, cwd, env, native_pid_file, timeout_sec):
             return event['result']
 
     try:
+        stdout_reader.start()
+        stderr_reader.start()
+        stdin_writer.start()
         rpc(1, 'initialize', {'clientInfo': {'name': 'cae_harness', 'version': '1.0'},
                               'capabilities': {'experimentalApi': True}})
         send({'method': 'initialized'})
@@ -1977,29 +2254,96 @@ def _query_codex_stdio(command, cwd, env, native_pid_file, timeout_sec):
     except OSError as exc:
         failure = HarnessError('Codex 模型目录通信失败', stderr=str(exc))
         raise failure from exc
+    except BaseException as exc:
+        failure = exc
+        raise
     finally:
-        try:
-            proc.stdin.close()
-        except OSError:
-            pass
+        # 写线程独占 stdin；控制线程不能 close 一个正被阻塞写入的文本管道。
+        outbox.put(None)
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            cleanup_errors = _terminate_tree(proc, native_pid_file)
-            if cleanup_errors and failure:
-                failure.details['cleanup_errors'] = cleanup_errors
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        stdout_reader.join(timeout=1)
-        stderr_reader.join(timeout=1)
-        if not stdout_reader.is_alive():
-            proc.stdout.close()
-        if not stderr_reader.is_alive():
-            proc.stderr.close()
-        if failure and errors:
+            pass
+        # 正常退出也回收后代，避免后代继承管道让读取线程永久等 EOF。
+        stopped.set()
+        cleanup_errors = _reap_process(proc, native_pid_file)
+        for reader in (stdout_reader, stderr_reader, stdin_writer):
+            if reader.ident is not None:
+                reader.join(timeout=5)
+            if reader.is_alive():
+                cleanup_errors.append(reader.name + ' did not stop')
+        if not any(reader.is_alive() for reader in (stdout_reader, stderr_reader, stdin_writer)):
+            cleanup_errors.extend(_close_process_streams(proc))
+        if isinstance(failure, HarnessError) and errors:
             failure.details['stderr'] = (str(failure.details.get('stderr') or '') + '\n' + ''.join(errors))[-3000:]
+        if cleanup_errors:
+            if failure is not None:
+                if isinstance(failure, Exception) and not isinstance(failure, HarnessError):
+                    raise HarnessError(str(failure), cleanup_errors=cleanup_errors) from failure
+                _note_cleanup_errors(failure, cleanup_errors)
+            elif sys.exc_info()[0] is None:
+                raise HarnessError('Codex 模型查询资源回收未完成', cleanup_errors=cleanup_errors)
+
+
+def _query_codex_listing(info, timeout_sec=30):
+    if _CANCELLED.is_set():
+        raise HarnessError('任务已取消', 'cancelled')
+    home = info.get('config_home')
+    binary = info.get('binary')
+    if not home or not binary:
+        raise HarnessError('未发现 Codex 或其配置目录，无法刷新模型列表')
+    command = [binary, 'app-server', '--stdio']
+    if info.get('windows_interop'):
+        if not shutil.which('powershell.exe') or not shutil.which('taskkill.exe'):
+            raise HarnessError('WSL 跨端查询需要 powershell.exe 与 taskkill.exe 进行进程监督')
+        windows_temp = _wsl_path(Path(_windows_env('TEMP')), windows=False)
+        with tempfile.TemporaryDirectory(prefix='cae-harness-', dir=windows_temp) as temp:
+            cwd = Path(temp)
+            command, pid_file = _interop_command(command, cwd, cwd, None, home)
+            return _query_codex_stdio(command, cwd, None, pid_file, timeout_sec)
+    env = os.environ.copy()
+    env.update(CODEX_HOME=home, CAE_HARNESS_DEPTH='1')
+    return _query_codex_stdio(command, None, env, None, timeout_sec)
+
+
+def _quota_startup_only(stdout):
+    """只有空输出或明确启动/错误事件才证明尚未执行任务；未知事件按已执行处理。"""
+    for line in (stdout or '').splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return False
+        if not isinstance(event, dict):
+            return False
+        kind = event.get('event', event.get('type'))
+        if kind in ('init', 'thread.started', 'turn.started', 'turn.failed', 'error'):
+            continue
+        if kind == 'system' and event.get('subtype') == 'init':
+            continue
+        if kind == 'result':
+            result = event.get('result', event)
+            if (isinstance(result, dict) and type(result.get('num_turns')) is int and result['num_turns'] == 0
+                    and not any(result.get(key) for key in ('structured_output', 'response', 'output', 'content', 'text'))):
+                continue
+        return False
+    return True
+
+
+def _backend_diagnostics(result):
+    parts = [result.stderr or '']
+    for line in (result.stdout or '').splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            parts.append(line)
+            continue
+        if isinstance(event, dict) and event.get('event', event.get('type')) in ('error', 'result', 'turn.failed'):
+            parts.append(json.dumps(event, ensure_ascii=False))
+    return '\n'.join(part for part in parts if part).strip()
 
 
 def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, timeout_sec=600,
@@ -2013,7 +2357,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
     if profile is None:
         _prepare_execution(backends, (spec,), batch)
         info = backends[prefix]
-        profile = resolve_execution_profile(backends, spec, effort or 'high')
+        profile = resolve_execution_profile(backends, spec, effort or 'max')
     _require_execution_profile(profile)
     _, model = _engine_parts(profile['spec'])
     effort = profile['cli_effort']
@@ -2102,23 +2446,12 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             raise
         receipt['invocation_started'] = True
         receipt['returncode'] = result.returncode
+        startup_stderr = all(not line.strip() or _is_quota_exhausted(line)
+                             for line in (result.stderr or '').splitlines())
+        receipt['startup_only'] = (_quota_startup_only(result.stdout) and startup_stderr
+                                   and not (output_file.exists() and output_file.stat().st_size))
         if result.returncode:
-            if prefix == 'agy':
-                agy_diag_parts = [result.stderr or '']
-                for raw_line in (result.stdout or '').splitlines():
-                    stripped = raw_line.strip()
-                    if not stripped:
-                        continue
-                    try:
-                        evt = json.loads(stripped)
-                    except ValueError:
-                        agy_diag_parts.append(stripped)
-                        continue
-                    if isinstance(evt, dict) and evt.get('event') in ('error', 'result'):
-                        agy_diag_parts.append(json.dumps(evt, ensure_ascii=False))
-                detail = '\n'.join(part for part in agy_diag_parts if part).strip()
-            else:
-                detail = ((result.stderr or '') + '\n' + (result.stdout or '')).strip()
+            detail = _backend_diagnostics(result)
             if _is_quota_exhausted(detail):
                 cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
                 raise HarnessError(f'{prefix} 额度不足或已达用量上限，已停止并记录冷却状态',
@@ -2167,6 +2500,11 @@ def invoke_edit_worker(spec, target_dir, prompt, backends, timeout_sec=600, effo
     return json.dumps(result, ensure_ascii=False)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# ⑥ 工作区快照、分片审计规划与双盲归并
+# ════════════════════════════════════════════════════════════════════════════
+
+
 def snapshot_files(root):
     """对独立任务目录作事后核对，排除 Git 元数据，不撤销文件。"""
     root = Path(root)
@@ -2179,7 +2517,10 @@ def snapshot_files(root):
             location = str(directory)
         raise HarnessError(f'无法遍历目录 {location}: {exc}', snapshot_path=location) from exc
 
-    result = {}
+    try:
+        result = {'.': 'directory:' + str(stat.S_IMODE(root.stat().st_mode))}
+    except OSError as exc:
+        raise HarnessError(f'无法核对目标目录: {exc}', snapshot_path='.') from exc
     for directory, dirs, files in os.walk(root, followlinks=False, onerror=traversal_failed):
         dirs[:] = sorted(d for d in dirs if d != '.git')
         for name in list(dirs):
@@ -2189,6 +2530,8 @@ def snapshot_files(root):
                 if _is_link(link):
                     result[rel] = 'symlink:' + os.readlink(link)
                     dirs.remove(name)
+                else:
+                    result[rel + '/'] = 'directory:' + str(stat.S_IMODE(link.stat().st_mode))
             except OSError as exc:
                 raise HarnessError(f'无法核对目录 {rel}: {exc}', snapshot_path=rel) from exc
         for name in files:
@@ -2204,7 +2547,7 @@ def snapshot_files(root):
                     with path.open('rb') as stream:
                         for block in iter(lambda: stream.read(1024 * 1024), b''):
                             digest.update(block)
-                    result[rel] = digest.hexdigest()
+                    result[rel] = digest.hexdigest() + ':' + str(stat.S_IMODE(path.stat().st_mode))
             except OSError as exc:
                 raise HarnessError(f'无法核对文件 {rel}: {exc}', snapshot_path=rel) from exc
     return result
@@ -2216,26 +2559,94 @@ def _scope_patterns(patterns):
         normalized = pattern.replace('\\', '/')
         if not normalized or normalized.startswith('/') or ':' in normalized or '..' in normalized.split('/'):
             raise HarnessError('--write-scope 必须使用目标目录内的相对路径或通配符')
-        result.append(normalized[2:] if normalized.startswith('./') else normalized)
+        normalized = posixpath.normpath(normalized)
+        if normalized == '.':
+            raise HarnessError('--write-scope 不可为空路径')
+        result.append(normalized)
     return result
 
 
+def _scope_matches(path, scopes):
+    def key(value):
+        return value.casefold() if os.name == 'nt' else value
+
+    return any(fnmatch.fnmatchcase(key(path), key(pattern)) for pattern in scopes)
+
+
 def changed_files(before, after):
-    return sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
+    changed = {path for path in set(before) | set(after) if before.get(path) != after.get(path)}
+    # 文件变化已能代表其新建/删除的父目录；单独保留空目录或目录权限变化。
+    return sorted(path for path in changed if not path.endswith('/')
+                  or (path in before and path in after)
+                  or not any(other != path and other.startswith(path) for other in changed))
 
 
 def _changes_report(before, root, scopes, readonly):
     changes = changed_files(before, snapshot_files(root))
-    violations = changes if readonly else [path for path in changes if scopes and not any(fnmatch.fnmatchcase(path, pattern) for pattern in scopes)]
+    violations = changes if readonly else [path for path in changes if scopes and not _scope_matches(path, scopes)]
     return {'changed_files': changes, 'scope_violations': violations, 'scope_check': 'post_execution_snapshot',
             'scope_notice': '需使用独立任务目录，快照无法区分并发写入来源，检查不自动回滚。'}
 
 
-def _build_audit_prompt(unit, focus):
-    files = '\n'.join('- ' + path for path in unit['files'])
-    return ('在当前目录按指定范围只读审查，给出文件和真实行号。不要修改文件，严禁在目标工作目录外创建或改动任何文件或目录（含严禁 git worktree add），且不要另行调用本编排器。\n重点: '
-            + (focus or '物理守恒、边界条件、数值稳定性及代码一致性') + '\n计划文件清单:\n' + files
-            + '\n按 JSON Schema 返回发现，read_files 列出已读取文件，unread_files 逐文件说明未完成的原因。')
+def _safe_changes_report(before, root, scopes, readonly):
+    try:
+        report = _changes_report(before, root, scopes, readonly)
+        report['scope_verified'] = True
+        return report
+    except (HarnessError, OSError) as exc:
+        return {
+            'changed_files': None,
+            'scope_violations': [],
+            'scope_check': 'unverified',
+            'scope_verified': False,
+            'scope_error': str(exc),
+            'scope_error_path': getattr(exc, 'details', {}).get('snapshot_path'),
+        }
+
+
+def _workspace_unchanged(before, root):
+    if before is None:
+        return False
+    scope = _safe_changes_report(before, root, [], True)
+    return scope['scope_verified'] and not scope['changed_files']
+
+
+def estimate_tokens_from_bytes(num_bytes):
+    return max(1, (num_bytes + 2) // 3) if num_bytes else 0
+
+
+def collect_target_files(target, skipped_files=None):
+    target = target.resolve()
+    skipped = skipped_files if skipped_files is not None else []
+    candidates = [target] if target.is_file() else []
+    if target.is_dir():
+        for root, dirs, files in os.walk(target):
+            dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS and not d.startswith('.'))
+            for name in list(dirs):
+                directory = Path(root) / name
+                if _is_link(directory):
+                    skipped.append({'file': directory.relative_to(target).as_posix(), 'reason': 'directory_link'})
+                    dirs.remove(name)
+            candidates.extend(Path(root) / name for name in sorted(files)
+                              if Path(name).suffix.lower() in SOURCE_EXTENSIONS or name in ('CMakeLists.txt', 'Makefile', 'makefile'))
+    records = []
+    for path in candidates:
+        rel = path.name if target.is_file() else path.relative_to(target).as_posix()
+        if _is_link(path):
+            skipped.append({'file': rel, 'reason': 'symbolic_link'})
+            continue
+        try:
+            size = path.stat().st_size
+            with path.open('rb') as stream:
+                stream.read(1)
+        except OSError as exc:
+            skipped.append({'file': rel, 'reason': 'unreadable', 'detail': str(exc)})
+            continue
+        if not size:
+            skipped.append({'file': rel, 'reason': 'empty_file'})
+            continue
+        records.append({'path': path, 'rel_path': rel, 'bytes': size, 'tokens': estimate_tokens_from_bytes(size)})
+    return records
 
 
 def _normalize_rel_file(file_str, target_dir):
@@ -2246,12 +2657,149 @@ def _normalize_rel_file(file_str, target_dir):
         except HarnessError:
             pass
     candidate = Path(cleaned)
-    if candidate.is_absolute():
-        try:
-            return candidate.resolve().relative_to(target_dir.resolve()).as_posix()
-        except ValueError:
-            return cleaned
-    return re.sub(r'^\./+', '', cleaned)
+    # 无法映射的 Windows 绝对路径必须原样交给范围核对，不能伪装成相对路径。
+    if not candidate.is_absolute() and ntpath.isabs(cleaned):
+        return cleaned
+    try:
+        root = target_dir.resolve()
+        absolute = candidate if candidate.is_absolute() else root / candidate
+        return absolute.resolve().relative_to(root).as_posix()
+    except (OSError, ValueError):
+        return posixpath.normpath(cleaned)
+
+
+def _build_audit_prompt(unit, focus):
+    files = '\n'.join('- ' + path for path in unit['files'])
+    return ('在当前目录按指定范围只读审查，给出文件和真实行号。不要修改文件，严禁在目标工作目录外创建或改动任何文件或目录（含严禁 git worktree add），且不要另行调用本编排器。\n重点: '
+            + (focus or '物理守恒、边界条件、数值稳定性及代码一致性') + '\n计划文件清单:\n' + files
+            + '\n按 JSON Schema 返回发现，read_files 列出已读取文件，unread_files 逐文件说明未完成的原因。')
+
+
+def _audit_estimate(files, file_tokens, focus, interop=False):
+    prompt = _build_audit_prompt({'files': files}, focus)
+    schema_bytes = len(json.dumps(AUDIT_JSON_SCHEMA, ensure_ascii=False).encode('utf-8'))
+    interop_bytes = len(STAGED_PROMPT_SUFFIX.encode('utf-8')) if interop else 0
+    overhead = estimate_tokens_from_bytes(len(prompt.encode('utf-8')) + schema_bytes + interop_bytes)
+    return {'estimated_file_tokens': file_tokens, 'estimated_prompt_tokens': overhead,
+            'estimated_tokens': file_tokens + overhead}
+
+
+def build_shards(file_records, max_shard_tokens, *, input_budget=None, focus='', interop=False):
+    if max_shard_tokens <= 0:
+        raise HarnessError('分片预算必须为正数')
+    budget = input_budget if input_budget is not None else max_shard_tokens
+    soft = min(max_shard_tokens, budget)
+    shards, files, file_tokens = [], [], 0
+    base_bytes = len(_build_audit_prompt({'files': []}, focus).encode('utf-8'))
+    base_bytes += len(json.dumps(AUDIT_JSON_SCHEMA, ensure_ascii=False).encode('utf-8'))
+    if interop:
+        base_bytes += len(STAGED_PROMPT_SUFFIX.encode('utf-8'))
+    path_bytes = 0
+    for record in file_records:
+        name = record['rel_path']
+        size = len(('- ' + name).encode('utf-8'))
+        if record['tokens'] + estimate_tokens_from_bytes(base_bytes + size) > budget:
+            raise HarnessError(f'单文件与审查提示词超出输入预算: {name}')
+        combined = file_tokens + record['tokens'] + estimate_tokens_from_bytes(base_bytes + path_bytes + size + bool(files))
+        if files and combined > soft:
+            shards.append({'shard_id': len(shards) + 1, 'files': files, **_audit_estimate(files, file_tokens, focus, interop)})
+            files, file_tokens, path_bytes = [], 0, 0
+        path_bytes += size + bool(files)
+        files.append(name)
+        file_tokens += record['tokens']
+    if files:
+        shards.append({'shard_id': len(shards) + 1, 'files': files, **_audit_estimate(files, file_tokens, focus, interop)})
+    return shards
+
+
+def _budget_for_spec(backends, spec):
+    return resolve_execution_profile(backends, spec, kind='audit')['capacity']['input_budget_tokens']
+
+
+def _audit_engines(backends, dual_blind, left_override, right_override, allow_unconfigured, caller):
+    if not left_override and caller == 'caller':
+        available = [name for name in ('codex', 'agy') if backends.get(name, {}).get('available')]
+        if not available:
+            if allow_unconfigured:
+                return None, None
+            raise HarnessError('未发现 agy 或 codex 后端')
+        left_override = available[0] + ':default'
+    left = choose_engine(backends, caller, left_override)
+    right = None
+    if dual_blind:
+        name, _ = _engine_parts(left)
+        right = right_override or ('agy:default' if name == 'codex' else 'codex:default')
+        choose_engine(backends, caller, right)
+        if left == right:
+            raise HarnessError('双路审查需要两个不同引擎或显式模型')
+    return left, right
+
+
+def select_audit_plan(total_tokens, file_records, backends, strategy='auto', dual_blind=True,
+                      left_override='', right_override='', shard_tokens=120_000, allow_unconfigured=False, caller='caller',
+                      *, focus='', profiles=None, engines=None):
+    requested_strategy = strategy
+    if strategy == 'whole-1m':
+        strategy = 'single-pass'
+    left, right = engines if engines is not None else _audit_engines(
+        backends, dual_blind, left_override, right_override, allow_unconfigured, caller)
+    if not left:
+        return {'mode': 'unconfigured', 'caller': caller, 'handoff_to_caller': True,
+                'total_files': len(file_records), 'total_estimated_tokens': total_tokens,
+                'left_engine': None, 'right_engine': None, 'left_units': [], 'right_units': [],
+                'skipped_files': [], 'execution_profiles': {}, 'notice': '未发现 agy 或 codex，当前只提供未就绪计划。'}
+    if profiles is None:
+        tier, _ = select_task_tier(kind='audit', text=focus)
+        paths = [record['rel_path'] for record in file_records]
+        estimated = _audit_estimate(paths, total_tokens, focus)['estimated_tokens']
+        profiles = {}
+        for side, spec in (('left', left), ('right', right)):
+            if spec:
+                profiles[side] = resolve_execution_profile(backends, spec, tier, focus, 'audit', estimated)
+    if right and profiles['left']['model'] and profiles['left']['spec'] == profiles['right']['spec']:
+        raise HarnessError('双路选路最终指向同一个模型；请为其中一路指定其他模型。')
+    plan = {'mode': strategy, 'requested_strategy': requested_strategy, 'caller': caller, 'handoff_to_caller': True,
+            'total_files': len(file_records), 'total_estimated_tokens': total_tokens,
+            'dual_blind': bool(right), 'left_engine': left, 'right_engine': right, 'skipped_files': [],
+            'execution_profiles': profiles, 'soft_shard_target_tokens': shard_tokens,
+            'coverage_notice': '清单是计划覆盖范围，实际读取完整性仍由回执与证据核实。',
+            'budget_notice': '按每 3 字节约 1 token 估算文件、审查提示词、清单与 JSON Schema，另保留策略余量；不表示分词器实测容量。',
+            'independence_notice': '不同进程独立审查，模型家族及错误独立性尚未验证。'}
+    all_files = [record['rel_path'] for record in file_records]
+    whole = strategy != 'sharded'
+    for side, spec in (('left', left), ('right', right)):
+        units_key = side + '_units'
+        plan[units_key] = []
+        if not spec:
+            continue
+        profile = profiles[side]
+        cap = profile['capacity']['input_budget_tokens']
+        interop = profile['execution_environment']['windows_interop']
+        all_estimate = _audit_estimate(all_files, total_tokens, focus, interop)
+        if strategy != 'sharded' and all_estimate['estimated_tokens'] <= cap:
+            plan[units_key] = [{'shard_id': 1, 'files': all_files, **all_estimate, 'single_pass_planned': True}]
+            continue
+        whole = False
+        if strategy == 'single-pass':
+            raise HarnessError(f'{spec} 文件与提示词超出单次预算，请选择 sharded 或调整有依据的预算。',
+                               execution_profile=profile, **all_estimate)
+        usable = []
+        for record in file_records:
+            estimate = _audit_estimate([record['rel_path']], record['tokens'], focus, interop)
+            if estimate['estimated_tokens'] > cap:
+                plan['skipped_files'].append({'file': record['rel_path'], 'engine': spec, 'side': side,
+                                             'reason': 'over_input_budget', **estimate, 'budget_tokens': cap})
+            else:
+                usable.append(record)
+        plan[units_key] = [{**unit, 'single_pass_planned': False,
+                            'exceeds_soft_shard_target': unit['estimated_tokens'] > shard_tokens}
+                           for unit in build_shards(usable, shard_tokens, input_budget=cap, focus=focus, interop=interop)]
+    plan['mode'] = 'single-pass' if whole else 'sharded'
+    if not whole:
+        plan['coverage_notice'] += ' 跨分片依赖未在同一个上下文内联合核查。'
+    if requested_strategy == 'whole-1m':
+        plan['deprecation_notice'] = 'whole-1m 兼容映射至 single-pass，不表示百万 token 或无压缩能力。'
+    return plan
 
 
 def merge_blind_findings(left_findings, right_findings, left_engine, right_engine, target_dir, line_tolerance=8):
@@ -2262,9 +2810,14 @@ def merge_blind_findings(left_findings, right_findings, left_engine, right_engin
     matched = set()
     consensus, singles = [], []
     for item in left:
-        hit = next((i for i, other in enumerate(right) if i not in matched and item['file'] == other['file']
-                    and item['line_start'] - line_tolerance <= other['line_end']
-                    and other['line_start'] - line_tolerance <= item['line_end']), None) if right_engine else None
+        hit = None
+        if right_engine:
+            for index, other in enumerate(right):
+                if (index not in matched and item['file'] == other['file']
+                        and item['line_start'] - line_tolerance <= other['line_end']
+                        and other['line_start'] - line_tolerance <= item['line_end']):
+                    hit = index
+                    break
         if hit is None:
             singles.append({**item, 'reported_by': [left_engine], 'independently_verified': False})
             continue
@@ -2280,6 +2833,11 @@ def merge_blind_findings(left_findings, right_findings, left_engine, right_engin
                    for i, item in enumerate(right) if i not in matched)
     key = lambda item: (-ranks[item['severity']], item['file'], item['line_start'])
     return {'consensus_findings': sorted(consensus, key=key), 'single_source_findings': sorted(singles, key=key)}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ⑦ 物理门禁循环与五大 CLI 子命令入口
+# ════════════════════════════════════════════════════════════════════════════
 
 
 def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_fn=None, max_rounds=3,
@@ -2341,8 +2899,7 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
             break
         round_changes = changed_files(before_worker, after_worker)
         worker_changes.update(round_changes)
-        round_violations = [path for path in round_changes if scopes and
-                            not any(fnmatch.fnmatchcase(path, pattern) for pattern in scopes)]
+        round_violations = [path for path in round_changes if scopes and not _scope_matches(path, scopes)]
         violations.update(round_violations)
         entry['worker_changed_files'] = round_changes
         if round_violations:
@@ -2403,6 +2960,13 @@ def _target(args):
     return target, target if target.is_dir() else target.parent
 
 
+def _task_text(args):
+    text = Path(args.task_file).expanduser().resolve().read_text(encoding='utf-8-sig') if getattr(args, 'task_file', None) else args.task
+    if not text or not text.strip():
+        raise HarnessError('任务内容为空')
+    return text
+
+
 def _git_head(root):
     try:
         result = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)
@@ -2411,79 +2975,16 @@ def _git_head(root):
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def _print(payload):
-    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
-    return EXIT_CODES.get(payload.get('status', 'ok'), 1)
-
-
-def cmd_probe(args):
-    return _print({'status': 'ok', 'caller': resolve_caller(args.caller), 'backends': _args_backends(args)})
-
-
-def _capability_matrix(prefix, info):
-    models = info['models']
-    families = _agy_families(models) if prefix == 'agy' else {}
-    rows = []
-    for record in sorted(models, key=_catalog_order):
-        slug = record['slug']
-        category = _model_category(prefix, record)
-        if prefix == 'agy':
-            family, variant = _agy_slug_tier(slug)
-            efforts = sorted(families.get(family, {}), key=EFFORT_LADDER.index) if family else []
-        else:
-            family, variant = None, None
-            efforts = list(record.get('supported_efforts') or [])
-        rows.append({
-            'model': slug, 'display_name': record.get('display_name'), 'category': category,
-            'auto_candidate': category == 'native',
-            'family': family or None, 'variant_effort': variant or None,
-            'declared_efforts': efforts, 'declared_default_effort': record.get('default_reasoning_level'),
-            'effort_source': ('fixed_configuration' if category == 'fixed_composite' else
-                              'agy_catalog_slug_suffix' if variant else
-                              'codex_client_cache_reasoning_levels' if efforts else 'unknown'),
-            'fixed_configuration': 'same_agent_planning_review_and_execution' if category == 'fixed_composite' else None,
-            'capacity': _execution_budget(prefix, info, record),
-            'catalog_source': info['model_catalog'].get('source'),
-            'catalog_fetched_at': info['model_catalog'].get('fetched_at'),
-            'catalog_freshness': info['model_catalog'].get('freshness'),
-            'runtime_verified': False,
-        })
-    return rows
-
-
-def cmd_assess(args):
-    backends = probe_backends(args.codex_input_budget, args.agy_input_budget, args.discover_models,
-                              refresh_model_cache=False)
-    caller = resolve_caller(args.caller)
-    local_backend = {'codex': 'codex', 'antigravity': 'agy'}.get(caller)
-    scenarios = {kind: (kind, '') for kind in ('review', 'direction', 'polish', 'math', 'code', 'audit', 'gate')}
-    scenarios['surface_review'] = ('review', '检查注释拼写')
-    recommendations = {}
-    for name, info in backends.items():
-        info['caller_relation'] = ('local' if name == local_backend else 'counterpart') if local_backend else 'unspecified'
-        info['program_origin'] = ('windows_interop' if info['windows_interop'] else 'native') if info['detected'] else None
-        info['execution_environment'] = _execution_environment(info)
-        info['capability_matrix'] = _capability_matrix(name, info)
-        info['model_metadata_sources'] = {
-            'context': 'codex_client_cache_context_fields' if name == 'codex' and any(
-                model.get('context_window') or model.get('max_context_window') for model in info['models']) else None,
-            'effort': ('codex_client_cache_reasoning_levels' if name == 'codex' and any(
-                model.get('supported_efforts') for model in info['models']) else
-                'agy_catalog_slug_suffix' if name == 'agy' and any(
-                    _agy_slug_tier(model['slug'])[1] for model in info['models']) else None),
-            'runtime_verified': False,
-        }
-        recommendations[name] = {}
-        for scenario, (kind, prompt) in scenarios.items():
-            tier, reason = select_task_tier(kind=kind, text=prompt)
-            profile = resolve_execution_profile(backends, name + ':default', tier, prompt, kind=kind)
-            recommendations[name][scenario] = {**profile, 'requested_tier': 'auto', 'tier_reason': reason,
-                                                'backend_detected': info['detected']}
-    return _print({'status': 'ok', 'caller': caller, 'backends': backends,
-                   'recommendations': recommendations,
-                   'catalog_discovery_requested': args.discover_models,
-                   'runtime_verified': False, 'controls_native_spawn_agent': False,
-                   'notice': '能力矩阵和选路基于目录及策略。实际可用性、性能、有效上下文、压缩和委派行为仍需执行验证。'})
+def _target_metrics(requested_target, text):
+    prompt_tokens = estimate_tokens_from_bytes(len((text or '').encode('utf-8')))
+    if requested_target.is_file():
+        try:
+            size = requested_target.stat().st_size
+        except OSError:
+            size = 0
+        return 1, estimate_tokens_from_bytes(size) + prompt_tokens
+    records = collect_target_files(requested_target)
+    return max(1, len(records)), sum(item['tokens'] for item in records) + prompt_tokens
 
 
 def _prepare_execution(backends, specs, batch, *, dry_run=False):
@@ -2527,16 +3028,137 @@ def _planned_profile(args, backends, engine, tier, reason, text, kind, estimated
     return profile
 
 
-def _target_metrics(requested_target, text):
-    prompt_tokens = estimate_tokens_from_bytes(len((text or '').encode('utf-8')))
-    if requested_target.is_file():
-        try:
-            size = requested_target.stat().st_size
-        except OSError:
-            size = 0
-        return 1, estimate_tokens_from_bytes(size) + prompt_tokens
-    records = collect_target_files(requested_target)
-    return max(1, len(records)), sum(item['tokens'] for item in records) + prompt_tokens
+def _profile_payload(profile):
+    return {key: profile[key] for key in ('requested_engine', 'requested_tier', 'model', 'reasoning_effort',
+                                          'declared_effort', 'effective_effort', 'selected_tier', 'tier_reason',
+                                          'profile_source', 'effort_source', 'quota_status')} | {'execution_profile': profile}
+
+
+def _run_cli_gate(args, root, requested_target, text, caller, engine, backends, scopes, profile, kind, estimated_tokens, batch):
+    receipts = []
+    current = profile
+    prefix, _ = _engine_parts(engine)
+    retry_on_failure = (args.tier == 'auto' and profile['tier'] not in ('max', 'ultra')
+                        and not profile['tier_reason'].startswith('user_description_'))
+
+    def variant_key(selected):
+        return (selected['spec'], selected['cli_effort'], selected['capacity']['cli_context_window_tokens'])
+
+    def worker(prompt, number):
+        nonlocal current
+        previous = current
+        if number == 2 and retry_on_failure:
+            candidate = _planned_profile(args, backends, engine, 'max', 'gate_retry_escalated_max', text, kind, estimated_tokens)
+            old = previous.get('declared_effort')
+            new = candidate.get('declared_effort')
+            if (not candidate.get('execution_blocked_reason') and variant_key(candidate) != variant_key(previous)
+                    and new in EFFORT_LADDER and (old is None or EFFORT_LADDER.index(new) > EFFORT_LADDER.index(old))):
+                current = candidate
+        invocation = {}
+        entry = {'execution_profile': current, 'invocation': invocation, 'variant_changed': variant_key(current) != variant_key(previous)}
+        receipts.append(entry)
+        return invoke_edit_worker(current['spec'], root, prompt, backends, args.timeout, current['cli_effort'], args.retry_quota,
+                                  profile=current, batch=batch, receipt=invocation)
+
+    result = run_physics_gate_loop(root, f'任务目标 {requested_target}。\n' + text, args.verify_cmd, worker,
+                                   max_rounds=args.max_rounds, caller=caller, timeout_sec=args.timeout, write_scope=scopes)
+    for entry, receipt in zip(result['history'], receipts):
+        entry.update(receipt)
+        entry['escalated'] = receipt['variant_changed'] and bool(receipt['invocation'].get('invocation_started'))
+    last = next((entry['execution_profile'] for entry in reversed(result['history'])
+                 if entry.get('invocation', {}).get('invocation_started')), profile)
+    result.update(_profile_payload(last))
+    result['quota_status'] = backends.get(prefix, {}).get('quota_status', last['quota_status'])
+    return result
+
+
+def _gate_can_replay(result, before, root):
+    """第二轮、验收已执行、出现过改动或快照无法核对时，均不可自动重放。"""
+    if (before is None or result.get('scope_verified') is not True
+            or result.get('changed_files') != [] or result.get('worker_changed_files')
+            or result.get('verification_changed_files') or result.get('rounds_used') != 1):
+        return False
+    entry = result['history'][0]
+    if entry.get('verify_exit_code') is not None or not _quota_can_replay(entry, entry.get('invocation', {})):
+        return False
+    scope = _safe_changes_report(before, root, [], True)
+    return scope['scope_verified'] and not scope['changed_files']
+
+
+def _run_gate_with_fallback(args, root, requested_target, text, caller, engine, backends,
+                            scopes, profile, kind, estimated_tokens, batch, meta, before):
+    result = _run_cli_gate(args, root, requested_target, text, caller, engine, backends,
+                           scopes, profile, kind, estimated_tokens, batch)
+    if (result.get('status') != 'quota_exhausted' or not getattr(args, 'fallback_on_quota', False)
+            or 'quota_fallback' in meta or not _gate_can_replay(result, before, root)):
+        return result
+    fallback = _local_fallback_engine(caller, engine, backends)
+    if not fallback:
+        return result
+    meta['quota_fallback'] = _quota_fallback_record(engine, fallback, result)
+    try:
+        _prepare_execution(backends, (fallback,), batch)
+        if not _workspace_unchanged(before, root):
+            meta.pop('quota_fallback')
+            return result
+        selected = _planned_profile(args, backends, fallback, profile['tier'], profile['tier_reason'],
+                                     text, kind, estimated_tokens)
+        _require_execution_profile(selected)
+    except HarnessError as exc:
+        # 本侧准备失败时保留原额度回执与门禁历史，便于总控复核两次尝试。
+        return {**result, 'status': exc.status, 'error': str(exc), **exc.details}
+    meta.update(engine=fallback)
+    if 'worker_engine' in meta:
+        meta['worker_engine'] = fallback
+    meta.update(_profile_payload(selected))
+    return _run_cli_gate(args, root, requested_target, text, caller, fallback, backends,
+                         scopes, selected, kind, estimated_tokens, batch)
+
+
+def _print(payload):
+    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    return EXIT_CODES.get(payload.get('status', 'ok'), 1)
+
+
+def cmd_probe(args):
+    return _print({'status': 'ok', 'caller': resolve_caller(args.caller), 'backends': _args_backends(args)})
+
+
+def cmd_assess(args):
+    backends = probe_backends(args.codex_input_budget, args.agy_input_budget, args.discover_models,
+                              refresh_model_cache=False)
+    caller = resolve_caller(args.caller)
+    local_backend = {'codex': 'codex', 'antigravity': 'agy'}.get(caller)
+    scenarios = {kind: (kind, '') for kind in ('review', 'direction', 'polish', 'math', 'code', 'audit', 'gate')}
+    scenarios['surface_review'] = ('review', '检查注释拼写')
+    scenarios['economy_review'] = ('review', '省额度做常规代码审查')
+    scenarios['economy_surface_review'] = ('review', '省额度检查注释拼写')
+    recommendations = {}
+    for name, info in backends.items():
+        info['caller_relation'] = ('local' if name == local_backend else 'counterpart') if local_backend else 'unspecified'
+        info['program_origin'] = ('windows_interop' if info['windows_interop'] else 'native') if info['detected'] else None
+        info['execution_environment'] = _execution_environment(info)
+        info['capability_matrix'] = _capability_matrix(name, info)
+        info['model_metadata_sources'] = {
+            'context': 'codex_client_cache_context_fields' if name == 'codex' and any(
+                model.get('context_window') or model.get('max_context_window') for model in info['models']) else None,
+            'effort': ('codex_client_cache_reasoning_levels' if name == 'codex' and any(
+                model.get('supported_efforts') for model in info['models']) else
+                'agy_catalog_slug_suffix' if name == 'agy' and any(
+                    _agy_slug_tier(model['slug'])[1] for model in info['models']) else None),
+            'runtime_verified': False,
+        }
+        recommendations[name] = {}
+        for scenario, (kind, prompt) in scenarios.items():
+            tier, reason = select_task_tier(kind=kind, text=prompt)
+            profile = resolve_execution_profile(backends, name + ':default', tier, prompt, kind=kind)
+            recommendations[name][scenario] = {**profile, 'requested_tier': 'auto', 'tier_reason': reason,
+                                                'backend_detected': info['detected']}
+    return _print({'status': 'ok', 'caller': caller, 'backends': backends,
+                   'recommendations': recommendations,
+                   'catalog_discovery_requested': args.discover_models,
+                   'runtime_verified': False, 'controls_native_spawn_agent': False,
+                   'notice': '能力矩阵和选路基于目录及策略。实际可用性、性能、有效上下文、压缩和委派行为仍需执行验证。'})
 
 
 def cmd_audit(args):
@@ -2553,12 +3175,14 @@ def cmd_audit(args):
     meta = {'caller': caller, 'handoff_to_caller': True, 'requested_tier': args.tier,
             'selected_tier': tier, 'tier_reason': tier_reason, 'target': str(root)}
     batch = _QuotaBatch(args.retry_quota)
+    fallback_before = snapshot_files(root) if getattr(args, 'fallback_on_quota', False) and not args.dry_run else None
     try:
         _prepare_execution(backends, engines, batch, dry_run=args.dry_run)
     except HarnessError as exc:
         q_backend = exc.details.get('quota_backend') or ''
         fb_engine = _local_fallback_engine(caller, f'{q_backend}:default', backends) if (
             exc.status == 'quota_exhausted' and q_backend and getattr(args, 'fallback_on_quota', False)
+            and _workspace_unchanged(fallback_before, root)
         ) else None
         if not fb_engine:
             return _print({'status': exc.status, **meta, 'error': str(exc), 'requested_engines': list(engines), **exc.details})
@@ -2611,18 +3235,19 @@ def cmd_audit(args):
                 _validate_schema(result, AUDIT_JSON_SCHEMA)
                 planned = set(unit['files'])
                 read = [_normalize_rel_file(path, root) for path in result['read_files']]
+                read_paths = set(read)
                 unread = [{**item, 'file': _normalize_rel_file(item['file'], root)} for item in result['unread_files']]
                 unread_paths = {item['file'] for item in unread}
-                if (set(read) | unread_paths) - planned or set(read) & unread_paths:
+                if (read_paths | unread_paths) - planned or read_paths & unread_paths:
                     raise OutputParseError('读取覆盖回执与本分片文件范围不一致')
-                if len(set(read)) != len(read) or len(unread_paths) != len(unread):
+                if len(read_paths) != len(read) or len(unread_paths) != len(unread):
                     raise OutputParseError('读取覆盖回执包含重复路径')
                 normalized = [{**item, 'file': _normalize_rel_file(item['file'], root)} for item in result['findings']]
                 if {item['file'] for item in normalized} - planned:
                     raise OutputParseError('发现项引用了分片清单之外的文件')
-                if any(item['file'] not in set(read) for item in normalized):
+                if any(item['file'] not in read_paths for item in normalized):
                     raise OutputParseError('发现项没有相应的自报已读文件')
-                for missing in sorted(planned - set(read) - unread_paths):
+                for missing in sorted(planned - read_paths - unread_paths):
                     unread.append({'file': missing, 'reason': 'backend_did_not_report_reading'})
                 findings[side].extend(normalized)
                 completed.append({**common, 'read_files': read, 'unread_files': unread,
@@ -2659,95 +3284,6 @@ def cmd_audit(args):
                    **merged, **scope, **quota_meta, 'verification_notice': '当前总控需核实原始文件与证据后采纳发现。'})
 
 
-def _task_text(args):
-    text = Path(args.task_file).expanduser().resolve().read_text(encoding='utf-8-sig') if getattr(args, 'task_file', None) else args.task
-    if not text or not text.strip():
-        raise HarnessError('任务内容为空')
-    return text
-
-
-def _profile_payload(profile):
-    return {key: profile[key] for key in ('requested_engine', 'requested_tier', 'model', 'reasoning_effort',
-                                          'declared_effort', 'effective_effort', 'selected_tier', 'tier_reason',
-                                          'profile_source', 'effort_source', 'quota_status')} | {'execution_profile': profile}
-
-
-def _run_cli_gate(args, root, requested_target, text, caller, engine, backends, scopes, profile, kind, estimated_tokens, batch):
-    receipts = []
-    current = profile
-    prefix, _ = _engine_parts(engine)
-    retry_on_failure = (args.tier == 'auto' and profile['tier'] not in ('max', 'ultra')
-                        and not profile['tier_reason'].startswith('user_description_'))
-
-    def variant_key(selected):
-        return (selected['spec'], selected['cli_effort'], selected['capacity']['cli_context_window_tokens'])
-
-    def worker(prompt, number):
-        nonlocal current
-        previous = current
-        if number == 2 and retry_on_failure:
-            candidate = _planned_profile(args, backends, engine, 'max', 'gate_retry_escalated_max', text, kind, estimated_tokens)
-            old = previous.get('declared_effort')
-            new = candidate.get('declared_effort')
-            if (not candidate.get('execution_blocked_reason') and variant_key(candidate) != variant_key(previous)
-                    and new in EFFORT_LADDER and (old is None or EFFORT_LADDER.index(new) > EFFORT_LADDER.index(old))):
-                current = candidate
-        invocation = {}
-        entry = {'execution_profile': current, 'invocation': invocation, 'variant_changed': variant_key(current) != variant_key(previous)}
-        receipts.append(entry)
-        return invoke_edit_worker(current['spec'], root, prompt, backends, args.timeout, current['cli_effort'], args.retry_quota,
-                                  profile=current, batch=batch, receipt=invocation)
-
-    result = run_physics_gate_loop(root, f'任务目标 {requested_target}。\n' + text, args.verify_cmd, worker,
-                                   max_rounds=args.max_rounds, caller=caller, timeout_sec=args.timeout, write_scope=scopes)
-    for entry, receipt in zip(result['history'], receipts):
-        entry.update(receipt)
-        entry['escalated'] = receipt['variant_changed'] and bool(receipt['invocation'].get('invocation_started'))
-    last = next((entry['execution_profile'] for entry in reversed(result['history'])
-                 if entry.get('invocation', {}).get('invocation_started')), profile)
-    result.update(_profile_payload(last))
-    result['quota_status'] = backends.get(prefix, {}).get('quota_status', last['quota_status'])
-    return result
-
-
-def _local_fallback_engine(caller, engine, backends):
-    fallback = {'antigravity': 'agy:default', 'codex': 'codex:default'}.get(caller)
-    if not fallback:
-        return None
-    cur_prefix, _ = _engine_parts(engine)
-    fb_prefix, _ = _engine_parts(fallback)
-    if cur_prefix == fb_prefix or not backends.get(fb_prefix, {}).get('available'):
-        return None
-    return fallback
-
-
-def _quota_fallback_record(from_engine, to_engine, details):
-    details = details or {}
-    return {
-        'from_engine': from_engine,
-        'to_engine': to_engine,
-        'reason': 'quota_exhausted',
-        'preflight_blocked': bool(details.get('preflight_blocked')),
-        'quota_cooldown': details.get('quota_cooldown'),
-    }
-
-
-def _safe_changes_report(before, root, scopes, readonly):
-    try:
-        report = _changes_report(before, root, scopes, readonly)
-        report['scope_verified'] = True
-        return report
-    except (HarnessError, OSError) as exc:
-        return {
-            'changed_files': None,
-            'scope_violations': [],
-            'scope_check': 'unverified',
-            'scope_verified': False,
-            'scope_error': str(exc),
-            'scope_error_path': getattr(exc, 'details', {}).get('snapshot_path'),
-        }
-
-
 def cmd_gate(args):
     requested_target, root = _target(args)
     text = _task_text(args)
@@ -2763,11 +3299,13 @@ def cmd_gate(args):
     meta = {'caller': caller, 'handoff_to_caller': True, 'engine': engine, 'worker_engine': engine,
             'requested_tier': args.tier, 'selected_tier': tier, 'tier_reason': tier_reason,
             'target': str(root), 'requested_target': str(requested_target)}
+    fallback_before = snapshot_files(root) if getattr(args, 'fallback_on_quota', False) and not args.dry_run else None
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
     except HarnessError as exc:
         fb_engine = _local_fallback_engine(caller, engine, backends) if (
             exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
+            and _workspace_unchanged(fallback_before, root)
         ) else None
         if not fb_engine:
             return _print({'status': exc.status, **meta, 'error': str(exc), **exc.details})
@@ -2786,26 +3324,11 @@ def cmd_gate(args):
                        'work_dir': str(root), 'verify_cmd': args.verify_cmd, 'write_scope': scopes, 'max_rounds': args.max_rounds})
     _require_execution_profile(profile)
     base = _git_head(root)
-    pre_gate_snap = snapshot_files(root) if (getattr(args, 'fallback_on_quota', False) and 'quota_fallback' not in meta) else None
-    result = _run_cli_gate(args, root, requested_target, text, caller, engine, backends, scopes, profile, 'gate', est_tokens, batch)
-    if (result.get('status') == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
-            and 'quota_fallback' not in meta):
-        fb_engine = _local_fallback_engine(caller, engine, backends)
-        no_writes = not result.get('changed_files') and (
-            pre_gate_snap is None or not changed_files(pre_gate_snap, snapshot_files(root))
-        )
-        if fb_engine and no_writes:
-            try:
-                _prepare_execution(backends, (fb_engine,), batch, dry_run=False)
-                fb_profile = _planned_profile(args, backends, fb_engine, tier, tier_reason, text, 'gate', est_tokens)
-                _require_execution_profile(fb_profile)
-                meta['quota_fallback'] = _quota_fallback_record(engine, fb_engine, result)
-                engine = fb_engine
-                meta.update(engine=engine, worker_engine=engine)
-                result = _run_cli_gate(args, root, requested_target, text, caller, engine, backends, scopes,
-                                       fb_profile, 'gate', est_tokens, batch)
-            except HarnessError as fb_exc:
-                return _print({'status': fb_exc.status, **meta, 'base_commit': base, 'error': str(fb_exc), **fb_exc.details})
+    try:
+        result = _run_gate_with_fallback(args, root, requested_target, text, caller, engine, backends,
+                                         scopes, profile, 'gate', est_tokens, batch, meta, fallback_before)
+    except HarnessError as exc:
+        return _print({'status': exc.status, **meta, 'base_commit': base, 'error': str(exc), **exc.details})
     return _print({**meta, **result, 'base_commit': base})
 
 
@@ -2834,11 +3357,13 @@ def cmd_task(args):
                'requested_tier': args.tier, 'selected_tier': tier, 'tier_reason': tier_reason,
                'target': str(root), 'requested_target': str(requested_target), 'base_commit': base,
                'readonly': readonly, 'write_scope': scopes}
+    fallback_before = snapshot_files(root) if getattr(args, 'fallback_on_quota', False) and not args.dry_run else None
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
     except HarnessError as exc:
         fb_engine = _local_fallback_engine(caller, engine, backends) if (
             exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
+            and _workspace_unchanged(fallback_before, root)
         ) else None
         if not fb_engine:
             return _print({'status': exc.status, **payload, 'result': {}, 'changed_files': [], 'scope_violations': [],
@@ -2858,29 +3383,12 @@ def cmd_task(args):
         return _print({'status': 'ok', 'dry_run': True, 'quota_cooldown': backends.get(prefix, {}).get('quota_cooldown'), **payload})
     _require_execution_profile(profile)
     if args.kind == 'code' and args.verify_cmd:
-        pre_gate_snap = snapshot_files(root) if (getattr(args, 'fallback_on_quota', False) and 'quota_fallback' not in payload) else None
-        result = _run_cli_gate(args, root, requested_target, text, caller, engine, backends, scopes,
-                               profile, args.kind, est_tokens, batch)
-        if (result.get('status') == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
-                and 'quota_fallback' not in payload):
-            fb_engine = _local_fallback_engine(caller, engine, backends)
-            no_writes = not result.get('changed_files') and (
-                pre_gate_snap is None or not changed_files(pre_gate_snap, snapshot_files(root))
-            )
-            if fb_engine and no_writes:
-                try:
-                    _prepare_execution(backends, (fb_engine,), batch, dry_run=False)
-                    fb_profile = _planned_profile(args, backends, fb_engine, tier, tier_reason, text, args.kind, est_tokens)
-                    _require_execution_profile(fb_profile)
-                    payload['quota_fallback'] = _quota_fallback_record(engine, fb_engine, result)
-                    engine = fb_engine
-                    payload['engine'] = engine
-                    payload.update(_profile_payload(fb_profile))
-                    result = _run_cli_gate(args, root, requested_target, text, caller, engine, backends, scopes,
-                                           fb_profile, args.kind, est_tokens, batch)
-                except HarnessError as fb_exc:
-                    return _print({'status': fb_exc.status, **payload, 'result': {}, 'changed_files': [],
-                                   'scope_violations': [], 'error': str(fb_exc), **fb_exc.details})
+        try:
+            result = _run_gate_with_fallback(args, root, requested_target, text, caller, engine, backends,
+                                             scopes, profile, args.kind, est_tokens, batch, payload, fallback_before)
+        except HarnessError as exc:
+            return _print({'status': exc.status, **payload, 'result': {}, 'changed_files': [],
+                           'scope_violations': [], 'error': str(exc), **exc.details})
         return _print({**payload, **result})
     before = snapshot_files(root)
     rel_hint = f'（相对路径: {rel_single_file}）' if rel_single_file else ''
@@ -2896,19 +3404,24 @@ def cmd_task(args):
             result = invoke_engine(profile['spec'], root, prompt, backends, TASK_JSON_SCHEMA,
                                    readonly, args.timeout, 'readonly-collaborator', stage_files, profile['cli_effort'], args.retry_quota,
                                    profile=profile, batch=batch, receipt=invocation)
-        except Exception as exc:
+        except HarnessError as exc:
             fb_engine = _local_fallback_engine(caller, engine, backends) if (
                 getattr(exc, 'status', None) == 'quota_exhausted'
                 and getattr(args, 'fallback_on_quota', False)
                 and 'quota_fallback' not in payload
-                and not changed_files(before, snapshot_files(root))
+                and _quota_can_replay(exc.details, invocation)
+                and _workspace_unchanged(before, root)
+                and _workspace_unchanged(fallback_before, root)
             ) else None
             if not fb_engine:
                 raise
+            payload['quota_fallback'] = _quota_fallback_record(engine, fb_engine, exc.details)
             _prepare_execution(backends, (fb_engine,), batch, dry_run=False)
+            if not _workspace_unchanged(before, root):
+                payload.pop('quota_fallback')
+                raise
             fb_profile = _planned_profile(args, backends, fb_engine, tier, tier_reason, text, args.kind, est_tokens)
             _require_execution_profile(fb_profile)
-            payload['quota_fallback'] = _quota_fallback_record(engine, fb_engine, getattr(exc, 'details', {}))
             engine = fb_engine
             prefix, _ = _engine_parts(engine)
             payload['engine'] = engine
@@ -2975,7 +3488,7 @@ def build_arg_parser():
         command.add_argument('--agy-input-budget', type=_positive_arg)
     for command in (audit, gate, task):
         command.add_argument('--tier', choices=list(TIER_CHOICES), default='auto',
-                             help='挡位策略：auto 按任务专长选模并分级思考挡位（攻坚用单模型最高挡 max，常规用 high，短润色用 medium，表面检查用 low）')
+                             help='挡位策略：auto 默认启用旗舰专长模型与单模型最高挡 max（短润色用 medium、长润色用 high）；仅当用户显式或模糊要求降挡／省 token 时切换分级自适应（常规 high、表面检查轻量模型 + low）')
         command.add_argument('--retry-quota', action='store_true',
                              help='用户确认已充值或额度恢复后，忽略本地额度冷却记录重试发起')
         command.add_argument('--fallback-on-quota', action='store_true',
@@ -2986,7 +3499,14 @@ def build_arg_parser():
 
 
 def main():
-    _SESSION_QUOTA_BLOCKED.clear()
+    # 作为库被测试导入时不改宿主标准流；编码与取消状态只在 CLI 入口初始化。
+    for name in ('stdin', 'stdout', 'stderr'):
+        stream = getattr(sys, name, None)
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
+    _CANCELLED.clear()
+    with QUOTA_LOCK:
+        _SESSION_QUOTA_BLOCKED.clear()
     args = build_arg_parser().parse_args()
     if os.environ.get('CAE_HARNESS_DEPTH') and args.subcommand not in ('probe', 'assess'):
         sys.exit(_print({'status': 'failed', 'error': '子任务再次调用本编排器会形成递归派工，已拒绝'}))

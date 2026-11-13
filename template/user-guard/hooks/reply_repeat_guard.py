@@ -12,6 +12,8 @@ reply_repeat_guard.py - 反重力 Stop 交接终审与防连续同质等待刷�
    - 同一用户回合至多触发一次续跑。
 """
 
+# ① 常量、阈值与宿主依赖
+
 import difflib
 import hashlib
 import json
@@ -116,6 +118,8 @@ BLOCK_REASON_TEXT = (
 )
 
 
+# ② 目录、日志与防重复状态读写
+
 def get_data_dirs() -> Tuple[Path, Path]:
     return user_words.resolve_data_dirs(HOOKS_DIR)
 
@@ -128,109 +132,75 @@ def log_event(event_name: str, conversation_id: str, message: str) -> None:
     user_words.append_lifecycle_log(HOOKS_DIR, event_name, conversation_id, message)
 
 
-def is_short_status_reply(text: str) -> bool:
-    """判定回复是否属于无提问的短状态等待回复"""
-    if not text:
-        return False
-    stripped = text.strip()
-    if not stripped or len(stripped) > MAX_SHORT_REPLY_CHARS:
-        return False
-
-    low = stripped.lower()
-    for qm in USER_DECISION_OR_QUESTION_MARKERS:
-        if qm in low:
-            return False
-
-    return any(kw in low for kw in WAIT_KEYWORDS)
-
-
-def normalize_reply_text(text: str) -> str:
-    """归一化回复文本（去除标点与多余空白，但保留字母、汉字与数字以敏感识别迭代步数/残差变化）"""
-    low = text.strip().lower()
-    # 移除常见 ISO 时间戳如 2026-11-12T06:00:00 或 06:12:34，保留业务数值（步数、残差、百分比）
-    low = re.sub(r"\b\d{4}-\d{2}-\d{2}[t\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})?\b", "", low)
-    low = re.sub(r"\b\d{2}:\d{2}:\d{2}\b", "", low)
-    # 仅保留中英文字符、数字与科学计数法符号
-    cleaned = re.sub(r"[^\w\u4e00-\u9fff.+-]+", " ", low)
-    return re.sub(r"\s+", " ", cleaned).strip()
+def _load_repeat_state(state_file: Path, conversation_id: str) -> Dict[str, Any]:
+    if state_file.exists():
+        try:
+            data = json.loads(state_file.read_text(encoding="utf-8-sig"))
+            if (isinstance(data, dict) and data.get("version") == 2
+                    and data.get("conversationId") == conversation_id and isinstance(data.get("turns"), dict)):
+                for record in data["turns"].values():
+                    if (not isinstance(record, dict)
+                            or type(record.get("consecutiveShortWaitCount")) is not int
+                            or record["consecutiveShortWaitCount"] < 0
+                            or not isinstance(record.get("lastNormalizedReply"), str)
+                            or not isinstance(record.get("blockedSignatures"), list)
+                            or (record.get("lastStepIndex") is not None and type(record["lastStepIndex"]) is not int)):
+                        raise ValueError("回合复读记录格式错误")
+                return data
+            raise ValueError("状态格式或会话身份不符")
+        except (OSError, ValueError, RecursionError) as exc:
+            log_event("Stop:repeat_state_error", conversation_id, f"防重复状态读取失败（{exc}），保留原文件")
+            raise
+    return {"version": 2, "conversationId": conversation_id, "turns": {}}
 
 
-def _extract_number_tokens(norm_text: str) -> List[str]:
-    """提取归一化文本中的数值标记（如迭代步数 100、残差 1e-5、进度 45）"""
-    return re.findall(r"\d+(?:\.\d+)?(?:e[+-]?\d+)?", norm_text)
+def _save_repeat_state(state_file: Path, state: Dict[str, Any], conversation_id: str) -> None:
+    state["version"] = 2
+    state["conversationId"] = conversation_id
+    state["updatedAt"] = get_current_iso_time()
+    user_words.atomic_write_json(state_file, state)
 
 
-def _strip_wait_boilerplate(norm_text: str) -> str:
-    """剥离通用等待套话词汇，提取短状态回复的核心任务主语"""
-    s = norm_text
-    for tok in WAIT_BOILERPLATE_TOKENS:
-        s = s.replace(tok, " ")
-    return re.sub(r"\s+", "", s).strip()
-
-
-def are_replies_homogeneous(prev_norm: str, curr_norm: str) -> bool:
-    """
-    严格比对相邻两条短等待回复是否同质：
-    1. 归一化文本完全一致 -> 同质；
-    2. 若包含数值指标（如迭代步数、残差、完成度）且数值发生变化 -> 属于真实进展汇报，绝不判为复读；
-    3. 数值集合相同（或均无数值）时：
-       - 整句序列相似度 >= SIMILARITY_THRESHOLD，或
-       - 剥离通用等待套话后的核心主语一致 / 高度相似 -> 判为同质等待复读。
-    """
-    if not prev_norm or not curr_norm:
-        return False
-    if prev_norm == curr_norm:
-        return True
-
-    prev_nums = _extract_number_tokens(prev_norm)
-    curr_nums = _extract_number_tokens(curr_norm)
-    if prev_nums != curr_nums:
-        return False
-
-    if difflib.SequenceMatcher(None, prev_norm, curr_norm).ratio() >= SIMILARITY_THRESHOLD:
-        return True
-
-    core_prev = _strip_wait_boilerplate(prev_norm)
-    core_curr = _strip_wait_boilerplate(curr_norm)
-    if core_prev == core_curr:
-        return True
-    if core_prev and core_curr:
-        return difflib.SequenceMatcher(None, core_prev, core_curr).ratio() >= CORE_SIMILARITY_THRESHOLD
-    return False
-
+# ③ 尾部窗口、逆序回合定位与截断回复回查
 
 def _read_tail_steps_with_offset(transcript_path: Path) -> Tuple[List[Dict[str, Any]], int]:
     """读取 transcript.jsonl 末尾窗口并解析步骤列表，同时返回窗口起始字节偏移"""
     try:
-        fsize = transcript_path.stat().st_size
         start_offset = 0
         with open(transcript_path, "rb") as f:
+            f.seek(0, 2)
+            fsize = f.tell()
             if fsize > TAIL_SCAN_BYTES:
                 seek_pos = fsize - TAIL_SCAN_BYTES
-                f.seek(seek_pos)
-                raw = f.read()
-                first_nl = raw.find(b"\n")
-                if first_nl != -1:
-                    start_offset = seek_pos + first_nl + 1
-                    raw = raw[first_nl + 1 :]
+                f.seek(seek_pos - 1)
+                at_line_start = f.read(1) == b"\n"
+                raw = f.read(TAIL_SCAN_BYTES)
+                if at_line_start:
+                    start_offset = seek_pos
                 else:
-                    start_offset = fsize
-                    raw = b""
+                    first_nl = raw.find(b"\n")
+                    if first_nl != -1:
+                        start_offset = seek_pos + first_nl + 1
+                        raw = raw[first_nl + 1 :]
+                    else:
+                        start_offset = fsize
+                        raw = b""
             else:
-                raw = f.read()
+                f.seek(0)
+                raw = f.read(fsize)
     except OSError:
         return [], 0
 
     steps: List[Dict[str, Any]] = []
-    for line in raw.decode("utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line:
+    # JSON 字符串允许含 U+2028 等字符，只能按真实换行字节分行。
+    for line in raw.split(b"\n"):
+        if not line.strip():
             continue
         try:
-            obj = json.loads(line)
+            obj = json.loads(user_words.decode_jsonl_line(line))
             if isinstance(obj, dict):
                 steps.append(obj)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             continue
     return steps, start_offset
 
@@ -239,6 +209,16 @@ def _read_tail_steps(transcript_path: Path) -> List[Dict[str, Any]]:
     """读取 transcript.jsonl 末尾窗口并解析步骤列表，避免大会话全量读盘"""
     steps, _ = _read_tail_steps_with_offset(transcript_path)
     return steps
+
+
+def _is_turn_boundary_step(step: Dict[str, Any]) -> bool:
+    """识别回合起点：人类显式 USER_INPUT 或跨代理派发的非 system 消息"""
+    s_type = step.get("type", "")
+    if s_type == "USER_INPUT" or step.get("source") == "USER_EXPLICIT":
+        return True
+    if s_type == "SYSTEM_MESSAGE":
+        return bool(user_words.clean_user_content(step.get("content"), "SYSTEM_MESSAGE"))
+    return False
 
 
 def _find_turn_key_before_offset(transcript_path: Path, end_offset: int) -> str:
@@ -272,8 +252,8 @@ def _find_turn_key_before_offset(transcript_path: Path, end_offset: int) -> str:
                     ):
                         continue
                     try:
-                        st = json.loads(stripped.decode("utf-8", errors="replace"))
-                    except json.JSONDecodeError:
+                        st = json.loads(user_words.decode_jsonl_line(stripped))
+                    except (ValueError, RecursionError):
                         continue
                     if isinstance(st, dict) and _is_turn_boundary_step(st):
                         s_idx = st.get("step_index", 0)
@@ -283,18 +263,6 @@ def _find_turn_key_before_offset(transcript_path: Path, end_offset: int) -> str:
     except OSError:
         pass
     return "turn_0_initial"
-
-
-def _is_turn_boundary_step(step: Dict[str, Any]) -> bool:
-    """识别回合起点：人类显式 USER_INPUT 或跨代理派发的非 system 消息"""
-    s_type = step.get("type", "")
-    if s_type == "USER_INPUT" or step.get("source") == "USER_EXPLICIT":
-        return True
-    if s_type == "SYSTEM_MESSAGE":
-        content = str(step.get("content") or "")
-        if "[Message]" in content and "sender=system" not in content:
-            return True
-    return False
 
 
 def extract_current_turn_latest_reply(transcript_path_str: Optional[str]) -> Tuple[str, Optional[int], str]:
@@ -354,49 +322,81 @@ def extract_current_turn_latest_reply(transcript_path_str: Optional[str]) -> Tup
     return turn_key, latest_step_idx, latest_text
 
 
-def _load_repeat_state(state_file: Path, conversation_id: str) -> Dict[str, Any]:
-    if state_file.exists():
-        try:
-            data = json.loads(state_file.read_text(encoding="utf-8"))
-            if (isinstance(data, dict) and data.get("version") == 2
-                    and data.get("conversationId") == conversation_id and isinstance(data.get("turns"), dict)):
-                return data
-            raise ValueError("状态格式或会话身份不符")
-        except (OSError, ValueError) as exc:
-            log_event("Stop:repeat_state_error", conversation_id, f"防重复状态读取失败（{exc}），保留原文件")
-            raise
-    return {"version": 2, "conversationId": conversation_id, "turns": {}}
+# ④ 短等待识别、数值标记与相邻回复相似度
+
+def is_short_status_reply(text: str) -> bool:
+    """判定回复是否属于无提问的短状态等待回复"""
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped or len(stripped) > MAX_SHORT_REPLY_CHARS:
+        return False
+
+    low = stripped.lower()
+    for qm in USER_DECISION_OR_QUESTION_MARKERS:
+        if qm in low:
+            return False
+
+    return any(kw in low for kw in WAIT_KEYWORDS)
 
 
-def _save_repeat_state(state_file: Path, state: Dict[str, Any], conversation_id: str) -> None:
-    state["version"] = 2
-    state["conversationId"] = conversation_id
-    state["updatedAt"] = get_current_iso_time()
-    user_words.atomic_write_json(state_file, state)
+def normalize_reply_text(text: str) -> str:
+    """归一化回复文本（去除标点与多余空白，但保留字母、汉字与数字以敏感识别迭代步数/残差变化）"""
+    low = text.strip().lower()
+    # 移除常见 ISO 时间戳如 2026-11-12T06:00:00 或 06:12:34，保留业务数值（步数、残差、百分比）
+    low = re.sub(r"\b\d{4}-\d{2}-\d{2}[t\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})?\b", "", low)
+    low = re.sub(r"\b\d{2}:\d{2}:\d{2}\b", "", low)
+    # 仅保留中英文字符、数字与科学计数法符号
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff.+-]+", " ", low)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def handle_stop_repeat_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """处理 Stop 事件防复读刷屏检测"""
-    conversation_id = str(payload.get("conversationId") or "unknown_session").strip()
-    termination_reason = str(payload.get("terminationReason") or "").strip().casefold()
+def _extract_number_tokens(norm_text: str) -> List[str]:
+    """提取归一化文本中的数值标记（如迭代步数 100、残差 1e-5、进度 45）"""
+    return re.findall(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?", norm_text)
 
-    # 1. 非正常无工具结束时直接放行
-    if (termination_reason not in ("model_stop", "no_tool_call") or payload.get("error")
-            or not user_words.valid_session_id(conversation_id)):
-        return {"decision": "allow"}
 
-    # 2. 官方防死循环协议规范：若当前回合已处于 Stop 钩子触发的续跑状态，立即放行，绝不循环唤醒
-    if payload.get("continuationActive") is True:
-        return {"decision": "allow"}
+def _strip_wait_boilerplate(norm_text: str) -> str:
+    """剥离通用等待套话词汇，提取短状态回复的核心任务主语"""
+    s = norm_text
+    for tok in WAIT_BOILERPLATE_TOKENS:
+        s = s.replace(tok, " ")
+    return re.sub(r"\s+", "", s).strip()
 
-    state_dir, _ = get_data_dirs()
-    try:
-        with user_words.session_state_lock(state_dir, conversation_id):
-            return _handle_stop_locked(payload, state_dir, conversation_id)
-    except (OSError, ValueError) as exc:
-        log_event("Stop:state_error", conversation_id, f"Stop 状态未更新（{exc}）")
-        return {"decision": "allow"}
 
+def are_replies_homogeneous(prev_norm: str, curr_norm: str) -> bool:
+    """
+    严格比对相邻两条短等待回复是否同质：
+    1. 归一化文本完全一致 -> 同质；
+    2. 若包含数值指标（如迭代步数、残差、完成度）且数值发生变化 -> 属于真实进展汇报，绝不判为复读；
+    3. 数值序列相同（或均无数值）时：
+       - 整句序列相似度 >= SIMILARITY_THRESHOLD，或
+        - 剥离通用等待套话后的核心主语一致 / 高度相似 -> 判为同质等待复读。
+    这里比较相邻短句的字符序列，不对长篇技术报告执行 N-gram 或段落去重。
+    """
+    if not prev_norm or not curr_norm:
+        return False
+    if prev_norm == curr_norm:
+        return True
+
+    prev_nums = _extract_number_tokens(prev_norm)
+    curr_nums = _extract_number_tokens(curr_norm)
+    if prev_nums != curr_nums:
+        return False
+
+    if difflib.SequenceMatcher(None, prev_norm, curr_norm).ratio() >= SIMILARITY_THRESHOLD:
+        return True
+
+    core_prev = _strip_wait_boilerplate(prev_norm)
+    core_curr = _strip_wait_boilerplate(curr_norm)
+    if core_prev == core_curr:
+        return True
+    if core_prev and core_curr:
+        return difflib.SequenceMatcher(None, core_prev, core_curr).ratio() >= CORE_SIMILARITY_THRESHOLD
+    return False
+
+
+# ⑤ Stop 交接终审与每回合一次的防重复提醒
 
 def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_id: str) -> Dict[str, Any]:
     turn_key, step_idx, latest_reply = extract_current_turn_latest_reply(payload.get("transcriptPath"))
@@ -477,14 +477,37 @@ def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_i
     return {"decision": "allow"}
 
 
+def handle_stop_repeat_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """处理 Stop 事件防复读刷屏检测"""
+    conversation_id = str(payload.get("conversationId") or "unknown_session").strip()
+    termination_reason = str(payload.get("terminationReason") or "").strip().casefold()
+
+    # 1. 非正常无工具结束时直接放行
+    if (termination_reason not in ("model_stop", "no_tool_call") or payload.get("error")
+            or not user_words.valid_session_id(conversation_id)):
+        return {"decision": "allow"}
+
+    # 2. 官方防死循环协议规范：若当前回合已处于 Stop 钩子触发的续跑状态，立即放行，绝不循环唤醒
+    if payload.get("continuationActive") is True:
+        return {"decision": "allow"}
+
+    state_dir, _ = get_data_dirs()
+    try:
+        with user_words.session_state_lock(state_dir, conversation_id):
+            return _handle_stop_locked(payload, state_dir, conversation_id)
+    except (OSError, ValueError) as exc:
+        log_event("Stop:state_error", conversation_id, f"Stop 状态未更新（{exc}）")
+        return {"decision": "allow"}
+
+
+# ⑥ 命令行主入口
+
 def main() -> None:
-    input_text = sys.stdin.read().strip()
     payload: Dict[str, Any] = {}
-    if input_text:
-        try:
-            payload = json.loads(input_text)
-        except Exception as e:
-            log_event("Stop:reply_repeat_guard", "unknown", f"Failed to parse stdin JSON: {e}")
+    try:
+        payload = user_words.read_hook_payload()
+    except (OSError, ValueError) as e:
+        log_event("Stop:reply_repeat_guard", "unknown", f"Failed to parse stdin JSON: {e}")
 
     try:
         response = handle_stop_repeat_guard(payload)

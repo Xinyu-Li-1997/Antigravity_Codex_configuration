@@ -8,12 +8,15 @@ user_words.py - 反重力与 Codex 双端会话用户原话纯标准库解析与
 4. 安全提取用户原始输入与交互式选项回答，按序格式化并原子写入会话原话归档 Markdown 文档。
 """
 
+# ① 常量、阈值与宿主依赖
+
 import contextlib
 import errno
 import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import time
 import uuid
@@ -21,6 +24,41 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
+MAX_HOOK_INPUT_CHARS = 8 * 1024 * 1024
+
+# 系统自动注入的伪消息特征（子代理消息筛选时排除）
+SYSTEM_NOISE_PATTERNS = (
+    "<EPHEMERAL_MESSAGE>",
+    "<CONVERSATION_SUMMARIES>",
+    "<TASK_NOTIFICATION>",
+    "The following system message was injected by a",
+    "[Notice] All your subagents and background tasks have been stopped",
+)
+
+TOOL_TIMING_HEADER_RE = re.compile(
+    r"^(?:(?:Created|Completed) At:\s*[^\r\n]+\r?\n)+",
+    re.MULTILINE,
+)
+
+MARKDOWN_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
+GOAL_START_RE = re.compile(r"^/goal(?:\s|$)", re.IGNORECASE)
+GOAL_CANCEL_RE = re.compile(r"^(?:请)?(?:取消|停止|结束|关闭)\s*/?goal\b", re.IGNORECASE)
+
+# Codex Rollout 会话记录解析与归档 (供 --client codex 在 compact/resume 时调用)
+
+CODEX_META_HEAD_BYTES = 65536
+CODEX_MAIN_SOURCES = {"cli", "vscode", "exec", "mcp", "desktop", "app_server"}
+CODEX_SYSTEM_PROVENANCE = {"harness", "agents_md"}
+CODEX_ATTACHMENTS = {"input_image": "图片", "input_audio": "音频", "input_file": "文件"}
+CODEX_ARCHIVE_FORMAT = "user-guard-codex-v2"
+CODEX_LEGACY_ARCHIVE_FORMAT = "user-guard-codex-v1"
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+MAX_LOG_BYTES = 2 * 1024 * 1024
+TRIM_LOG_BYTES = 1 * 1024 * 1024
+
+
+# ② 标准流协议、数据目录与原子状态事务
 
 def ensure_utf8_stdio() -> None:
     """全平台强制标准流为 UTF-8 编码，消除 Windows GBK 管道及 POSIX C locale 编解码崩溃"""
@@ -29,11 +67,35 @@ def ensure_utf8_stdio() -> None:
         if stream is not None and hasattr(stream, "reconfigure"):
             try:
                 stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
+            except (OSError, ValueError):
                 pass
 
 
 ensure_utf8_stdio()
+
+
+def read_hook_payload() -> Dict[str, Any]:
+    """宿主以 EOF 结束一次 JSON 请求；交互终端不等待，管道输入限制体积。"""
+    if sys.stdin.isatty():
+        return {}
+    raw = sys.stdin.read(MAX_HOOK_INPUT_CHARS + 1)
+    if len(raw) > MAX_HOOK_INPUT_CHARS:
+        raise ValueError("钩子输入超过 8 Mi 字符上限")
+    raw = raw.lstrip("\ufeff").strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except RecursionError as exc:
+        raise ValueError("钩子输入嵌套过深") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("钩子输入必须为 JSON 对象")
+    return payload
+
+
+def decode_jsonl_line(raw: bytes) -> str:
+    """只去掉行首 BOM；严格解码，避免把坏字节替换后误报为完整原话。"""
+    return raw.decode("utf-8-sig").strip()
 
 
 def resolve_data_dirs(hooks_dir: Path) -> Tuple[Path, Path]:
@@ -67,18 +129,25 @@ def resolve_compact_transcript_path(raw_path: Path) -> Path:
     return raw_path
 
 
+def valid_session_id(value: str) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9_-]{1,160}", value))
+
+
 def atomic_write_text(target_path: Path, content: str) -> None:
     """使用同目录临时文件 + fsync + os.replace 原子更新文件，防止并发或中断产生半截损坏文件"""
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target_path.with_name(f".{target_path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    tmp_path = target_path.with_name(f".{target_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    created = False
     try:
-        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        with open(tmp_path, "x", encoding="utf-8", newline="\n") as f:
+            created = True
             f.write(content)
             f.flush()
             try:
                 os.fsync(f.fileno())
-            except OSError:
-                pass
+            except OSError as exc:
+                if exc.errno not in (errno.EINVAL, errno.ENOSYS):
+                    raise
         for attempt in range(5):
             try:
                 os.replace(tmp_path, target_path)
@@ -89,7 +158,8 @@ def atomic_write_text(target_path: Path, content: str) -> None:
                 time.sleep(0.01)
     finally:
         try:
-            tmp_path.unlink(missing_ok=True)
+            if created:
+                tmp_path.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -100,10 +170,6 @@ def atomic_write_json(target_path: Path, data: Dict[str, Any]) -> None:
     atomic_write_text(target_path, text)
 
 
-def valid_session_id(value: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z0-9_-]{1,160}", value))
-
-
 @contextlib.contextmanager
 def session_state_lock(state_dir: Path, session_id: str, timeout_sec: float = 1.5) -> Iterator[None]:
     """串行化同会话状态事务。锁文件作为稳定锚点，进程退出由内核释放锁。"""
@@ -111,10 +177,15 @@ def session_state_lock(state_dir: Path, session_id: str, timeout_sec: float = 1.
         raise ValueError("会话标识缺失或不合法")
     state_dir.mkdir(parents=True, exist_ok=True)
     path = state_dir / f".{session_id}.lock"
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     deadline = time.monotonic() + timeout_sec
     token = uuid.uuid4().hex.encode("ascii")
     try:
+        opened = os.fstat(fd)
+        anchor = path.lstat()
+        if (not stat.S_ISREG(anchor.st_mode) or opened.st_nlink != 1
+                or (anchor.st_dev, anchor.st_ino) != (opened.st_dev, opened.st_ino)):
+            raise OSError(errno.EINVAL, "会话锁必须为独立普通文件", str(path))
         while True:
             try:
                 if os.name == "nt":
@@ -139,27 +210,55 @@ def session_state_lock(state_dir: Path, session_id: str, timeout_sec: float = 1.
         try:
             yield
         finally:
-            os.lseek(fd, 1, os.SEEK_SET)
-            if os.read(fd, len(token)) == token:
-                os.ftruncate(fd, 1)
+            # 清理锁内元数据失败也要关闭描述符，且不能遮盖事务本身的异常。
+            with contextlib.suppress(OSError):
+                os.lseek(fd, 1, os.SEEK_SET)
+                if os.read(fd, len(token)) == token:
+                    os.ftruncate(fd, 1)
     finally:
         os.close(fd)
 
 
-# 系统自动注入的伪消息特征（子代理消息筛选时排除）
-SYSTEM_NOISE_PATTERNS = (
-    "<EPHEMERAL_MESSAGE>",
-    "<CONVERSATION_SUMMARIES>",
-    "<TASK_NOTIFICATION>",
-    "The following system message was injected by a",
-    "[Notice] All your subagents and background tasks have been stopped",
-)
+def current_iso_time() -> str:
+    """返回带本机时区偏移的 ISO-8601 时间戳"""
+    return datetime.now(timezone.utc).astimezone().isoformat()
 
-TOOL_TIMING_HEADER_RE = re.compile(
-    r"^(?:(?:Created|Completed) At:\s*[^\r\n]+\r?\n)+",
-    re.MULTILINE,
-)
 
+def append_jsonl_log(log_path: Path, entry: Dict[str, Any]) -> None:
+    """日志共用独立锁；裁剪仅读尾部，避免大会话日志全量入内存或并发丢行。"""
+    try:
+        row = json.dumps(entry, ensure_ascii=False) + "\n"
+        lock_id = "log-" + hashlib.sha256(_canonical_path_key(log_path).encode("utf-8")).hexdigest()[:24]
+        with session_state_lock(log_path.parent, lock_id):
+            if log_path.exists() and log_path.stat().st_size > MAX_LOG_BYTES:
+                with log_path.open("rb") as stream:
+                    stream.seek(-TRIM_LOG_BYTES, os.SEEK_END)
+                    stream.readline()  # 丢掉裁剪边界上的半行。
+                    tail = stream.read(TRIM_LOG_BYTES)
+                atomic_write_text(log_path, tail.decode("utf-8", errors="replace"))
+            with log_path.open("a", encoding="utf-8", newline="\n") as stream:
+                stream.write(row)
+    except (OSError, ValueError, TypeError, RecursionError):
+        # 日志不应影响主协议；状态事务的异常由调用方另行处理。
+        pass
+
+
+def append_lifecycle_log(
+    hooks_dir: Path,
+    event_name: str,
+    conversation_id: str,
+    message: str,
+    payload_summary: Optional[Dict[str, Any]] = None,
+) -> None:
+    """向 logs/lifecycle.log 追加结构化 JSONL 日志，附带 2MB 自动滚动裁剪防无限膨胀"""
+    _, logs_dir = resolve_data_dirs(hooks_dir)
+    append_jsonl_log(logs_dir / "lifecycle.log", {
+        "timestamp": current_iso_time(), "event": event_name,
+        "conversationId": conversation_id, "message": message, "summary": payload_summary or {},
+    })
+
+
+# ③ 用户正文、控制指令与 Markdown 归档格式
 
 def _extract_outer_user_request(text: str) -> Optional[str]:
     """
@@ -182,8 +281,11 @@ def _extract_outer_user_request(text: str) -> Optional[str]:
     body_start = start_idx + len(open_tag)
     end_idx = text.rfind(close_tag, body_start)
     while end_idx >= body_start:
-        trailer = text[end_idx + len(close_tag):].lstrip()
-        if not trailer or trailer.startswith(("<ADDITIONAL_METADATA>", "<USER_SETTINGS_CHANGE>")):
+        # 只移动索引，不反复复制越来越长的后缀，避免多闭标签输入退化为平方耗时。
+        trailer_idx = end_idx + len(close_tag)
+        while trailer_idx < len(text) and text[trailer_idx].isspace():
+            trailer_idx += 1
+        if trailer_idx == len(text) or text.startswith(("<ADDITIONAL_METADATA>", "<USER_SETTINGS_CHANGE>"), trailer_idx):
             return text[body_start:end_idx].strip()
         end_idx = text.rfind(close_tag, body_start, end_idx)
     return text[body_start:].strip()
@@ -222,11 +324,6 @@ def clean_user_content(raw_content: str, step_type: str = "USER_INPUT") -> str:
     return ""
 
 
-MARKDOWN_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
-GOAL_START_RE = re.compile(r"^/goal(?:\s|$)", re.IGNORECASE)
-GOAL_CANCEL_RE = re.compile(r"^(?:请)?(?:取消|停止|结束|关闭)\s*/?goal\b", re.IGNORECASE)
-
-
 def agy_goal_command(text: str) -> Optional[bool]:
     if GOAL_CANCEL_RE.match(text):
         return False
@@ -257,6 +354,57 @@ def has_goal_cancel_marker(text: str) -> bool:
     return bool(lines and lines[-1] == marker and list(markdown_unquoted_lines(text.rstrip()))[-1] == marker)
 
 
+def format_user_words_markdown(conversation_id: str, words: List[Dict[str, Any]],
+                               issues: Optional[List[str]] = None) -> str:
+    """将提取出的用户原话格式化为持久留痕 Markdown 文档"""
+    lines = [
+        "# 会话用户原话归档",
+        "",
+        f"- **Conversation ID**: `{conversation_id}`",
+        f"- **累计指令轮数**: {len(words)}",
+    ]
+    if issues:
+        lines.extend(["- 归档状态：存在缺口，未核实完整性", *[f"  - {issue}" for issue in issues]])
+    lines.extend(["", "---", ""])
+
+    for w in words:
+        time_str = f" ({w['created_at']})" if w.get("created_at") else ""
+        kind_tag = ""
+        if w.get("kind") == "ask_question_answer":
+            kind_tag = " [选项框回答]"
+        elif w.get("kind") == "subagent_message":
+            kind_tag = " [父代理任务]"
+        if w.get("truncated"):
+            kind_tag += " [截断正文待补]"
+        if w.get("provenance_verified") is False:
+            kind_tag += " [用户角色，来源未核实]"
+        lines.append(f"## 第 {w['turn']} 轮指令 [Step {w['step_index']}]{kind_tag}{time_str}")
+        if w.get("attachments") and w.get("source_path"):
+            lines.append(f"来源分段：`{w['source_path']}`")
+        lines.append("")
+        lines.append(w["content"])
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def save_user_words_markdown(state_dir: Path, conversation_id: str, words: List[Dict[str, Any]],
+                             issues: Optional[List[str]] = None) -> Optional[Path]:
+    """将用户原话列表原子保存至 state/<conversationId>_user_words.md"""
+    if not words:
+        return None
+    if not valid_session_id(conversation_id):
+        raise ValueError("会话标识缺失或不合法")
+    out_file = state_dir / f"{conversation_id}_user_words.md"
+    md_text = format_user_words_markdown(conversation_id, words, issues)
+    atomic_write_text(out_file, md_text)
+    return out_file
+
+
+# ④ Antigravity JSONL 解析与截断正文回查
+
 def _load_truncated_contents_map(full_transcript_path: Path, needed_indices: Set[int]) -> Dict[int, str]:
     """
     单次线性扫描 transcript_full.jsonl，按需补全所有被截断步骤的完整 content。
@@ -268,7 +416,7 @@ def _load_truncated_contents_map(full_transcript_path: Path, needed_indices: Set
 
     remaining = set(needed_indices)
     try:
-        with open(full_transcript_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(full_transcript_path, "rb") as f:
             for line in f:
                 if not remaining:
                     break
@@ -276,10 +424,13 @@ def _load_truncated_contents_map(full_transcript_path: Path, needed_indices: Set
                 if not line:
                     continue
                 try:
-                    step = json.loads(line)
-                except json.JSONDecodeError:
+                    step = json.loads(decode_jsonl_line(line))
+                except (ValueError, RecursionError):
                     continue
-                if not isinstance(step, dict) or "content" in (step.get("truncated_fields") or []):
+                if not isinstance(step, dict):
+                    continue
+                truncated = step.get("truncated_fields")
+                if isinstance(truncated, list) and "content" in truncated:
                     continue
                 idx = step.get("step_index")
                 if isinstance(idx, int) and idx in remaining:
@@ -287,7 +438,7 @@ def _load_truncated_contents_map(full_transcript_path: Path, needed_indices: Set
                     if isinstance(content, str):
                         resolved[idx] = content
                         remaining.discard(idx)
-    except Exception:
+    except OSError:
         pass
 
     return resolved
@@ -299,13 +450,13 @@ def _ask_question_title(call: Dict[str, Any]) -> str:
     if isinstance(args, str):
         try:
             args = json.loads(args)
-        except ValueError:
+        except (ValueError, RecursionError):
             args = None
     qs = args.get("questions") if isinstance(args, dict) else None
     if isinstance(qs, str):
         try:
             qs = json.loads(qs)
-        except ValueError:
+        except (ValueError, RecursionError):
             qs = None
     if isinstance(qs, list):
         for q in qs:
@@ -361,8 +512,8 @@ def extract_agy_archive(
                 if not line:
                     continue
                 try:
-                    step = json.loads(line)
-                except (ValueError, UnicodeDecodeError):
+                    step = json.loads(decode_jsonl_line(line))
+                except (ValueError, RecursionError):
                     result["issues"].append(f"{transcript_path.name} 第 {line_num + 1} 行未能解析")
                     continue
                 if not isinstance(step, dict):
@@ -517,74 +668,24 @@ def extract_user_words(
     return words
 
 
-def format_user_words_markdown(conversation_id: str, words: List[Dict[str, Any]],
-                               issues: Optional[List[str]] = None) -> str:
-    """将提取出的用户原话格式化为持久留痕 Markdown 文档"""
-    lines = [
-        "# 会话用户原话归档",
-        "",
-        f"- **Conversation ID**: `{conversation_id}`",
-        f"- **累计指令轮数**: {len(words)}",
-    ]
-    if issues:
-        lines.extend(["- 归档状态：存在缺口，未核实完整性", *[f"  - {issue}" for issue in issues]])
-    lines.extend(["", "---", ""])
-
-    for w in words:
-        time_str = f" ({w['created_at']})" if w.get("created_at") else ""
-        kind_tag = ""
-        if w.get("kind") == "ask_question_answer":
-            kind_tag = " [选项框回答]"
-        elif w.get("kind") == "subagent_message":
-            kind_tag = " [父代理任务]"
-        if w.get("truncated"):
-            kind_tag += " [截断正文待补]"
-        if w.get("provenance_verified") is False:
-            kind_tag += " [用户角色，来源未核实]"
-        lines.append(f"## 第 {w['turn']} 轮指令 [Step {w['step_index']}]{kind_tag}{time_str}")
-        if w.get("attachments") and w.get("source_path"):
-            lines.append(f"来源分段：`{w['source_path']}`")
-        lines.append("")
-        lines.append(w["content"])
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-def save_user_words_markdown(state_dir: Path, conversation_id: str, words: List[Dict[str, Any]],
-                             issues: Optional[List[str]] = None) -> Optional[Path]:
-    """将用户原话列表原子保存至 state/<conversationId>_user_words.md"""
-    if not words:
-        return None
-    out_file = state_dir / f"{conversation_id}_user_words.md"
-    md_text = format_user_words_markdown(conversation_id, words, issues)
-    atomic_write_text(out_file, md_text)
-    return out_file
-
-
-# ==============================================================================
-# Codex Rollout 会话记录解析与归档 (供 --client codex 在 compact/resume 时调用)
-# ==============================================================================
-
-CODEX_META_HEAD_BYTES = 65536
-CODEX_MAIN_SOURCES = {"cli", "vscode", "exec", "mcp", "desktop", "app_server"}
-CODEX_SYSTEM_PROVENANCE = {"harness", "agents_md"}
-CODEX_ATTACHMENTS = {"input_image": "图片", "input_audio": "音频", "input_file": "文件"}
-CODEX_ARCHIVE_FORMAT = "user-guard-codex-v2"
-CODEX_LEGACY_ARCHIVE_FORMAT = "user-guard-codex-v1"
-SHA256_RE = re.compile(r"[0-9a-f]{64}")
-
+# ⑤ Codex 路径、主会话身份与分段发现
 
 def strip_win_extended_prefix(path_str: str) -> str:
     """剥离 Windows \\\\?\\ 扩展长度路径前缀，统一跨端路径比较与读取"""
     raw = str(path_str or "").strip()
-    if raw.startswith("\\\\?\\UNC\\"):
+    if raw[:8].casefold() == "\\\\?\\unc\\":
         return "\\\\" + raw[8:]
     if raw.startswith("\\\\?\\"):
         return raw[4:]
     return raw
+
+
+def _canonical_path_key(p: Path) -> str:
+    try:
+        s = str(p.resolve())
+    except (OSError, RuntimeError, ValueError):
+        s = os.path.abspath(str(p))
+    return s.casefold() if os.name == "nt" else s
 
 
 def read_codex_rollout_meta(rollout_path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -620,7 +721,7 @@ def read_codex_rollout_meta(rollout_path: Path) -> Tuple[Optional[Dict[str, Any]
         else:
             source_kind = "unknown"
         return {"id": sid.strip(), "cwd": str(cwd), "source_kind": source_kind}, None
-    except Exception as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         return None, f"读取 Codex 会话元数据失败 ({rollout_path}): {exc}"
 
 
@@ -683,14 +784,6 @@ def _scan_codex_home_rollouts(codex_root: Path) -> List[Path]:
     return candidates
 
 
-def _canonical_path_key(p: Path) -> str:
-    try:
-        s = str(p.resolve())
-    except OSError:
-        s = os.path.abspath(str(p))
-    return s.casefold() if os.name == "nt" else s
-
-
 def discover_codex_session_segments(
     transcript_path_str: str,
     session_id: Optional[str] = None,
@@ -749,6 +842,8 @@ def discover_codex_session_segments(
     segments.sort(key=lambda p: (p.name, str(p)))
     return segments, sid, issues
 
+
+# ⑥ Codex 来源合并、完整性校验与归档发布
 
 def _extract_codex_record(
     entry: Dict[str, Any],
@@ -897,8 +992,9 @@ def extract_codex_session_words(
         line_counter = 0
 
         try:
-            initial_size = seg_path.stat().st_size
             with open(seg_path, "rb") as f:
+                before = os.fstat(f.fileno())
+                initial_size = before.st_size
                 for raw_line in f:
                     line_counter += 1
                     if not raw_line.strip():
@@ -906,8 +1002,8 @@ def extract_codex_session_words(
                         digest.update(raw_line)
                         continue
                     try:
-                        entry = json.loads(raw_line)
-                    except (ValueError, UnicodeDecodeError):
+                        entry = json.loads(decode_jsonl_line(raw_line))
+                    except (ValueError, RecursionError):
                         if not raw_line.endswith(b"\n"):
                             issues.append(f"末尾存在未写完记录: {seg_path.name}")
                             break
@@ -936,9 +1032,15 @@ def extract_codex_session_words(
                             continue
                         indices.append(len(records))
                     records.append(record)
+                after = os.fstat(f.fileno())
             if bad_lines:
                 issues.append(f"存在损坏 JSON 行 ({bad_lines} 行): {seg_path.name}")
-            if offset != initial_size or seg_path.stat().st_size != initial_size:
+            current = seg_path.stat()
+            if (offset != initial_size
+                    or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                    != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                    or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+                    != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
                 issues.append(f"读取时分段未稳定或不完整: {seg_path.name}")
             sources.append(
                 {
@@ -996,7 +1098,7 @@ def _read_codex_publication(md_path: Path, meta_path: Path, sid: str) -> Dict[st
     saved["available"] = True
     digest = saved["body_sha256"]
     try:
-        manifest = json.loads(meta_path.read_text(encoding="utf-8"))
+        manifest = json.loads(meta_path.read_text(encoding="utf-8-sig"))
         if not isinstance(manifest, dict):
             raise ValueError
         sources = manifest.get("sources")
@@ -1021,11 +1123,12 @@ def _read_codex_publication(md_path: Path, meta_path: Path, sid: str) -> Dict[st
                 or not isinstance(source.get("sha256"), str) or not SHA256_RE.fullmatch(source["sha256"])
                 or type(source.get("complete_offset")) is not int or type(source.get("observed_size")) is not int
                 or source["complete_offset"] < 0 or source["observed_size"] < 0
+                or source["complete_offset"] > source["observed_size"]
                 or (not legacy and complete and source["complete_offset"] != source["observed_size"])
                 or (legacy and source["complete_offset"] == 0)
             ):
                 raise ValueError
-    except (ValueError, OSError, UnicodeDecodeError):
+    except (ValueError, OSError, RecursionError):
         saved["issue"] = "校验清单格式无效或无法读取，归档完整性未验证"
         return saved
     if manifest["sha256"] != digest:
@@ -1050,7 +1153,8 @@ def _missing_codex_source_coverage(previous: List[Dict[str, Any]], current: List
     for old in previous:
         key = _canonical_path_key(Path(old["path"]))
         same_path = indexed.get(key)
-        candidates = [same_path] if same_path is not None else current
+        candidates = ([same_path] + [item for item in current if item is not same_path]
+                      if same_path is not None else current)
         length = old["complete_offset"]
         for candidate in candidates:
             if candidate["complete_offset"] < length:
@@ -1163,46 +1267,3 @@ def refresh_codex_session_archive(
         "meta_path": str(meta_path),
         "segments": parsed["segments"],
     }
-
-
-MAX_LOG_BYTES = 2 * 1024 * 1024
-TRIM_LOG_BYTES = 1 * 1024 * 1024
-
-
-def current_iso_time() -> str:
-    """返回带本机时区偏移的 ISO-8601 时间戳"""
-    return datetime.now(timezone.utc).astimezone().isoformat()
-
-
-def append_lifecycle_log(
-    hooks_dir: Path,
-    event_name: str,
-    conversation_id: str,
-    message: str,
-    payload_summary: Optional[Dict[str, Any]] = None,
-) -> None:
-    """向 logs/lifecycle.log 追加结构化 JSONL 日志，附带 2MB 自动滚动裁剪防无限膨胀"""
-    try:
-        _, logs_dir = resolve_data_dirs(hooks_dir)
-        logs_dir.mkdir(parents=True, exist_ok=True)
-        log_file = logs_dir / "lifecycle.log"
-
-        if log_file.exists() and log_file.stat().st_size > MAX_LOG_BYTES:
-            raw = log_file.read_bytes()
-            tail = raw[-TRIM_LOG_BYTES:]
-            nl = tail.find(b"\n")
-            if nl != -1:
-                tail = tail[nl + 1 :]
-            atomic_write_text(log_file, tail.decode("utf-8", errors="replace"))
-
-        log_entry = {
-            "timestamp": current_iso_time(),
-            "event": event_name,
-            "conversationId": conversation_id,
-            "message": message,
-            "summary": payload_summary or {},
-        }
-        with open(log_file, "a", encoding="utf-8", newline="\n") as f:
-            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
