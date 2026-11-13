@@ -16,16 +16,14 @@ Antigravity 适配保留原有遥测与门禁；Codex 独立入口默认仅观�
 """
 
 import argparse
-import contextlib
 import hashlib
 import json
 import os
 import re
 import shlex
 import sys
-import time
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, ContextManager, Dict, List, Optional, Tuple
 
 HOOKS_DIR = Path(__file__).resolve().parent
 if str(HOOKS_DIR) not in sys.path:
@@ -38,7 +36,7 @@ user_words.ensure_utf8_stdio()
 DEFAULT_DRAIN_INVOCATIONS = 4
 DEFAULT_DRAIN_ACTIONS = 8
 
-# 遥测阈值（基于多组真实长会话与图片洪泛轨迹标定）
+# 遥测阈值是项目收口策略的启发式参数，不能据此推断模型的上下文容量。
 ADVISORY_CP_THRESHOLD = 11
 ADVISORY_TRANSCRIPT_BYTES = 4 * 1024 * 1024
 ADVISORY_THRASH_MIN_CP = 6
@@ -56,7 +54,7 @@ DRAIN_MEDIA_MIN_CP = 6
 DRAIN_IMAGE_CALLS = 65
 DRAIN_IMAGE_BYTES = 100 * 1024 * 1024
 
-# UI Banner 文本与 Turn-1 合理性最低门槛（防纯提问贴报错文本时误锁死）
+# 用户直接报告 UI 告警时，另检查现有轨迹是否达到最低遥测门槛。
 UI_BANNER_PHRASE = "this conversation grew too large, so the history before this point may be missing or incomplete"
 BANNER_PLAUSIBLE_CP = 2
 BANNER_PLAUSIBLE_STEP = 120
@@ -71,14 +69,22 @@ MAX_TRACKED_IMAGES = 2000
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
-# 显式 R8 暂缓 / 继续指令（明确排除“处理好交接”类要求执行交接的指令）
-OVERRIDE_POSITIVE_RE = re.compile(
+OVERRIDE_COMMAND = (
     r"(?:暂不交接|先不交接|先别交接|不用交接|不要交接|取消交接|解除交接|暂缓交接|跳过交接|"
-    r"先继续(?:当前|完成|执行)|继续当前对话|不用开新对话|先别停|继续往下做)",
-    re.IGNORECASE,
+    r"先继续(?:当前|完成|执行)|继续当前对话|不用开新对话|先别停|继续往下做)"
 )
-OVERRIDE_NEGATIVE_RE = re.compile(
-    r"(?:处理好交接|做好交接|整理交接|开始交接|准备交接|立即交接|完成交接)",
+AGY_OVERRIDE_REQUEST_RE = re.compile(
+    r"(?:请(?:你)?)?(?:" + OVERRIDE_COMMAND + r"|继续当前对话(?:做完|完成)这一批)"
+    r"(?:[，,、]\s*(?:请(?:你)?)?(?:" + OVERRIDE_COMMAND + r"|继续当前对话(?:做完|完成)这一批))*[。.!！]*",
+)
+AGY_HANDOFF_REQUEST_RE = re.compile(
+    r"(?:/handoff|(?:请(?:你)?)?(?:立即)?(?:处理好交接|(?:整理|开始|准备|完成|做好|立即|执行)交接)"
+    r"(?:并|后)?(?:停机|停止|结束当前对话)?)[。.!！]*",
+)
+AGY_BANNER_REPORT_RE = re.compile(
+    r"(?:我(?:刚才|刚刚)?(?:看到|收到)|(?:界面|宿主|客户端|对话)(?:刚才|刚刚)?(?:显示|出现|提示))"
+    r"(?:了)?(?:界面|系统|截断|上下文|会话|UI|\s)*(?:告警|提示|报错)?\s*[:：]\s*[“\"‘']?"
+    + re.escape(UI_BANNER_PHRASE) + r"[.。]?[”\"’']?[.。!！]*",
     re.IGNORECASE,
 )
 
@@ -96,6 +102,15 @@ PROMPT_MARKER_RE = re.compile(
 )
 
 DELEGATION_TOOLS = {"invoke_subagent", "define_subagent", "swarm", "schedule"}
+AGY_TOOL_ALIASES = {
+    "view_file": "read_file",
+    "write_to_file": "write_file",
+    "replace_file_content": "edit_file",
+    "multi_replace_file_content": "edit_file",
+}
+AGY_INSPECTION_TOOLS = {"list_dir", "list_directory", "view_file_outline", "view_code_item", "grep_search",
+                        "find_by_name", "search_files", "manage_task", "manage_subagents", "ask_question", "finish"}
+MEDIA_TOOLS = {"generate_image", "imagegen", "view_image", "open_image"}
 
 READONLY_BINARIES = {
     "ls",
@@ -138,21 +153,24 @@ def default_gate_state(conversation_id: str) -> Dict[str, Any]:
     """生成初始长会话交接门禁状态"""
     return {
         "version": 1,
-        "gateSchemaVersion": 2,
+        "gateSchemaVersion": 3,
         "conversationId": conversation_id,
         "phase": "normal",
         "triggers": [],
         "bannerDetectedAtStep": None,
         "bannerTriggerTurnHash": "",
+        "bannerTriggerHostStep": -1,
         "enteredDrainAtStep": None,
         "enteredFreezeAtStep": None,
         "drainInvocationsRemaining": DEFAULT_DRAIN_INVOCATIONS,
         "drainActionsRemaining": DEFAULT_DRAIN_ACTIONS,
         "handoffFilesTouched": [],
+        "handoffFileBaselines": {},
         "imageReads": {},
         "imageReadCallCount": 0,
         "isGoalActive": False,
         "overriddenTurnHash": "",
+        "handoffRequestTurnHash": "",
         "overrideUntilCheckpoint": -1,
         "overrideUntilStep": -1,
         "stopGateBlockedTurnKeys": [],
@@ -175,24 +193,24 @@ def load_gate_state(state_dir: Path, conversation_id: str) -> Dict[str, Any]:
         return default
     try:
         raw = json.loads(state_file.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            return default
+        if (not isinstance(raw, dict) or raw.get("conversationId") != conversation_id
+                or raw.get("version") != 1):
+            raise ValueError("门禁状态格式或身份错误")
         merged = dict(default)
         merged.update(raw)
         merged["gateSchemaVersion"] = int(raw.get("gateSchemaVersion", 1))
-        if not isinstance(merged.get("triggers"), list):
-            merged["triggers"] = []
-        if not isinstance(merged.get("handoffFilesTouched"), list):
-            merged["handoffFilesTouched"] = []
-        if not isinstance(merged.get("imageReads"), dict):
-            merged["imageReads"] = {}
-        if not isinstance(merged.get("stopGateBlockedTurnKeys"), list):
-            merged["stopGateBlockedTurnKeys"] = []
-        if not isinstance(merged.get("lastAdvisoryTriggers"), list):
-            merged["lastAdvisoryTriggers"] = []
+        for key in ("triggers", "handoffFilesTouched", "handoffFileBaselines", "imageReads", "stopGateBlockedTurnKeys",
+                    "lastAdvisoryTriggers", "drainInvocationsRemaining", "drainActionsRemaining",
+                    "imageReadCallCount", "overrideUntilCheckpoint", "overrideUntilStep", "bannerTriggerHostStep"):
+            if type(merged[key]) is not type(default[key]):
+                raise ValueError(f"门禁状态字段 {key} 格式错误")
+        if merged["phase"] not in ("normal", "advisory", "drain", "freeze", "overridden"):
+            raise ValueError("未知的门禁阶段")
         return merged
-    except Exception:
-        return default
+    except (TypeError, ValueError, OSError) as exc:
+        user_words.append_lifecycle_log(HOOKS_DIR, "HandoffGate:state_error", conversation_id,
+                                        f"门禁状态读取失败（{exc}），保留原文件")
+        raise
 
 
 def save_gate_state(state_dir: Path, conversation_id: str, gate_state: Dict[str, Any]) -> None:
@@ -209,41 +227,10 @@ def consume_drain_action(gate_state: Dict[str, Any]) -> bool:
     return remaining == 0
 
 
-@contextlib.contextmanager
 def _gate_state_lock(state_dir: Path, conversation_id: str, timeout_sec: float = 1.5,
-                     strict: bool = False) -> Iterator[None]:
-    """轻量会话级独占文件锁，防止并发 PreToolUse / PreInvocation / Stop 发生状态读-改-写覆盖丢失"""
-    state_dir.mkdir(parents=True, exist_ok=True)
-    safe_cid = re.sub(r"[^A-Za-z0-9_.-]+", "_", conversation_id) or "unknown"
-    lock_path = state_dir / f".{safe_cid}_handoff_gate.lock"
-    acquired = False
-    deadline = time.monotonic() + timeout_sec
-    while time.monotonic() < deadline:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-            os.close(fd)
-            acquired = True
-            break
-        except FileExistsError:
-            try:
-                if time.time() - lock_path.stat().st_mtime > 10.0:
-                    lock_path.unlink(missing_ok=True)
-                    continue
-            except OSError:
-                pass
-            time.sleep(0.005)
-        except OSError:
-            break
-    if strict and not acquired:
-        raise TimeoutError("未取得会话状态锁，本次不更新门禁状态")
-    try:
-        yield
-    finally:
-        if acquired:
-            try:
-                lock_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+                     strict: bool = False) -> ContextManager[None]:
+    """保留既有测试和调用入口，两种模式均须持锁才可进入事务。"""
+    return user_words.session_state_lock(state_dir, conversation_id, timeout_sec)
 
 
 def is_image_path(path_str: str) -> bool:
@@ -293,7 +280,7 @@ def record_image_read(
     workspace_paths: Optional[List[str]] = None,
     increment_calls: bool = True,
 ) -> Tuple[int, int]:
-    """登记单次图片读取并统计去重后的总图片数与磁盘字节总量"""
+    """登记 PreToolUse 图片请求，文件大小用于估算可能增加的图片负载。"""
     if increment_calls:
         gate_state["imageReadCallCount"] = int(gate_state.get("imageReadCallCount", 0)) + 1
 
@@ -343,20 +330,19 @@ def _merge_telemetry(
             except OSError:
                 transcript_bytes = 0
 
-    # 将 transcript 中扫到的新增图片路径同步入 gate_state["imageReads"]
-    scanned_imgs = compaction_state.get("transcriptImageSizes")
-    img_map: Dict[str, int] = gate_state.setdefault("imageReads", {})
-    if isinstance(scanned_imgs, dict):
-        for k, sz in scanned_imgs.items():
-            if len(img_map) >= MAX_TRACKED_IMAGES:
-                break
-            if k not in img_map or (int(sz or 0) > int(img_map.get(k, 0))):
-                img_map[k] = int(sz or 0)
+    recorded_imgs = compaction_state.get("transcriptImageSizes") or {}
+    img_map: Dict[str, int] = {}
+    for source in (recorded_imgs, compaction_state.get("transcriptImageAttemptSizes") or {}, gate_state["imageReads"]):
+        for key, size in source.items():
+            if isinstance(size, int) and size >= 0 and (key in img_map or len(img_map) < MAX_TRACKED_IMAGES):
+                img_map[key] = max(size, img_map.get(key, 0))
 
     comp_img_calls = int(compaction_state.get("transcriptImageCallCount", 0))
     gate_img_calls = int(gate_state.get("imageReadCallCount", 0))
-    image_call_count = max(comp_img_calls, gate_img_calls, len(img_map))
-    total_image_bytes = sum(int(v) for v in img_map.values() if isinstance(v, (int, float)))
+    result_count = int(compaction_state.get("transcriptImageResultCount", 0))
+    image_attempt_count = max(comp_img_calls, gate_img_calls)
+    image_call_count = max(image_attempt_count, result_count, len(img_map))
+    total_image_bytes = sum(img_map.values())
     media_step_count = int(compaction_state.get("mediaStepCount", 0))
 
     latest_step = max(
@@ -372,24 +358,36 @@ def _merge_telemetry(
         "mediaStepCount": media_step_count,
         "uniqueImageCount": len(img_map),
         "imageCallCount": image_call_count,
+        "imageAttemptCount": image_attempt_count,
+        "imageResultCount": result_count,
+        "recordedImageBytes": sum(v for v in recorded_imgs.values() if isinstance(v, int) and v >= 0),
         "totalImageBytes": total_image_bytes,
         "latestStep": latest_step,
         "latestUserInputHash": str(compaction_state.get("latestUserInputHash") or ""),
         "latestUserInputPreview": str(compaction_state.get("latestUserInputPreview") or ""),
+        "latestUserHandoffIntent": compaction_state.get("latestUserHandoffIntent"),
+        "latestHandoffStepIndex": compaction_state.get("latestHandoffStepIndex"),
+        "latestHandoffInputHash": compaction_state.get("latestHandoffInputHash"),
+        "latestUserBannerReport": compaction_state.get("latestUserBannerReport"),
         "latestUserStepIndex": int(compaction_state.get("latestUserStepIndex", -1)),
+        "hostBannerStep": int(compaction_state.get("hostBannerStep", -1)),
         "isGoalActive": bool(compaction_state.get("isGoalActive", False)),
     }
 
 
-def _has_user_override(user_text: str) -> bool:
-    if not user_text:
-        return False
-    if OVERRIDE_NEGATIVE_RE.search(user_text) and not re.search(
-        r"(?:暂不交接|先不交接|先别交接|不用交接|不要交接|取消交接|解除交接|暂缓交接|跳过交接)",
-        user_text,
-    ):
-        return False
-    return bool(OVERRIDE_POSITIVE_RE.search(user_text))
+def agy_handoff_intent(user_text: str) -> str:
+    """识别独立指令句，按最后一条直接指令处理，忽略引用与代码。"""
+    intent = ""
+    for line in user_words.markdown_unquoted_lines(user_text):
+        if AGY_OVERRIDE_REQUEST_RE.fullmatch(line):
+            intent = "override"
+        elif AGY_HANDOFF_REQUEST_RE.fullmatch(line):
+            intent = "handoff"
+    return intent
+
+
+def agy_banner_report(user_text: str) -> bool:
+    return any(AGY_BANNER_REPORT_RE.fullmatch(line) for line in user_words.markdown_unquoted_lines(user_text))
 
 
 def _evaluate_triggers(tel: Dict[str, Any], user_text: str) -> Tuple[List[str], List[str]]:
@@ -418,8 +416,10 @@ def _evaluate_triggers(tel: Dict[str, Any], user_text: str) -> Tuple[List[str], 
         advisory_hits.append("image_bytes_warning")
 
     # Stage 2 (强收口硬门禁)
-    has_banner = UI_BANNER_PHRASE in (user_text or "").lower()
-    if has_banner:
+    user_report = tel.get("latestUserBannerReport")
+    if user_report is None:
+        user_report = agy_banner_report(user_text)
+    if user_report:
         banner_plausible = (
             cp_count >= BANNER_PLAUSIBLE_CP
             or latest_step >= BANNER_PLAUSIBLE_STEP
@@ -429,7 +429,7 @@ def _evaluate_triggers(tel: Dict[str, Any], user_text: str) -> Tuple[List[str], 
             or img_bytes >= BANNER_PLAUSIBLE_IMAGE_BYTES
         )
         if banner_plausible:
-            stage2_hits.append("banner")
+            stage2_hits.append("user_banner_report")
 
     if cp_count >= DRAIN_CP_THRESHOLD:
         stage2_hits.append("cp_count")
@@ -451,7 +451,8 @@ def _format_telemetry_brief(tel: Dict[str, Any]) -> str:
     avg_txt = f"{tel['recentAvgInterval']:.0f}" if tel["recentAvgInterval"] is not None else "N/A"
     return (
         f"压缩={tel['cpCount']}次, 近期均值间隔={avg_txt}步, "
-        f"transcript={mb_tp:.2f}MB, 读图={tel['imageCallCount']}次/{mb_img:.1f}MB"
+        f"transcript={mb_tp:.2f}MB，读图尝试={tel['imageAttemptCount']}次，"
+        f"轨迹图片结果={tel['imageResultCount']}步，图片文件估算={mb_img:.1f}MB"
     )
 
 
@@ -460,7 +461,7 @@ def _build_advisory_message(tel: Dict[str, Any], triggers: List[str]) -> str:
     if "media_warning" in triggers or "image_bytes_warning" in triggers:
         extra = "；检测到批量读图偏高，请改用已提取文本/脚本核对，避免无谓大图耗尽上下文。"
     return (
-        f"【长会话容量预警 · Stage-1 advisory】当前会话遥测（{_format_telemetry_brief(tel)}）已接近上下文上限。"
+        f"【长会话提醒 · Stage-1 advisory】当前会话达到启发式收口预警阈值（{_format_telemetry_brief(tel)}）。"
         f"建议在完成本原子单元并提交本地 Git 后适时整理交接；若非必要请勿新开长耗时探索{extra}"
     )
 
@@ -504,23 +505,35 @@ def _refresh_phase_from_telemetry(
     """
     changed = False
     prev_phase = str(gate_state.get("phase") or "normal")
+    turn_hash = tel.get("latestUserInputHash") or ""
+    u_step_idx = int(tel.get("latestUserStepIndex", -1))
+    turn_token = f"{u_step_idx}:{turn_hash}" if (turn_hash and u_step_idx >= 0) else turn_hash
+    intent = tel.get("latestUserHandoffIntent")
+    if intent is None:
+        intent = agy_handoff_intent(user_text)
+    control_hash = tel.get("latestHandoffInputHash")
+    control_step = tel.get("latestHandoffStepIndex")
+    if control_step is None:
+        control_token, control_hash = turn_token, turn_hash
+    else:
+        control_token = f"{control_step}:{control_hash}" if control_hash else ""
+    new_request = intent == "handoff" and control_token and gate_state.get("handoffRequestTurnHash") != control_token
+    host_banner_step = int(tel.get("hostBannerStep", -1))
+    host_banner_is_new = host_banner_step > int(gate_state.get("bannerTriggerHostStep", -1))
+    advisory_hits, stage2_hits = _evaluate_triggers(tel, user_text)
 
-    # 从 v1 门禁状态升级时：若此前仅因误测 transcript_full.jsonl 体积触发 advisory/drain/freeze，按紧凑版重新标定自愈
-    if int(gate_state.get("gateSchemaVersion", 1)) < 2:
-        gate_state["gateSchemaVersion"] = 2
+    # 重新核对旧版单一体积或匿名告警触发，保留其他已登记的触发依据。
+    if int(gate_state.get("gateSchemaVersion", 1)) < 3:
+        gate_state["gateSchemaVersion"] = 3
+        gate_state["handoffFilesTouched"] = []
         changed = True
         prev_triggers = set(gate_state.get("triggers") or [])
-        if prev_phase in ("advisory", "drain", "freeze") and prev_triggers and prev_triggers <= {"transcript_warning", "transcript_bytes"}:
-            recal_adv, recal_s2 = _evaluate_triggers(tel, user_text)
-            if not recal_s2:
-                if recal_adv:
-                    prev_phase = "advisory"
-                    gate_state["phase"] = "advisory"
-                    gate_state["triggers"] = list(dict.fromkeys(recal_adv))
-                else:
-                    prev_phase = "normal"
-                    gate_state["phase"] = "normal"
-                    gate_state["triggers"] = []
+        if (prev_phase in ("advisory", "drain", "freeze") and prev_triggers
+                and prev_triggers <= {"transcript_warning", "transcript_bytes", "banner"}):
+            if not stage2_hits and not host_banner_is_new:
+                prev_phase = "advisory" if advisory_hits else "normal"
+                gate_state["phase"] = prev_phase
+                gate_state["triggers"] = list(advisory_hits)
                 gate_state["drainInvocationsRemaining"] = DEFAULT_DRAIN_INVOCATIONS
                 gate_state["drainActionsRemaining"] = DEFAULT_DRAIN_ACTIONS
                 gate_state["enteredDrainAtStep"] = None
@@ -536,18 +549,15 @@ def _refresh_phase_from_telemetry(
         gate_state["isGoalActive"] = bool(tel.get("isGoalActive"))
         changed = True
 
-    turn_hash = tel.get("latestUserInputHash") or ""
-    u_step_idx = int(tel.get("latestUserStepIndex", -1))
-    turn_token = f"{u_step_idx}:{turn_hash}" if (turn_hash and u_step_idx >= 0) else turn_hash
-
     # 1. 检查显式 R8 暂缓指令（绑定步骤号+内容哈希，防止同轮重复消费且允许后续轮次再次输入相同暂缓词）
-    if turn_token and gate_state.get("overriddenTurnHash") not in (turn_token, turn_hash) and _has_user_override(user_text):
+    if control_token and gate_state.get("overriddenTurnHash") not in (control_token, control_hash) and intent == "override":
         gate_state["phase"] = "overridden"
-        gate_state["overriddenTurnHash"] = turn_token
+        gate_state["overriddenTurnHash"] = control_token
         gate_state["overrideUntilCheckpoint"] = int(tel["cpCount"]) + OVERRIDE_SNOOZE_CPS
         gate_state["overrideUntilStep"] = int(tel["latestStep"]) + OVERRIDE_SNOOZE_STEPS
         gate_state["drainInvocationsRemaining"] = DEFAULT_DRAIN_INVOCATIONS
         gate_state["drainActionsRemaining"] = DEFAULT_DRAIN_ACTIONS
+        gate_state["bannerTriggerHostStep"] = max(gate_state["bannerTriggerHostStep"], host_banner_step)
         user_words.append_lifecycle_log(
             HOOKS_DIR,
             "HandoffGate:override",
@@ -556,7 +566,7 @@ def _refresh_phase_from_telemetry(
         )
         return True
 
-    # 2. 若当前处于 R8 overridden 宽限期，检查宽限窗口是否已过期（或遇到新的 banner 报错）
+    # 2. 暂缓期内，新交接指令或新宿主告警优先。
     if prev_phase == "overridden":
         snooze_expired = (
             int(tel["cpCount"]) >= int(gate_state.get("overrideUntilCheckpoint", -1))
@@ -566,16 +576,23 @@ def _refresh_phase_from_telemetry(
             turn_token
             and gate_state.get("overriddenTurnHash") not in (turn_token, turn_hash)
             and gate_state.get("bannerTriggerTurnHash") not in (turn_token, turn_hash)
-            and UI_BANNER_PHRASE in (user_text or "").lower()
+            and "user_banner_report" in stage2_hits
         )
-        if not snooze_expired and not new_banner_in_fresh_turn:
+        if not (snooze_expired or new_banner_in_fresh_turn or new_request or host_banner_is_new):
             return changed
         # 宽限到期或新报错出现，允许重新进入阈值判定
         gate_state["phase"] = "normal"
         prev_phase = "normal"
         changed = True
 
-    advisory_hits, stage2_hits = _evaluate_triggers(tel, user_text)
+    if new_request:
+        gate_state["handoffRequestTurnHash"] = control_token
+        stage2_hits.append("user_request")
+        changed = True
+    if host_banner_is_new:
+        gate_state["bannerTriggerHostStep"] = host_banner_step
+        stage2_hits.append("host_banner")
+        changed = True
 
     # 3. 阶段跃迁与单调冻结演进
     if prev_phase == "freeze":
@@ -610,9 +627,11 @@ def _refresh_phase_from_telemetry(
         gate_state["phase"] = "drain"
         gate_state["triggers"] = list(dict.fromkeys(stage2_hits))
         gate_state["enteredDrainAtStep"] = tel["latestStep"]
+        gate_state["handoffFilesTouched"] = []
+        gate_state["handoffFileBaselines"] = {}
         gate_state["drainInvocationsRemaining"] = DEFAULT_DRAIN_INVOCATIONS
         gate_state["drainActionsRemaining"] = DEFAULT_DRAIN_ACTIONS
-        if "banner" in stage2_hits:
+        if "user_banner_report" in stage2_hits or "host_banner" in stage2_hits:
             gate_state["bannerDetectedAtStep"] = tel["latestStep"]
             gate_state["bannerTriggerTurnHash"] = turn_token
         user_words.append_lifecycle_log(
@@ -643,72 +662,60 @@ def _refresh_phase_from_telemetry(
     return changed
 
 
-def evaluate_pre_invocation(
+def evaluate_pre_invocation_locked(
     conversation_id: str,
     event_name: str,
     state_dir: Path,
     compaction_state: Dict[str, Any],
     transcript_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """
-    供 session_context_loader.py (Antigravity SessionStart / PreInvocation) 调用：
-    评估会话压力并在 advisory/drain/freeze 时生成附加系统提示。
-    """
-    try:
-        with _gate_state_lock(state_dir, conversation_id):
-            gate_state = load_gate_state(state_dir, conversation_id)
-            tel = _merge_telemetry(compaction_state, gate_state, transcript_path=transcript_path)
-            user_text = tel["latestUserInputPreview"]
+    """评估遥测并更新门禁。调用方在同一会话锁内提交压缩状态。"""
+    gate_state = load_gate_state(state_dir, conversation_id)
+    tel = _merge_telemetry(compaction_state, gate_state, transcript_path=transcript_path)
+    user_text = tel["latestUserInputPreview"]
 
-            is_pre_inv = event_name == "PreInvocation"
-            changed = _refresh_phase_from_telemetry(
-                gate_state,
-                tel,
-                user_text,
-                conversation_id,
-                decrement_invocation=is_pre_inv,
-            )
+    is_pre_inv = event_name == "PreInvocation"
+    changed = _refresh_phase_from_telemetry(
+        gate_state,
+        tel,
+        user_text,
+        conversation_id,
+        decrement_invocation=is_pre_inv,
+    )
 
-            phase = str(gate_state.get("phase") or "normal")
-            advisory_notice: Optional[str] = None
-            mandate_message: Optional[str] = None
+    phase = str(gate_state.get("phase") or "normal")
+    advisory_notice: Optional[str] = None
+    mandate_message: Optional[str] = None
 
-            if phase == "advisory":
-                cp_now = int(tel["cpCount"])
-                img_milestone = int(tel["imageCallCount"]) // 25
-                curr_triggers = list(gate_state.get("triggers") or [])
-                prev_adv_triggers = set(gate_state.get("lastAdvisoryTriggers") or [])
-                if (
-                    cp_now > int(gate_state.get("lastAdvisoryCp", -1))
-                    or img_milestone > int(gate_state.get("lastAdvisoryImageMilestone", 0))
-                    or bool(set(curr_triggers) - prev_adv_triggers)
-                ):
-                    gate_state["lastAdvisoryCp"] = cp_now
-                    gate_state["lastAdvisoryImageMilestone"] = img_milestone
-                    gate_state["lastAdvisoryTriggers"] = curr_triggers
-                    advisory_notice = _build_advisory_message(tel, curr_triggers)
-                    changed = True
-            elif phase == "drain":
-                mandate_message = _build_drain_message(gate_state, tel)
-            elif phase == "freeze":
-                mandate_message = _build_freeze_message(gate_state, tel)
+    if phase == "advisory":
+        cp_now = int(tel["cpCount"])
+        img_milestone = int(tel["imageCallCount"]) // 25
+        curr_triggers = list(gate_state.get("triggers") or [])
+        prev_adv_triggers = set(gate_state.get("lastAdvisoryTriggers") or [])
+        if (
+            cp_now > int(gate_state.get("lastAdvisoryCp", -1))
+            or img_milestone > int(gate_state.get("lastAdvisoryImageMilestone", 0))
+            or bool(set(curr_triggers) - prev_adv_triggers)
+        ):
+            gate_state["lastAdvisoryCp"] = cp_now
+            gate_state["lastAdvisoryImageMilestone"] = img_milestone
+            gate_state["lastAdvisoryTriggers"] = curr_triggers
+            advisory_notice = _build_advisory_message(tel, curr_triggers)
+            changed = True
+    elif phase == "drain":
+        mandate_message = _build_drain_message(gate_state, tel)
+    elif phase == "freeze":
+        mandate_message = _build_freeze_message(gate_state, tel)
 
-            if changed:
-                save_gate_state(state_dir, conversation_id, gate_state)
+    if changed:
+        save_gate_state(state_dir, conversation_id, gate_state)
 
-            return {
-                "phase": phase,
-                "advisoryNotice": advisory_notice,
-                "mandateMessage": mandate_message,
-                "telemetry": tel,
-            }
-    except Exception:
-        return {
-            "phase": "normal",
-            "advisoryNotice": None,
-            "mandateMessage": None,
-            "telemetry": {},
-        }
+    return {
+        "phase": phase,
+        "advisoryNotice": advisory_notice,
+        "mandateMessage": mandate_message,
+        "telemetry": tel,
+    }
 
 
 def _is_handoff_target(
@@ -996,7 +1003,7 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
     if is_daemon:
         return "blocked_always"
     if not cmd_str or not cmd_str.strip():
-        return "readonly_inspect"
+        return "mutating_other"
     if _depth > 3:
         return "mutating_other"
 
@@ -1037,6 +1044,10 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
         raw_head = _strip_token_quotes(tokens[0])
         head_file = Path(raw_head.replace("\\", "/")).name.lower()
         head = head_file[:-4] if head_file.endswith(".exe") else head_file
+        if any(is_image_path(_strip_token_quotes(argument)) for argument in tokens[1:]) and head in (
+            "cat", "type", "get-content", "gc", "head", "tail", "xxd", "display", "open", "start",
+        ):
+            return "blocked_always"
 
         if head_file == "cae_harness.py":
             sub_tokens = [_strip_token_quotes(st) for st in tokens[1:]]
@@ -1111,301 +1122,362 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
     return "readonly_inspect"
 
 
-def check_pre_tool_use(payload: Dict[str, Any], state_dir: Path) -> Optional[Dict[str, Any]]:
-    """
-    供 status_guard.py 在 R4 边界检验之后调用的 PreToolUse 交接硬门禁。
-    返回 None 表示当前门禁放行（继续执行后续防轮询检查）；返回 dict 则直接阻断。
-    """
-    try:
-        conversation_id = str(payload.get("conversationId") or "").strip()
-        if not conversation_id:
-            return None
+def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
+                              *, boundary_blocked: bool = False) -> Optional[Dict[str, Any]]:
+    """在同一会话锁中检查阶段并更新状态。"""
+    conversation_id = str(payload.get("conversationId") or "").strip()
+    if not conversation_id:
+        return None
 
-        compaction_state_file = state_dir / f"{conversation_id}_compaction.json"
-        if not compaction_state_file.exists() and not _gate_state_path(state_dir, conversation_id).exists():
-            # 无主会话记录且尚未建门禁状态时直接放行，零干扰子代理或空跑测试
-            return None
-
+    compaction_state_file = state_dir / f"{conversation_id}_compaction.json"
+    compaction_state = {}
+    if compaction_state_file.is_file():
         try:
             compaction_state = json.loads(compaction_state_file.read_text(encoding="utf-8"))
-        except Exception:
+            if not isinstance(compaction_state, dict) or compaction_state.get("conversationId") != conversation_id:
+                raise ValueError("压缩状态格式或身份错误")
+        except (ValueError, OSError) as exc:
+            if not _gate_state_path(state_dir, conversation_id).exists():
+                raise
+            user_words.append_lifecycle_log(HOOKS_DIR, "PreToolUse:state_error", conversation_id,
+                                            f"读取压缩状态失败（{exc}），沿用现有门禁阶段")
             compaction_state = {}
-        if not compaction_state.get("hasExplicitUserInput", False):
-            return None
+    if not compaction_state.get("hasExplicitUserInput", False) and not _gate_state_path(state_dir, conversation_id).exists():
+        return None
 
-        with _gate_state_lock(state_dir, conversation_id):
-            gate_state = load_gate_state(state_dir, conversation_id)
-            tool_call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
-            tool_name = str(tool_call.get("name") or tool_call.get("tool_name") or "").strip()
-            args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
-            cwd = payload.get("cwd")
-            workspace_paths = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else []
-            transcript_str = payload.get("transcriptPath")
-            transcript_path = user_words.resolve_compact_transcript_path(Path(transcript_str)) if transcript_str else None
+    gate_state = load_gate_state(state_dir, conversation_id)
+    tool_call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
+    raw_tool_name = str(tool_call.get("name") or tool_call.get("tool_name") or "").strip()
+    tool_name = AGY_TOOL_ALIASES.get(raw_tool_name, raw_tool_name)
+    args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
+    cwd = args.get("Cwd") if tool_name == "run_command" else None
+    cwd = cwd or payload.get("cwd")
+    workspace_paths = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else []
+    transcript_str = payload.get("transcriptPath")
+    transcript_path = user_words.resolve_compact_transcript_path(Path(transcript_str).expanduser()) if transcript_str else None
 
-            # 对 read_file 图片读取实时累计计数并检查是否当场突破 Stage-2
-            is_image_read = False
-            if tool_name == "read_file":
-                file_arg = str(args.get("Path") or args.get("path") or "").strip()
-                if is_image_path(file_arg):
-                    is_image_read = True
-                    record_image_read(gate_state, file_arg, cwd=cwd, workspace_paths=workspace_paths, increment_calls=True)
+    # 对 read_file 图片读取实时累计计数并检查是否当场突破 Stage-2
+    is_image_read = False
+    if tool_name == "read_file":
+        file_arg = str(args.get("AbsolutePath") or args.get("Path") or args.get("path") or "").strip()
+        if is_image_path(file_arg):
+            is_image_read = True
+            record_image_read(gate_state, file_arg, cwd=cwd, workspace_paths=workspace_paths, increment_calls=True)
 
-            tel = _merge_telemetry(compaction_state, gate_state, transcript_path=transcript_path)
-            _refresh_phase_from_telemetry(
-                gate_state,
-                tel,
-                tel["latestUserInputPreview"],
-                conversation_id,
-                decrement_invocation=False,
-            )
+    tel = _merge_telemetry(compaction_state, gate_state, transcript_path=transcript_path)
+    if not compaction_state:
+        tel["isGoalActive"] = gate_state["isGoalActive"]
+    changed = _refresh_phase_from_telemetry(
+        gate_state,
+        tel,
+        tel["latestUserInputPreview"],
+        conversation_id,
+        decrement_invocation=False,
+    )
 
-            phase = str(gate_state.get("phase") or "normal")
-            if phase not in ("drain", "freeze"):
-                if is_image_read:
+    phase = str(gate_state.get("phase") or "normal")
+    if phase not in ("drain", "freeze"):
+        if changed or is_image_read:
+            save_gate_state(state_dir, conversation_id, gate_state)
+        return None
+
+    # 以下为 Stage-2 (drain / freeze) 精确工具门禁
+    # 1. 绝不允许的派工与常驻/外推工具（drain 与 freeze 均阻断）
+    if tool_name in DELEGATION_TOOLS or tool_name in MEDIA_TOOLS or tool_name.startswith("browser_"):
+        save_gate_state(state_dir, conversation_id, gate_state)
+        return {
+            "decision": "deny",
+            "reason": (
+                f"【user-guard 长会话交接门禁 ({phase})】当前会话已进入交接停机收口期（{_format_telemetry_brief(tel)}），"
+                    f"收口期禁用 `{tool_name}`。"
+                "请仅完成本地原子收口并整理交接文档与新对话提示词后立即停机。"
+            ),
+        }
+
+    # 2. manage_task / manage_subagents：允许查看或收尾后台任务（不扣减动作预算）
+    if tool_name in AGY_INSPECTION_TOOLS:
+        save_gate_state(state_dir, conversation_id, gate_state)
+        return None
+
+    # 3. read_file：禁止读图（防耗尽剩余配额），放行文本核对
+    if tool_name == "read_file":
+        save_gate_state(state_dir, conversation_id, gate_state)
+        if is_image_read:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"【user-guard 长会话交接门禁 ({phase})】当前图片遥测（{_format_telemetry_brief(tel)}）。"
+                    "收口期内禁止继续调用 `read_file` 看图，请改用文本摘要/脚本输出核对后完成交接。"
+                ),
+            }
+        return None
+
+    # 4. write_file / edit_file：交接文档始终放行；非交接修改在 drain 扣减预算，在 freeze 阻断
+    if tool_name in ("write_file", "edit_file"):
+        write_arg = str(args.get("Path") or args.get("path") or args.get("TargetFile") or args.get("file_path") or "").strip()
+        if _is_handoff_target(write_arg, conversation_id, cwd, workspace_paths):
+            if boundary_blocked:
+                if changed:
                     save_gate_state(state_dir, conversation_id, gate_state)
                 return None
-
-            # 以下为 Stage-2 (drain / freeze) 精确工具门禁
-            # 1. 绝不允许的派工与常驻/外推工具（drain 与 freeze 均阻断）
-            if tool_name in DELEGATION_TOOLS or tool_name.startswith("browser_"):
-                save_gate_state(state_dir, conversation_id, gate_state)
-                return {
-                    "decision": "deny",
-                    "reason": (
-                        f"【user-guard 长会话交接门禁 ({phase})】当前会话已进入交接停机收口期（{_format_telemetry_brief(tel)}），"
-                        f"严禁再调用 `{tool_name}` 新开子代理/集群/定时器/浏览器任务！"
-                        "请仅完成本地原子收口并整理交接文档与新对话提示词后立即停机。"
-                    ),
-                }
-
-            # 2. manage_task / manage_subagents：允许查看或收尾后台任务（不扣减动作预算）
-            if tool_name in ("manage_task", "manage_subagents"):
-                save_gate_state(state_dir, conversation_id, gate_state)
-                return None
-
-            # 3. read_file：禁止读图（防耗尽剩余配额），放行文本核对
-            if tool_name == "read_file":
-                save_gate_state(state_dir, conversation_id, gate_state)
-                if is_image_read:
-                    return {
-                        "decision": "deny",
-                        "reason": (
-                            f"【user-guard 长会话交接门禁 ({phase})】已累计读取 {tel['imageCallCount']} 次图片"
-                            f"（{tel['totalImageBytes'] / (1024 * 1024):.1f} MB），触发多模态上下文保护！"
-                            "收口期内禁止继续调用 `read_file` 看图，请改用文本摘要/脚本输出核对后完成交接。"
-                        ),
-                    }
-                return None
-
-            # 4. write_file / edit_file：交接文档始终放行；非交接修改在 drain 扣减预算，在 freeze 阻断
-            if tool_name in ("write_file", "edit_file"):
-                write_arg = str(args.get("Path") or args.get("path") or args.get("TargetFile") or args.get("file_path") or "").strip()
-                if _is_handoff_target(write_arg, conversation_id, cwd, workspace_paths):
-                    resolved_target = str(_resolve_candidate_path(write_arg, cwd=cwd, workspace_paths=workspace_paths))
-                    if resolved_target not in gate_state["handoffFilesTouched"]:
-                        gate_state["handoffFilesTouched"].append(resolved_target)
-                    save_gate_state(state_dir, conversation_id, gate_state)
-                    return None
-
-                if phase == "freeze":
-                    save_gate_state(state_dir, conversation_id, gate_state)
-                    return {
-                        "decision": "deny",
-                        "reason": (
-                            "【user-guard 长会话交接门禁 (freeze)】排空预算已用尽，当前已进入冻结期，禁止修改业务源码或非交接文件！"
-                            "请仅编写交接文件、执行本地 `git add`/`git commit` 或直接输出交接总结与新对话提示词后停机。"
-                        ),
-                    }
-
-                # drain 阶段扣减动作预算
-                rem_actions = int(gate_state.get("drainActionsRemaining", 0))
-                if rem_actions <= 0:
-                    gate_state["phase"] = "freeze"
-                    gate_state["enteredFreezeAtStep"] = tel["latestStep"]
-                    save_gate_state(state_dir, conversation_id, gate_state)
-                    return {
-                        "decision": "deny",
-                        "reason": (
-                            "【user-guard 长会话交接门禁 (drain -> freeze)】排空动作预算（8 次）已用完，已转入冻结期！"
-                            "禁止继续修改业务文件，请整理交接提示词并停机。"
-                        ),
-                    }
-                if consume_drain_action(gate_state):
-                    gate_state["enteredFreezeAtStep"] = tel["latestStep"]
-                save_gate_state(state_dir, conversation_id, gate_state)
-                return None
-
-            # 5. send_message：仅允许在 drain 消耗 1 次动作通知收尾，freeze 冻结阻断
-            if tool_name == "send_message":
-                if phase == "freeze" or int(gate_state.get("drainActionsRemaining", 0)) <= 0:
-                    gate_state["phase"] = "freeze"
-                    save_gate_state(state_dir, conversation_id, gate_state)
-                    return {
-                        "decision": "deny",
-                        "reason": "【user-guard 长会话交接门禁 (freeze)】已冻结，禁止再通过 `send_message` 唤醒或继续驱动子代理。请直接整理交接并停机。",
-                    }
-                if consume_drain_action(gate_state):
-                    gate_state["enteredFreezeAtStep"] = tel["latestStep"]
-                save_gate_state(state_dir, conversation_id, gate_state)
-                return None
-
-            # 6. run_command：分类管控（始终禁派工/push，始终放行只读与本地 git add/commit）
-            if tool_name == "run_command":
-                cmd_str = str(args.get("CommandLine") or args.get("command_line") or args.get("command") or "")
-                is_daemon = bool(args.get("IsDaemon", False))
-                cmd_kind = _classify_run_command(cmd_str, is_daemon=is_daemon)
-
-                if cmd_kind == "blocked_always":
-                    save_gate_state(state_dir, conversation_id, gate_state)
-                    return {
-                        "decision": "deny",
-                        "reason": (
-                            f"【user-guard 长会话交接门禁 ({phase})】收口期内严禁启动跨端派工（`cae_harness.py`）、`git push` 或常驻守护进程！"
-                            "仅允许本地只读核对、运行本地验收与本地 `git add`/`git commit`。"
-                        ),
-                    }
-
-                if cmd_kind in ("readonly_inspect", "git_local_commit"):
-                    save_gate_state(state_dir, conversation_id, gate_state)
-                    return None
-
-                if phase == "freeze":
-                    save_gate_state(state_dir, conversation_id, gate_state)
-                    return {
-                        "decision": "deny",
-                        "reason": (
-                            "【user-guard 长会话交接门禁 (freeze)】已进入冻结期，禁止运行新的构建/批量脚本或修改命令！"
-                            "当前仅允许只读检查命令（`git status/diff/log`）与本地 `git add`/`git commit`。"
-                        ),
-                    }
-
-                rem_actions = int(gate_state.get("drainActionsRemaining", 0))
-                if rem_actions <= 0:
-                    gate_state["phase"] = "freeze"
-                    gate_state["enteredFreezeAtStep"] = tel["latestStep"]
-                    save_gate_state(state_dir, conversation_id, gate_state)
-                    return {
-                        "decision": "deny",
-                        "reason": "【user-guard 长会话交接门禁 (drain -> freeze)】排空运行预算已耗尽，禁止再启动新命令，请完成交接停机。",
-                    }
-                if consume_drain_action(gate_state):
-                    gate_state["enteredFreezeAtStep"] = tel["latestStep"]
-                save_gate_state(state_dir, conversation_id, gate_state)
-                return None
-
+            resolved_target = str(_resolve_candidate_path(write_arg, cwd=cwd, workspace_paths=workspace_paths))
+            _record_handoff_baseline(gate_state, Path(resolved_target))
             save_gate_state(state_dir, conversation_id, gate_state)
             return None
-    except Exception:
+
+        if phase == "freeze":
+            save_gate_state(state_dir, conversation_id, gate_state)
+            return {
+                "decision": "deny",
+                "reason": (
+                    "【user-guard 长会话交接门禁 (freeze)】排空预算已用尽，当前已进入冻结期，禁止修改业务源码或非交接文件！"
+                    "请仅编写交接文件、执行本地 `git add`/`git commit` 或直接输出交接总结与新对话提示词后停机。"
+                ),
+            }
+
+        if boundary_blocked:
+            if changed:
+                save_gate_state(state_dir, conversation_id, gate_state)
+            return None
+        # drain 阶段扣减动作预算
+        rem_actions = int(gate_state.get("drainActionsRemaining", 0))
+        if rem_actions <= 0:
+            gate_state["phase"] = "freeze"
+            gate_state["enteredFreezeAtStep"] = tel["latestStep"]
+            save_gate_state(state_dir, conversation_id, gate_state)
+            return {
+                "decision": "deny",
+                "reason": (
+                    "【user-guard 长会话交接门禁 (drain -> freeze)】排空动作预算（8 次）已用完，已转入冻结期！"
+                    "禁止继续修改业务文件，请整理交接提示词并停机。"
+                ),
+            }
+        if consume_drain_action(gate_state):
+            gate_state["enteredFreezeAtStep"] = tel["latestStep"]
+        save_gate_state(state_dir, conversation_id, gate_state)
+        return None
+
+    # 5. send_message：仅允许在 drain 消耗 1 次动作通知收尾，freeze 冻结阻断
+    if tool_name == "send_message":
+        if phase == "freeze" or int(gate_state.get("drainActionsRemaining", 0)) <= 0:
+            gate_state["phase"] = "freeze"
+            save_gate_state(state_dir, conversation_id, gate_state)
+            return {
+                "decision": "deny",
+                "reason": "【user-guard 长会话交接门禁 (freeze)】已冻结，禁止再通过 `send_message` 唤醒或继续驱动子代理。请直接整理交接并停机。",
+            }
+        if consume_drain_action(gate_state):
+            gate_state["enteredFreezeAtStep"] = tel["latestStep"]
+        save_gate_state(state_dir, conversation_id, gate_state)
+        return None
+
+    # 6. run_command：分类管控（始终禁派工/push，始终放行只读与本地 git add/commit）
+    if tool_name == "run_command":
+        cmd_str = str(args.get("CommandLine") or args.get("command_line") or args.get("command") or "")
+        is_daemon = bool(args.get("IsDaemon", False))
+        cmd_kind = _classify_run_command(cmd_str, is_daemon=is_daemon)
+
+        if cmd_kind == "blocked_always":
+            save_gate_state(state_dir, conversation_id, gate_state)
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"【user-guard 长会话交接门禁 ({phase})】收口期禁用派工、推送、读图和常驻进程。"
+                    "仅允许本地只读核对、运行本地验收与本地 `git add`/`git commit`。"
+                ),
+            }
+
+        if cmd_kind in ("readonly_inspect", "git_local_commit"):
+            save_gate_state(state_dir, conversation_id, gate_state)
+            return None
+
+        if phase == "freeze":
+            save_gate_state(state_dir, conversation_id, gate_state)
+            return {
+                "decision": "deny",
+                "reason": (
+                    "【user-guard 长会话交接门禁 (freeze)】已进入冻结期，禁止运行新的构建/批量脚本或修改命令！"
+                    "当前仅允许只读检查命令（`git status/diff/log`）与本地 `git add`/`git commit`。"
+                ),
+            }
+
+        if boundary_blocked:
+            if changed:
+                save_gate_state(state_dir, conversation_id, gate_state)
+            return None
+        rem_actions = int(gate_state.get("drainActionsRemaining", 0))
+        if rem_actions <= 0:
+            gate_state["phase"] = "freeze"
+            gate_state["enteredFreezeAtStep"] = tel["latestStep"]
+            save_gate_state(state_dir, conversation_id, gate_state)
+            return {
+                "decision": "deny",
+                "reason": "【user-guard 长会话交接门禁 (drain -> freeze)】排空运行预算已耗尽，禁止再启动新命令，请完成交接停机。",
+            }
+        if consume_drain_action(gate_state):
+            gate_state["enteredFreezeAtStep"] = tel["latestStep"]
+        save_gate_state(state_dir, conversation_id, gate_state)
+        return None
+
+    if phase == "freeze" or int(gate_state["drainActionsRemaining"]) <= 0:
+        gate_state["phase"] = "freeze"
+        save_gate_state(state_dir, conversation_id, gate_state)
+        return {"decision": "deny", "reason": "【user-guard 冻结】当前工具缺少可核实的只读或交接用途。"}
+    if consume_drain_action(gate_state):
+        gate_state["enteredFreezeAtStep"] = tel["latestStep"]
+    save_gate_state(state_dir, conversation_id, gate_state)
+    return None
+
+
+MAX_HANDOFF_DOCUMENT_BYTES = 1024 * 1024
+
+
+def _handoff_document_snapshot(path: Path, *, include_text: bool = False) -> Optional[Dict[str, Any]]:
+    try:
+        resolved = str(path.resolve())
+        if not path.exists():
+            return {"path": resolved, "sha256": ""}
+        if not path.is_file():
+            return None
+        with path.open("rb") as stream:
+            data = stream.read(MAX_HANDOFF_DOCUMENT_BYTES + 1)
+        if len(data) > MAX_HANDOFF_DOCUMENT_BYTES:
+            return None
+        snapshot = {"path": resolved, "sha256": hashlib.sha256(data).hexdigest()}
+        if include_text:
+            snapshot["text"] = data.decode("utf-8-sig")
+        return snapshot
+    except (OSError, UnicodeDecodeError, RuntimeError):
         return None
 
 
+def _record_handoff_baseline(state: Dict[str, Any], path: Path) -> None:
+    baselines = state.setdefault("handoffFileBaselines", {})
+    key = str(path.absolute())
+    if key not in baselines:
+        snapshot = _handoff_document_snapshot(path)
+        if snapshot is not None:
+            baselines[key] = snapshot
+
+
 def _has_valid_handoff_file(gate_state: Dict[str, Any]) -> bool:
-    for p_str in gate_state.get("handoffFilesTouched") or []:
-        try:
-            p = Path(str(p_str))
-            if p.exists() and p.is_file() and p.stat().st_size >= 80:
-                return True
-        except OSError:
-            continue
+    for raw_path, baseline in gate_state.get("handoffFileBaselines", {}).items():
+        current = _handoff_document_snapshot(Path(raw_path), include_text=True)
+        if (isinstance(baseline, dict) and current and current.get("path") == baseline.get("path")
+                and current.get("sha256") != baseline.get("sha256")
+                and _handoff_structure_present(current.get("text") or "")):
+            return True
     return False
 
 
 def _reply_has_handoff_prompt(reply_text: str) -> bool:
-    stripped = (reply_text or "").strip()
-    if len(stripped) < 60:
-        return False
-    low = stripped.lower()
-    has_cue = bool(PROMPT_MARKER_RE.search(stripped)) or any(
-        cue in low for cue in ("交接", "接续", "新对话", "新会话", "handoff", "handover", "next prompt", "new conversation")
-    )
-    code_blocks = re.findall(r"```(?:[^\n]*\n)?([\s\S]{15,}?)```", stripped)
-    if code_blocks and has_cue:
-        return True
-    if PROMPT_MARKER_RE.search(stripped) and len(stripped) >= 80:
-        return True
+    lines = reply_text.strip().splitlines()
+    plain_lines = list(user_words.markdown_unquoted_lines(reply_text.strip()))
+    for idx, line in enumerate(plain_lines):
+        heading, *body = re.split(r"[:：]", line, maxsplit=1)
+        if not PROMPT_MARKER_RE.fullmatch(heading.strip("#*【】[] ")):
+            continue
+        if body and len(body[0].strip()) >= 15:
+            return True
+        for pos in range(idx + 1, len(lines)):
+            if not lines[pos].strip():
+                continue
+            fence = user_words.MARKDOWN_FENCE_RE.match(lines[pos])
+            if fence:
+                content = []
+                for body_line in lines[pos + 1:]:
+                    ending = user_words.MARKDOWN_FENCE_RE.match(body_line)
+                    if ending and ending[1][0] == fence[1][0] and len(ending[1]) >= len(fence[1]) and not ending[2].strip():
+                        return len("\n".join(content).strip()) >= 15
+                    content.append(body_line)
+                return False
+            return len(plain_lines[pos]) >= 15 and not lines[pos].lstrip().startswith(("#", ">"))
     return False
 
 
-def check_stop_handoff(
+def _handoff_structure_present(text: str) -> bool:
+    """核对交接文档结构，内容是否属实仍需对照源证据。"""
+    prose = "\n".join(user_words.markdown_unquoted_lines(text))
+    return (_reply_has_handoff_prompt(text)
+            and bool(re.search(r"已验证|已完成|进展|verified|completed", prose, re.IGNORECASE))
+            and bool(re.search(r"未完成|待办|下一步|剩余|remaining|next steps", prose, re.IGNORECASE))
+            and bool(re.search(r"git|提交|工作区|workspace", prose, re.IGNORECASE)))
+
+
+def check_stop_handoff_locked(
     payload: Dict[str, Any],
     state_dir: Path,
     turn_key: str,
     latest_reply: str,
+    *,
+    goal_active: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    供 reply_repeat_guard.py 在 Stop（NO_TOOL_CALL 且非 continuationActive）时调用：
-    在 drain/freeze 阶段核验是否已完成全量交接（提示词 + /goal 终止标记）。
-    每回合最多阻断 1 次，绝不死循环。
-    """
-    try:
-        conversation_id = str(payload.get("conversationId") or "").strip()
-        if not conversation_id:
-            return None
-
-        with _gate_state_lock(state_dir, conversation_id):
-            gate_state = load_gate_state(state_dir, conversation_id)
-            phase = str(gate_state.get("phase") or "normal")
-            if phase not in ("drain", "freeze"):
-                return None
-
-            if turn_key == "turn_0_initial":
-                comp_file = state_dir / f"{conversation_id}_compaction.json"
-                if comp_file.exists():
-                    try:
-                        comp = json.loads(comp_file.read_text(encoding="utf-8"))
-                        if isinstance(comp, dict):
-                            u_step = int(comp.get("latestUserStepIndex", -1))
-                            u_hash = str(comp.get("latestUserInputHash") or "")
-                            if u_step >= 0 and u_hash:
-                                turn_key = f"turn_{u_step}_{u_hash[:12]}"
-                    except Exception:
-                        pass
-
-            blocked_keys: List[str] = gate_state.setdefault("stopGateBlockedTurnKeys", [])
-            if turn_key in blocked_keys:
-                return None
-
-            missing_parts: List[str] = []
-            has_file = _has_valid_handoff_file(gate_state)
-            has_prompt_inline = _reply_has_handoff_prompt(latest_reply)
-            if not has_file and not has_prompt_inline:
-                missing_parts.append(
-                    "尚未落盘非空交接文档且最终回复中缺少可直接复制粘贴到新对话的完整【接续提示词】（含已验证进度、Git 状态与未尽事项）"
-                )
-
-            if gate_state.get("isGoalActive") and "<!-- GOAL_CANCELLED -->" not in (latest_reply or ""):
-                missing_parts.append(
-                    "检测到当前会话运行了 `/goal` 自主循环，回复末尾必须附带 `<!-- GOAL_CANCELLED -->` 才能安全停机"
-                )
-
-            if not missing_parts:
-                user_words.append_lifecycle_log(
-                    HOOKS_DIR,
-                    "Stop:handoff_gate",
-                    conversation_id,
-                    f"ALLOWED clean handoff stop in phase={phase} ({turn_key})",
-                )
-                return None
-
-            blocked_keys.append(turn_key)
-            save_gate_state(state_dir, conversation_id, gate_state)
-            user_words.append_lifecycle_log(
-                HOOKS_DIR,
-                "Stop:handoff_gate",
-                conversation_id,
-                f"BLOCKED incomplete handoff in phase={phase} ({turn_key}): {'; '.join(missing_parts)}",
-            )
-            return {
-                "decision": "continue",
-                "reason": (
-                    "【user-guard 交接停机门禁验收未通过】"
-                    + "；".join(missing_parts)
-                    + "。请补全上述交接要素后直接输出停机回复。"
-                ),
-            }
-    except Exception:
+    """检查当前交接结构，每个用户回合最多要求补正一次。"""
+    conversation_id = str(payload.get("conversationId") or "").strip()
+    if not conversation_id:
         return None
+
+    gate_state = load_gate_state(state_dir, conversation_id)
+    phase = str(gate_state.get("phase") or "normal")
+    if phase not in ("drain", "freeze"):
+        return None
+
+    if turn_key == "turn_0_initial":
+        comp_file = state_dir / f"{conversation_id}_compaction.json"
+        if comp_file.exists():
+            try:
+                comp = json.loads(comp_file.read_text(encoding="utf-8"))
+                if isinstance(comp, dict):
+                    u_step = int(comp.get("latestUserStepIndex", -1))
+                    u_hash = str(comp.get("latestUserInputHash") or "")
+                    if u_step >= 0 and u_hash:
+                        turn_key = f"turn_{u_step}_{u_hash[:12]}"
+            except Exception:
+                pass
+
+    blocked_keys: List[str] = gate_state.setdefault("stopGateBlockedTurnKeys", [])
+    if turn_key in blocked_keys:
+        return {"decision": "allow"}
+
+    missing_parts: List[str] = []
+    has_file = _has_valid_handoff_file(gate_state)
+    has_prompt_inline = _handoff_structure_present(latest_reply)
+    if not has_file and not has_prompt_inline:
+        missing_parts.append(
+            "尚未落盘非空交接文档且最终回复中缺少可直接复制粘贴到新对话的完整【接续提示词】（含已验证进度、Git 状态与未尽事项）"
+        )
+
+    requires_cancel = bool(gate_state.get("isGoalActive")) if goal_active is None else goal_active
+    if requires_cancel and not user_words.has_goal_cancel_marker(latest_reply):
+        missing_parts.append(
+            "检测到当前会话运行了 `/goal` 自主循环，回复末尾必须附带 `<!-- GOAL_CANCELLED -->` 才能安全停机"
+        )
+
+    if not missing_parts:
+        user_words.append_lifecycle_log(
+            HOOKS_DIR,
+            "Stop:handoff_gate",
+            conversation_id,
+            f"ALLOWED clean handoff stop in phase={phase} ({turn_key})",
+        )
+        return {"decision": "allow"}
+
+    blocked_keys.append(turn_key)
+    save_gate_state(state_dir, conversation_id, gate_state)
+    user_words.append_lifecycle_log(
+        HOOKS_DIR,
+        "Stop:handoff_gate",
+        conversation_id,
+        f"BLOCKED incomplete handoff in phase={phase} ({turn_key}): {'; '.join(missing_parts)}",
+    )
+    return {
+        "decision": "continue",
+        "reason": (
+            "【user-guard 交接停机门禁验收未通过】"
+            + "；".join(missing_parts)
+            + "。请补全上述交接要素后直接输出停机回复。"
+        ),
+    }
 
 
 # Codex 使用官方事件字段；不读取 Antigravity 的检查点、图片体积或目标终止标记。
@@ -1416,8 +1488,8 @@ CODEX_HANDOFF_REQUEST_RE = re.compile(
     re.IGNORECASE,
 )
 CODEX_OVERRIDE_REQUEST_RE = re.compile(
-    r"^(?:请)?" + OVERRIDE_POSITIVE_RE.pattern
-    + r"(?:[，,；;、\s]+(?:请)?" + OVERRIDE_POSITIVE_RE.pattern + r")*[。.!！\s]*$",
+    r"^(?:请)?" + OVERRIDE_COMMAND
+    + r"(?:[，,；;、\s]+(?:请)?" + OVERRIDE_COMMAND + r")*[。.!！\s]*$",
     re.IGNORECASE,
 )
 CODEX_READ_TOOLS = {
@@ -1429,7 +1501,7 @@ CODEX_DELEGATION_TOOLS = {"spawn_agent", "agent", "followup_task", "send_message
 
 
 def _codex_notice(phase: str, count: int, mode: str) -> str:
-    prefix = f"【Codex 长会话交接：{phase}】已登记 {count} 个可去重的压缩事件；模式 {mode}。"
+    prefix = f"【Codex 长会话交接：{phase}】已登记的压缩次数下界为 {count}。模式 {mode}。"
     if phase == "overridden":
         return prefix + "已按用户明确指令继续；宽限到其后第 3 个新压缩事件，再按已配置策略评估。"
     if phase in ("drain", "freeze"):
@@ -1446,100 +1518,213 @@ def _codex_context(event: str, message: str) -> Dict[str, Any]:
     return {"systemMessage": message}
 
 
-def _codex_compaction_key(payload: Dict[str, Any], transcript: Path) -> str:
-    """优先使用可辨识的 compacted 记录；未知轨迹格式按回合保守去重，可能少计而不多计。"""
+def _scan_codex_compactions(transcript: Path, ledger: Dict[str, Any]) -> Optional[str]:
+    """按轨迹文件身份与游标对账，保留可见记录及可确认的回合关联。"""
+    path_key = _path_key(transcript)
+    records = ledger["records"]
     try:
         with transcript.open("rb") as stream:
-            size = stream.seek(0, os.SEEK_END)
-            stream.seek(max(0, size - 256 * 1024))
-            data = stream.read()
-        rows = data.splitlines()
-        if size > len(data):
-            rows = rows[1:]
-        for raw in reversed(rows):
-            try:
-                entry = json.loads(raw)
-            except (ValueError, UnicodeDecodeError):
-                continue
-            if isinstance(entry, dict) and entry.get("type") == "compacted":
-                return "record:" + hashlib.sha256(raw).hexdigest()
-    except OSError:
-        pass
-    turn_id = str(payload.get("turn_id") or "")
-    # 没有唯一事件或回合标识时仅提醒，不使用文件大小猜测压缩次数。
-    return "turn:" + turn_id + ":" + str(payload.get("trigger") or "unknown") if turn_id else ""
+            stat = os.fstat(stream.fileno())
+            identity = [stat.st_dev, stat.st_ino]
+            cursor = ledger["files"].get(path_key, {})
+            offset = cursor.get("offset", 0)
+            if type(offset) is not int or offset < 0:
+                raise ValueError("压缩轨迹游标格式错误")
+            stream.seek(max(0, offset - 128))
+            anchor = hashlib.sha256(stream.read(min(128, offset))).hexdigest()
+            if (cursor.get("identity") != identity or offset > stat.st_size or anchor != cursor.get("anchor")):
+                cursor = {"identity": identity, "activeTurn": "", "pendingRecord": "", "occurrences": {}}
+                offset = 0
+            stream.seek(offset)
+            while stream.tell() < stat.st_size:
+                row_offset = stream.tell()
+                raw = stream.readline(stat.st_size - row_offset)
+                if not raw.endswith(b"\n"):
+                    stream.seek(row_offset)
+                    break
+                pending = cursor["pendingRecord"]
+                cursor["pendingRecord"] = ""
+                if not any(token in raw for token in (b'"compacted"', b'"turn_context"', b'"task_started"',
+                                                      b'"turn_started"', b'"task_complete"', b'"turn_complete"',
+                                                      b'"turn_aborted"')):
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    cursor["unreadable"] = True
+                    continue
+                if not isinstance(entry, dict) or not isinstance(entry.get("payload"), dict):
+                    continue
+                kind = entry.get("type")
+                fields = entry["payload"]
+                turn = fields.get("turn_id")
+                turn = turn if isinstance(turn, str) else ""
+                if kind == "event_msg":
+                    if fields.get("type") in ("task_started", "turn_started"):
+                        cursor["activeTurn"] = turn
+                    elif fields.get("type") in ("task_complete", "turn_complete", "turn_aborted"):
+                        cursor["activeTurn"] = ""
+                elif kind == "turn_context" and turn:
+                    if pending:
+                        records[pending].update(turn=turn, turnSource="following_turn_context")
+                    if not cursor["activeTurn"]:
+                        cursor["activeTurn"] = turn
+                elif kind == "compacted":
+                    window_id = fields.get("window_id")
+                    if isinstance(window_id, str) and window_id:
+                        key = f"window:{window_id}"
+                    else:
+                        # 没有宿主记录 ID 时，区分同一轨迹内相同内容的不同位置，镜像分段按出现顺序去重。
+                        digest = hashlib.sha256(raw.strip()).hexdigest()
+                        occurrence = cursor["occurrences"].get(digest, 0) + 1
+                        cursor["occurrences"][digest] = occurrence
+                        key = f"record:{digest}:{occurrence}"
+                    active_turn = cursor["activeTurn"]
+                    rec = records.setdefault(key, {"path": str(transcript), "offset": row_offset, "turn": "",
+                                                   "turnSource": "unknown"})
+                    if turn:
+                        rec.update(turn=turn, turnSource="record")
+                    else:
+                        if active_turn and not rec["turn"]:
+                            rec.update(turn=active_turn, turnSource="active_turn")
+                        if rec["turnSource"] != "record":
+                            cursor["pendingRecord"] = key
+
+            offset = stream.tell()
+            stream.seek(max(0, offset - 128))
+            anchor = hashlib.sha256(stream.read(min(128, offset))).hexdigest()
+            cursor.update(offset=offset, anchor=anchor)
+            ledger["files"][path_key] = cursor
+            if cursor.get("unreadable"):
+                return "轨迹中存在不可解析的相关记录"
+            if offset < stat.st_size:
+                return "轨迹末尾记录待写完"
+    except OSError as exc:
+        return f"压缩轨迹读取失败（{exc}）"
+    return None
 
 
-def _codex_handoff_patch_only(command: str, cwd: str) -> bool:
-    """冻结期仅豁免项目内的交接文档补丁；移动源和目标均须满足条件。"""
-    paths = re.findall(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$", command, re.MULTILINE)
-    if not paths or not cwd:
-        return False
-    base = Path(cwd).resolve()
-    for raw in paths:
-        path = Path(raw.strip())
-        resolved = (path if path.is_absolute() else base / path).resolve()
-        if (not resolved.is_relative_to(base) or resolved.suffix.lower() not in (".md", ".txt", ".rst")
-                or not HANDOFF_FILENAME_RE.search(resolved.name)):
-            return False
-    return True
+def _reconcile_codex_compactions(payload: Dict[str, Any], transcript: Path, state: Dict[str, Any]) -> None:
+    ledger = state.get("compactionLedger")
+    if ledger is None:
+        ledger = {"files": {}, "records": {}, "observations": {}}
+        for key in state.get("compactionKeys", []):
+            if isinstance(key, str) and key.startswith("turn:"):
+                turn, _, trigger = key[5:].rpartition(":")
+                if turn:
+                    ledger["observations"][key] = {"turn": turn, "trigger": trigger, "source": "legacy_hook"}
+        state["compactionLedger"] = ledger
+        state.pop("compactionKeys", None)
+    if not isinstance(ledger, dict) or any(not isinstance(ledger.get(key), dict)
+                                          for key in ("files", "records", "observations")):
+        raise ValueError("压缩对账状态格式错误，保留原文件")
+
+    paths = [transcript]
+    issues: List[str] = []
+    if payload["hook_event_name"] == "SessionStart":
+        segments, _, issues = user_words.discover_codex_session_segments(str(transcript), state["conversationId"])
+        paths = segments or paths
+    for path in paths:
+        issue = _scan_codex_compactions(path, ledger)
+        if issue:
+            issues.append(issue)
+    if payload["hook_event_name"] == "PostCompact":
+        turn = payload.get("turn_id")
+        if isinstance(turn, str) and turn:
+            trigger = payload.get("trigger")
+            trigger = trigger if trigger in ("manual", "auto") else "unknown"
+            ledger["observations"].setdefault(f"turn:{turn}:{trigger}", {"turn": turn, "trigger": trigger,
+                                                                          "source": "post_compact"})
+        else:
+            issues.append("PostCompact 未提供回合标识，无法按回合登记")
+
+    verified_turns = set()
+    unassigned = 0
+    for record in ledger["records"].values():
+        if record.get("turn") and record.get("turnSource") == "record":
+            verified_turns.add(record["turn"])
+        else:
+            unassigned += 1
+    observed_turns = {observation["turn"] for observation in ledger["observations"].values()}
+    unmatched = observed_turns.difference(verified_turns)
+    # 邻接记录只提供归属线索。它可能来自上一回合或恢复快照，不能证明与 hook 事件相互独立。
+    extra = max(0, len(unmatched) - unassigned)
+    record_count = len(ledger["records"])
+    if unmatched and unassigned:
+        issues.append("部分压缩记录未提供自身回合标识，与 PostCompact 观察可能重合")
+    state["compactionCount"] = record_count + extra
+    state["compactionRecordCount"] = record_count
+    state["compactionFallbackCount"] = extra
+    state["compactionIssues"] = issues
+    state["compactionIdentity"] = ("mixed" if record_count and extra else "rollout_record" if record_count
+                                  else "turn_fallback" if extra else "unknown")
 
 
-def _codex_tool_kind(payload: Dict[str, Any]) -> str:
+def _codex_handoff_patch_paths(command: str, cwd: str) -> List[Path]:
+    """获取项目内的交接补丁目标，移动源和目标均须通过路径核验。"""
+    edits = re.findall(r"^\*\*\* (Add File|Update File|Delete File|Move to): (.+)$", command, re.MULTILINE)
+    if not edits or not cwd:
+        return []
+    try:
+        base = Path(cwd).resolve()
+        targets: List[Path] = []
+        for kind, raw in edits:
+            path = Path(raw.strip())
+            path = path if path.is_absolute() else base / path
+            resolved = path.resolve()
+            if (not path.is_relative_to(base) or not resolved.is_relative_to(base)
+                    or resolved.suffix.lower() not in (".md", ".txt", ".rst")
+                    or not HANDOFF_FILENAME_RE.search(resolved.name)):
+                return []
+            if kind != "Delete File":
+                targets.append(path)
+        return targets
+    except (OSError, RuntimeError):
+        return []
+
+
+def _codex_tool_kind(payload: Dict[str, Any]) -> Tuple[str, List[Path]]:
     raw_name = str(payload.get("tool_name") or "")
     name = re.split(r"[.:]|__", raw_name)[-1].lower()
-    args = payload.get("tool_input")
-    args = args if isinstance(args, dict) else {}
+    raw_input = payload.get("tool_input")
+    args = raw_input if isinstance(raw_input, dict) else {}
     if name in CODEX_DELEGATION_TOOLS or name in ("view_image", "imagegen"):
-        return "blocked_always"
+        return "blocked_always", []
     if name in CODEX_READ_TOOLS:
-        return "readonly_inspect"
+        return "readonly_inspect", []
     if name in ("bash", "exec_command", "run_command"):
-        return _classify_run_command(str(args.get("command") or args.get("cmd") or args.get("CommandLine") or ""))
+        return _classify_run_command(str(args.get("command") or args.get("cmd") or args.get("CommandLine") or "")), []
     if name in ("apply_patch", "edit", "write"):
-        command = str(args.get("command") or args.get("patch") or "")
-        if _codex_handoff_patch_only(command, str(payload.get("cwd") or "")):
-            return "handoff_document"
+        command = str(args.get("command") or args.get("patch") or args.get("patch_text") or
+                      (raw_input if isinstance(raw_input, str) else ""))
+        targets = _codex_handoff_patch_paths(command, str(payload.get("cwd") or ""))
+        if targets:
+            return "handoff_document", targets
     # 未识别工具不赋予只读豁免；严格模式 drain 中计入预算，freeze 中拒绝。
-    return "mutating_other"
-
-
-def _codex_handoff_reply_present(text: str) -> bool:
-    """仅检查交接结构，不替代总控对进度和证据的语义核验。"""
-    return (_reply_has_handoff_prompt(text)
-            and bool(re.search(r"已验证|已完成|进展|verified|completed", text, re.IGNORECASE))
-            and bool(re.search(r"未完成|待办|下一步|剩余|remaining|next steps", text, re.IGNORECASE))
-            and bool(re.search(r"git|提交|工作区|workspace", text, re.IGNORECASE)))
+    return "mutating_other", []
 
 
 def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "advisory",
                          compact_limit: int = 0) -> Dict[str, Any]:
     """Codex 原生协议入口。advisory 永不阻断；enforce 只采用显式策略。"""
     event = str(payload.get("hook_event_name") or "")
-    sid = str(payload.get("session_id") or "")
     if event not in CODEX_EVENTS or mode == "off":
         return {}
     if mode not in ("advisory", "enforce") or isinstance(compact_limit, bool) or compact_limit < 0:
         raise ValueError("无效的 Codex 交接策略")
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", sid):
-        return {"systemMessage": "Codex 长会话门禁未启用：会话标识缺失或不合法。"}
-    if payload.get("agent_id") and str(payload["agent_id"]) != sid:
+    sid, transcript, identity_error, skip = user_words.codex_hook_session(payload)
+    if skip:
         return {}
-    raw_transcript = str(payload.get("transcript_path") or "")
-    if not raw_transcript:
-        return {"systemMessage": "Codex 长会话门禁仅提示：缺少轨迹，无法确认主会话身份。"}
-    transcript = Path(raw_transcript)
-    meta, error = user_words.read_codex_rollout_meta(transcript)
-    if meta and meta.get("source_kind") == "subagent":
-        return {}
-    if error or not meta or meta.get("id") != sid:
-        return {"systemMessage": "Codex 长会话门禁仅提示：轨迹与主会话身份未核实，本次不更新状态。"}
+    if transcript is None:
+        return {"systemMessage": f"Codex 长会话门禁未更新。{identity_error}。"}
     state_dir = Path(state_dir)
-    with _gate_state_lock(state_dir, sid, strict=True):
+    with user_words.session_state_lock(state_dir, sid):
         state_path = _gate_state_path(state_dir, sid)
         if state_path.exists():
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            if not isinstance(state, dict) or state.get("client") != "codex" or state.get("version") != 1:
+            if (not isinstance(state, dict) or state.get("client") != "codex" or state.get("version") != 1
+                    or state.get("conversationId") != sid or not isinstance(state.get("observedEvents"), list)
+                    or state.get("phase") not in ("normal", "advisory", "drain", "freeze", "overridden")):
                 raise ValueError("Codex 门禁状态格式不兼容，保留原文件")
         else:
             state = {"client": "codex", "version": 1, "conversationId": sid, "phase": "normal",
@@ -1549,15 +1734,9 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
         if event not in state["observedEvents"]:
             state["observedEvents"].append(event)
         state.update(mode=mode, compactLimit=compact_limit, lastModel=str(payload.get("model") or "unknown"))
-        if event == "PostCompact":
-            key = _codex_compaction_key(payload, transcript)
-            if key and key not in state["compactionKeys"]:
-                state["compactionKeys"].append(key)
-                state["compactionKeys"] = state["compactionKeys"][-512:]
-                state["compactionCount"] += 1
-            state["compactionIdentity"] = "rollout_record" if key.startswith("record:") else "turn_fallback" if key else "unknown"
-            if state["phase"] == "normal":
-                state["phase"] = "advisory"
+        _reconcile_codex_compactions(payload, transcript, state)
+        if state["phase"] == "normal" and (event == "PostCompact" or state["compactionCount"]):
+            state["phase"] = "advisory"
         count = state["compactionCount"]
         if state["phase"] == "overridden" and count >= state["overrideUntilCount"]:
             state["phase"] = "advisory"
@@ -1574,15 +1753,19 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
                 # 只处理短而明确的用户指令，引用长文中的相同短语不改变门禁。
                 if len(prompt) <= 160 and CODEX_OVERRIDE_REQUEST_RE.fullmatch(prompt):
                     state.update(phase="overridden", overrideUntilCount=count + OVERRIDE_SNOOZE_CPS,
-                                 stopCorrectionRequested=False, handoffRecorded=False)
+                                 stopCorrectionRequested=False, handoffRecorded=False, toolDecisions={},
+                                 handoffFileBaselines={})
                     enter_drain = False
                 elif CODEX_HANDOFF_REQUEST_RE.fullmatch(prompt):
                     enter_drain = state["phase"] not in ("drain", "freeze")
         if enter_drain:
             state.update(phase="drain", drainActionsRemaining=CODEX_DRAIN_ACTIONS,
-                         stopCorrectionRequested=False, handoffRecorded=False)
+                         stopCorrectionRequested=False, handoffRecorded=False, toolDecisions={},
+                         handoffFileBaselines={})
         phase = state["phase"]
         notice = _codex_notice(phase, count, mode)
+        if state["compactionIssues"]:
+            notice += " 压缩轨迹对账存在缺口，次数按当前可见证据保守计算。"
         response: Dict[str, Any] = {}
         if event in ("PostCompact", "SessionStart"):
             if event == "PostCompact" or payload.get("source") == "compact" or phase in ("drain", "freeze", "overridden"):
@@ -1593,20 +1776,24 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
             tool_id = str(payload.get("tool_use_id") or "")
             previous = state.setdefault("toolDecisions", {})
             if tool_id and tool_id in previous:
+                save_gate_state(state_dir, sid, state)
                 return previous[tool_id]
-            kind = _codex_tool_kind(payload)
+            kind, targets = _codex_tool_kind(payload)
             if kind == "blocked_always" or (phase == "freeze" and kind == "mutating_other"):
                 response = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                             "permissionDecisionReason": notice}}
             elif kind == "mutating_other":
                 consume_drain_action(state)
                 response = _codex_context(event, notice)
+            elif kind == "handoff_document":
+                for target in targets:
+                    _record_handoff_baseline(state, target)
             if tool_id:
                 previous[tool_id] = response
                 state["toolDecisions"] = dict(list(previous.items())[-512:])
         elif event == "Stop" and mode == "enforce" and phase in ("drain", "freeze"):
             reply = str(payload.get("last_assistant_message") or "")
-            if _codex_handoff_reply_present(reply):
+            if _handoff_structure_present(reply) or _has_valid_handoff_file(state):
                 state.update(phase="freeze", handoffRecorded=True)
                 response = {"continue": False, "stopReason": "已记录交接结构，结束当前回合；目标与后台任务状态须由用户/总控另行核对。"}
             elif payload.get("stop_hook_active") or state["stopCorrectionRequested"]:

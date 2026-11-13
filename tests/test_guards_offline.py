@@ -11,6 +11,7 @@ test_guards_offline.py - 防空转门禁 (status_guard) 与防刷屏门禁 (repl
 7. 【防误杀真实进展】连续 3 次包含不同迭代步数/残差数值的短回复、或含等待用户指示/提问的回复绝不误拦截。
 """
 
+import concurrent.futures
 import json
 import os
 import sys
@@ -291,11 +292,11 @@ class TestGuardsOffline(unittest.TestCase):
         }
         for allowed_runtime_path in (
             "/mnt/x/Projects/myproj/src/a.py",
-            "/tmp/cae_stage_check.json",
-            "/home/alice/.gemini/antigravity/brain/subagent-uuid-001/scratch/note.md",
-            r"C:\Users\alice\.gemini\antigravity\plugin_data\user-guard\state\conv_user_words.md",
-            "/home/alice/.codex/memories/proj_memo.json",
-            "/home/alice/.cache/solver-venv/pip-wheel.json",
+            str(Path(tempfile.gettempdir()) / "cae_stage_check.json"),
+            str(Path.home() / ".gemini/antigravity/brain/subagent-uuid-001/scratch/note.md"),
+            str(Path.home() / ".gemini/antigravity/plugin_data/user-guard/state/conv_user_words.md"),
+            str(Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "memories/proj_memo.json"),
+            str(Path.home() / ".cache/solver-venv/pip-wheel.json"),
         ):
             self.assertEqual(
                 status_guard.handle_pre_tool_use(
@@ -622,7 +623,7 @@ class TestGuardsOffline(unittest.TestCase):
             "allow",
         )
 
-        # R4 项目越界检查优先级仍高于 handoff_gate
+        # drain 中普通项目外请求仍走 R4 审批
         outside_path = self.tmp_root / "outside_dir" / "bad.txt"
         res_r4 = status_guard.handle_pre_tool_use(
             {
@@ -736,7 +737,11 @@ class TestGuardsOffline(unittest.TestCase):
             )["decision"],
             "allow",
         )
-        handoff_doc.write_text("# 本会话交接档案\n\n已完成核对，可在新对话继续推进第 4 批。\n" * 3, encoding="utf-8")
+        handoff_doc.write_text(
+            "# 本会话交接档案\n\n已验证：已核对前三批。\nGit 工作区：保留当前结果。\n"
+            "未完成：第 4 批待运行。\n\n## 新对话提示词\n请读取本文件和用户裁定，核对前三批结果后运行第 4 批。\n",
+            encoding="utf-8",
+        )
 
         # Stop 门禁：已落盘交接档但 /goal 未带 <!-- GOAL_CANCELLED --> 时先拦截 1 次；同回合续跑必放行
         _append_jsonl(tp, {"step_index": 20, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "已写入交接文档，停机等待新对话。"})
@@ -773,7 +778,10 @@ class TestGuardsOffline(unittest.TestCase):
         # 验证 Stop 门禁面对带 truncated_fields: ["content"] 的截断交接回复时，能回溯 transcript_full.jsonl 放行
         _append_jsonl(tp, {"step_index": 23, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "/goal\n再核一次截断回复"})
         full_tp = tp.parent / "transcript_full.jsonl"
-        full_reply = "完整收口交接已完成。\n```markdown\n接续提示词正文足够长用于新会话接续。\n```\n<!-- GOAL_CANCELLED -->"
+        full_reply = (
+            "已验证：前三批通过本地核对。\nGit 工作区：保留当前结果。\n未完成：第 4 批。\n"
+            "## 新对话提示词\n```markdown\n请核对前三批并完成第 4 批的验收。\n```\n<!-- GOAL_CANCELLED -->"
+        )
         _append_jsonl(
             tp,
             {
@@ -831,9 +839,8 @@ class TestGuardsOffline(unittest.TestCase):
         gs["phase"] = "freeze"
         handoff_gate.save_gate_state(state_dir, conv_id, gs)
 
-        # 1) Python Path('src') / '/abs/outside' 与 Path('src', '/abs/outside') 必须被 R4 拦下
-        res_ast = status_guard.handle_pre_tool_use(
-            {
+        # 1) 同一 AST 越界在常态要求审批，在冻结阶段必须直接阻断。
+        ast_payload = {
                 "conversationId": conv_id,
                 "cwd": str(ws_dir),
                 "workspacePaths": [str(ws_dir)],
@@ -841,9 +848,15 @@ class TestGuardsOffline(unittest.TestCase):
                     "name": "run_command",
                     "args": {"CommandLine": f'python -c "from pathlib import Path; (Path(\'src\') / \'{outside_abs}\').write_text(\'x\')"'},
                 },
-            }
-        )
-        self.assertEqual(res_ast["decision"], "force_ask")
+        }
+        self.assertEqual(status_guard.handle_pre_tool_use(ast_payload)["decision"], "deny")
+        gs["phase"] = "overridden"
+        gs["overrideUntilCheckpoint"] = 100
+        gs["overrideUntilStep"] = 10000
+        handoff_gate.save_gate_state(state_dir, conv_id, gs)
+        self.assertEqual(status_guard.handle_pre_tool_use(ast_payload)["decision"], "force_ask")
+        gs["phase"] = "freeze"
+        handoff_gate.save_gate_state(state_dir, conv_id, gs)
 
         # 2) echo "$(git push origin main)" 在 freeze/drain 期必须阻断
         res_sub = status_guard.handle_pre_tool_use(
@@ -884,6 +897,185 @@ class TestGuardsOffline(unittest.TestCase):
             {"conversationId": conv_id, "terminationReason": "NO_TOOL_CALL", "transcriptPath": str(tp)}
         )
         self.assertEqual(res_stop["decision"], "continue")
+
+    def test_native_stop_model_reason_and_concurrent_correction(self) -> None:
+        import handoff_gate
+        import session_context_loader
+
+        cid = "agy-native-model-stop"
+        transcript = self.tmp_root / "transcript.jsonl"
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 0, "content": "请整理交接并停机"})
+        payload = {"conversationId": cid, "transcriptPath": str(transcript), "lastUserInput": "请整理交接并停机",
+                   "executionNum": 1, "fullyIdle": False, "error": "", "terminationReason": "model_stop"}
+        session_context_loader.handle_pre_invocation(payload)
+        _append_jsonl(transcript, {"type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 1, "content": "尚未写好"})
+        for changes in ({"terminationReason": "error"}, {"terminationReason": "max_steps_exceeded"},
+                        {"error": "runtime error"}, {"continuationActive": True}):
+            self.assertEqual(reply_repeat_guard.handle_stop_repeat_guard({**payload, **changes})["decision"], "allow")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            replies = list(pool.map(lambda _: reply_repeat_guard.handle_stop_repeat_guard(payload), range(8)))
+        self.assertEqual([reply["decision"] for reply in replies].count("continue"), 1)
+        state_dir = self.plugin_data / "state"
+        state = handoff_gate.load_gate_state(state_dir, cid)
+        self.assertEqual(len(state["stopGateBlockedTurnKeys"]), 1)
+        state_file = state_dir / f"{cid}_handoff_gate.json"
+        state_file.write_text("{bad", encoding="utf-8")
+        self.assertEqual(reply_repeat_guard.handle_stop_repeat_guard(payload)["decision"], "allow")
+        self.assertEqual(state_file.read_text(encoding="utf-8"), "{bad")
+        log = self.plugin_data / "logs" / "lifecycle.log"
+        self.assertIn("Stop 状态未更新", log.read_text(encoding="utf-8"))
+
+    def test_stop_requires_changed_handoff_document_and_unquoted_goal_marker(self) -> None:
+        import session_context_loader
+
+        cid = "agy-stop-handoff-file"
+        project = self.tmp_root / "project"
+        project.mkdir()
+        handoff = project / "handoff.md"
+        transcript = self.tmp_root / "transcript.jsonl"
+        document = (
+            "已验证：已完成一轮。\nGit 工作区：当前仍有修改。\n未完成：下一轮验收。\n"
+            "## 新对话提示词\n请从当前工作区继续未完成的数值验收并保存原始记录。\n"
+        )
+        handoff.write_text(document, encoding="utf-8")
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 0, "content": "/goal\n请整理交接并停机"})
+        payload = {"conversationId": cid, "transcriptPath": str(transcript), "cwd": str(project),
+                   "workspacePaths": [str(project)], "terminationReason": "model_stop", "fullyIdle": True}
+        session_context_loader.handle_pre_invocation(payload)
+        approved = status_guard.handle_pre_tool_use({
+            **payload, "toolCall": {"name": "write_to_file", "args": {"TargetFile": str(handoff), "CodeContent": document}},
+        })
+        self.assertEqual(approved["decision"], "allow")
+        _append_jsonl(transcript, {"type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 1,
+                                  "content": "已整理。\n<!-- GOAL_CANCELLED -->"})
+        no_change = reply_repeat_guard.handle_stop_repeat_guard(payload)
+        self.assertEqual(no_change["decision"], "continue")
+        self.assertIn("尚未落盘", no_change["reason"])
+        handoff.write_text(document + "\n本轮新核对：保留最近一次日志。\n", encoding="utf-8")
+        for index, content in enumerate((
+            "    <!-- GOAL_CANCELLED -->",
+            "文档已更新。\n> <!-- GOAL_CANCELLED -->",
+            "文档已更新。\n~~~html\n<!-- GOAL_CANCELLED -->",
+            "文档已更新。\n<!-- GOAL_CANCELLED -->\n附注。",
+            "文档已更新。\n<!-- GOAL_CANCELLED -->",
+        )):
+            _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": index * 2 + 2, "content": "/goal\n继续交接验收"})
+            _append_jsonl(transcript, {"type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": index * 2 + 3,
+                                      "content": content})
+            result = reply_repeat_guard.handle_stop_repeat_guard(payload)
+            if index == 4:
+                self.assertEqual(result["decision"], "allow")
+            else:
+                self.assertEqual(result["decision"], "continue")
+                self.assertIn("GOAL_CANCELLED", result["reason"])
+                self.assertNotIn("尚未落盘", result["reason"])
+
+    def test_standard_temp_does_not_allow_business_name_or_link_escape(self) -> None:
+        from unittest import mock
+
+        root = self.tmp_root
+        project = root / "workspace"
+        runtime_temp = root / "actual-temp"
+        other = root / "outside"
+        for path in (project, runtime_temp, other):
+            path.mkdir()
+        payload = {"conversationId": "temp-boundary", "cwd": str(project), "workspacePaths": [str(project)]}
+
+        def write(target):
+            return status_guard.handle_pre_tool_use({
+                **payload, "toolCall": {"name": "write_to_file", "args": {"TargetFile": str(target), "CodeContent": "x"}},
+            })["decision"]
+
+        with mock.patch.object(status_guard.tempfile, "gettempdir", return_value=str(runtime_temp)):
+            self.assertEqual(write(runtime_temp / "probe.txt"), "allow")
+            self.assertEqual(write(other / "AppData/Local/Temp/probe.txt"), "force_ask")
+            self.assertEqual(write(other / "Users/not-the-current-user/.cache/probe.txt"), "force_ask")
+            link = runtime_temp / "escape"
+            try:
+                link.symlink_to(other, target_is_directory=True)
+            except OSError:
+                if os.name != "nt":
+                    raise
+                import subprocess
+
+                proc = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                     "New-Item -ItemType Junction -Path $env:UG_LINK -Target $env:UG_TARGET | Out-Null"],
+                    env={**os.environ, "UG_LINK": str(link), "UG_TARGET": str(other)},
+                    capture_output=True, timeout=10,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(write(link / "probe.txt"), "force_ask")
+
+    @unittest.skipUnless(os.name == "nt", "仅 Windows 钩子负责识别显式 WSL 调用")
+    def test_wsl_temp_exception_tracks_execution_scope_and_physical_probe(self) -> None:
+        from unittest import mock
+
+        project = self.tmp_root / "workspace"
+        project.mkdir()
+        payload = {"conversationId": "wsl-temp-boundary", "cwd": str(project), "workspacePaths": [str(project)]}
+
+        def check(command):
+            return status_guard.handle_pre_tool_use({
+                **payload, "toolCall": {"name": "run_command", "args": {"CommandLine": command}},
+            })["decision"]
+
+        runtime_root = self.tmp_root / "runtime-temp"
+        runtime_root.mkdir()
+        with mock.patch.object(status_guard.tempfile, "gettempdir", return_value=str(runtime_root)), \
+                mock.patch.object(status_guard.subprocess, "run") as run:
+            def probe(args, **kwargs):
+                self.assertEqual(args[1:3], ["-d", "Ubuntu-24.04"])
+                self.assertEqual(args[3:8], ["--exec", "/usr/bin/python3", "-B", "-I", "-c"])
+                self.assertNotIn("/tmp/nested/out.txt", args)
+                targets = json.loads(kwargs["input"])
+                if targets == ["/tmp/nested/out.txt"]:
+                    return mock.Mock(returncode=0, stdout=json.dumps(targets).encode())
+                return mock.Mock(returncode=0, stdout=b"[]")
+
+            run.side_effect = probe
+            self.assertEqual(check("wsl -d Ubuntu-24.04 --exec touch /tmp/nested/out.txt"), "allow")
+            self.assertEqual(check("wsl.exe -d Ubuntu-24.04 -- bash -lc 'printf x > /tmp/nested/out.txt'"), "allow")
+            self.assertEqual(check("wsl -d Ubuntu-24.04 --exec touch /tmp/link-out/out.txt"), "force_ask")
+            self.assertEqual(check("wsl -d Ubuntu-24.04 --exec touch /tmp/../etc/out.txt"), "force_ask")
+            previous = run.call_count
+            self.assertEqual(check("wsl -d Ubuntu-24.04 --exec touch /tmp/nested/out.txt > /tmp/host-output"), "force_ask")
+            self.assertEqual(check("wsl -d Ubuntu-24.04 --exec touch /var/tmp/out.txt"), "force_ask")
+            self.assertEqual(check("touch /tmp/nested/out.txt"), "force_ask")
+            self.assertEqual(run.call_count, previous)
+
+    def test_freeze_overrides_external_approval_and_recognizes_documented_tools(self) -> None:
+        import handoff_gate
+        import session_context_loader
+
+        cid = "agy-freeze-r4"
+        project = self.tmp_root / "project"
+        project.mkdir()
+        transcript = self.tmp_root / "transcript.jsonl"
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 0, "content": "请整理交接并停机"})
+        payload = {"conversationId": cid, "transcriptPath": str(transcript), "cwd": str(project),
+                   "workspacePaths": [str(project)]}
+        session_context_loader.handle_pre_invocation(payload)
+        def call(name, args):
+            return status_guard.handle_pre_tool_use({**payload, "toolCall": {"name": name, "args": args}})
+        outside = self.tmp_root / "outside" / "solver.py"
+        self.assertEqual(call("write_to_file", {"TargetFile": str(outside)})["decision"], "force_ask")
+        state_dir = self.plugin_data / "state"
+        state = handoff_gate.load_gate_state(state_dir, cid)
+        state["phase"] = "freeze"
+        handoff_gate.save_gate_state(state_dir, cid, state)
+        for name, args in (
+            ("replace_file_content", {"TargetFile": str(outside)}),
+            ("multi_replace_file_content", {"TargetFile": str(outside)}),
+            ("view_file", {"AbsolutePath": str(project / "plot.png")}),
+            ("run_command", {"CommandLine": "cat plot.png"}),
+            ("generate_image", {}),
+            ("unknown_tool", {}),
+        ):
+            self.assertEqual(call(name, args)["decision"], "deny", name)
+        self.assertEqual(call("view_file", {"AbsolutePath": str(project / "readme.md")})["decision"], "allow")
+        self.assertEqual(call("finish", {})["decision"], "allow")
+        self.assertEqual(call("write_to_file", {"TargetFile": str(outside.with_name("handoff.md"))})["decision"], "force_ask")
 
 
 if __name__ == "__main__":

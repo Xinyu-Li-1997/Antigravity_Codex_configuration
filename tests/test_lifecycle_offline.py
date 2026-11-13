@@ -12,12 +12,16 @@ test_lifecycle_offline.py - 上下文压缩原话回溯引擎离线单元测试�
 8. 子代理会话自动豁免主会话注入，且 PLUGIN_DATA 环境变量隔离生效。
 """
 
+import concurrent.futures
+import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOKS_DIR = Path(os.environ.get("USER_GUARD_INSTALLED_DIR", str(REPO_ROOT / "template" / "user-guard"))) / "hooks"
@@ -201,7 +205,7 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
             },
         )
 
-        # 3. 模型发起 ask_question 提问，紧随 GENERIC 用户选项框回答
+        # 3. 使用宿主调用标识关联选项结果，不能把中间的其它工具输出当成回答
         _append_jsonl(
             tp,
             {
@@ -211,6 +215,7 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
                 "tool_calls": [
                     {
                         "name": "ask_question",
+                        "id": "question-5",
                         "args": {"questions": [{"question": "选择时间推进格式", "options": ["SSP-RK3", "ADER"]}]},
                     }
                 ],
@@ -222,6 +227,17 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
                 "step_index": 6,
                 "source": "MODEL",
                 "type": "GENERIC",
+                "content": "不相关输出",
+                "tool_call_id": "other-6",
+            },
+        )
+        _append_jsonl(
+            tp,
+            {
+                "step_index": 7,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "tool_call_id": "question-5",
                 "content": "Created At: 2026-11-12T06:00:00+08:00\nCompleted At: 2026-11-12T06:00:05+08:00\nUser selected: SSP-RK3",
             },
         )
@@ -335,7 +351,12 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
                 "type": "response_item",
                 "ordinal": 3,
                 "timestamp": "2026-11-10T05:01:00Z",
-                "payload": {"id": "usr-msg-2", "type": "message", "role": "user", "content": "<environment_context>\nauto\n</environment_context>"},
+                "payload": {
+                    "id": "usr-msg-2", "type": "message", "role": "user", "content": "<environment_context>\nauto\n</environment_context>",
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_metadata": [{"provenance": {"type": "harness"}}],
+                    },
+                },
             },
         )
         _append_jsonl(
@@ -344,7 +365,12 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
                 "type": "response_item",
                 "ordinal": 4,
                 "timestamp": "2026-11-10T05:02:00Z",
-                "payload": {"id": "usr-msg-3", "type": "message", "role": "user", "content": "继续"},
+                "payload": {
+                    "id": "usr-msg-3", "type": "message", "role": "user", "content": "继续",
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_metadata": [{"provenance": {"type": "user"}}],
+                    },
+                },
             },
         )
         _append_jsonl(
@@ -353,7 +379,12 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
                 "type": "response_item",
                 "ordinal": 5,
                 "timestamp": "2026-11-10T05:03:00Z",
-                "payload": {"id": "usr-msg-4", "type": "message", "role": "user", "content": "继续"},
+                "payload": {
+                    "id": "usr-msg-4", "type": "message", "role": "user", "content": "继续",
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_metadata": [{"provenance": {"type": "user"}}],
+                    },
+                },
             },
         )
         _append_jsonl(
@@ -367,6 +398,9 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
                     "type": "message",
                     "role": "user",
                     "content": "<send_user_message_question_reply>采用熵稳定通量</send_user_message_question_reply>",
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_metadata": [{"provenance": {"type": "user"}}],
+                    },
                 },
             },
         )
@@ -423,6 +457,429 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
         self.assertIn("保留上次已验证文档", gap_ctx)
         self.assertEqual(md_file.read_text(encoding="utf-8"), md_text)
 
+    def test_codex_long_gap_preserves_provenance_and_reports_unverified_manifest(self) -> None:
+        sid = "codex-long-gap"
+        transcript = self.tmp_root / "rollout-long.jsonl"
+        state_dir = self.tmp_root / "session-context"
+        log = self.tmp_root / "hook-log.jsonl"
+        _append_jsonl(transcript, {"type": "session_meta", "payload": {"id": sid, "source": "vscode"}})
+
+        def add_user(index, body, origin="user"):
+            metadata = {"content_item_metadata": [{"provenance": {"type": origin}}]} if origin else {}
+            _append_jsonl(transcript, {"type": "response_item", "ordinal": index, "payload": {
+                "type": "message", "role": "user", "id": f"user-{index}", "content": body,
+                "internal_chat_message_metadata_passthrough": metadata,
+            }})
+
+        add_user(1, "# AGENTS.md instructions\n真实首轮立项")
+        for index in range(2, 23):
+            add_user(index, "中间工程约束。" * 250)
+        add_user(23, "最新裁定保留。")
+        payload = {"session_id": sid, "transcript_path": str(transcript), "source": "compact"}
+
+        def render():
+            return session_context_loader.handle_codex_session_start(
+                payload, str(state_dir), str(log),
+            )["hookSpecificOutput"]["additionalContext"]
+
+        self.assertIn("提取状态：成功", render())
+        md = self.tmp_root / "user-words" / f"{sid}.md"
+        md.write_text("可读，但和清单错配\n", encoding="utf-8")
+        add_user(24, "<environment_context>\n字面量输入候选\n</environment_context>", origin=None)
+        with transcript.open("ab") as stream:
+            stream.write(b'{"type":"response_item","payload":')
+        context = render()
+        self.assertLessEqual(len(context), session_context_loader.MAX_INLINE_TOTAL_CHARS)
+        self.assertIn("提取状态：存在缺口", context)
+        self.assertIn("正文可读，完整性未验证", context)
+        self.assertIn("原始轨迹：" + str(transcript), context)
+        self.assertIn("缺口信息", context)
+        self.assertIn("真实首轮立项", context)
+        self.assertIn("最新裁定保留", context)
+        self.assertIn("字面量输入候选", context)
+        self.assertIn("用户角色，来源未核实", context)
+        self.assertNotIn("保留上次已验证文档", context)
+        self.assertNotIn("完整归档", context)
+
+    def test_codex_archive_publication_failure_is_detectable_and_recoverable(self) -> None:
+        sid = "codex-publication"
+        transcript = self.tmp_root / "rollout.jsonl"
+        user_dir = self.tmp_root / "user-words"
+        _append_jsonl(transcript, {"type": "session_meta", "payload": {"id": sid, "source": "cli"}})
+        first = user_words.refresh_codex_session_archive(str(transcript), user_dir, sid)
+        self.assertTrue(first["saved"]["verified"])
+        _append_jsonl(transcript, {"type": "response_item", "payload": {"type": "message", "role": "user",
+                      "content": "并发归档记录", "internal_chat_message_metadata_passthrough": {
+                          "content_item_metadata": [{"provenance": {"type": "user"}}],
+                      }}})
+        with mock.patch.object(user_words, "atomic_write_json", side_effect=OSError("写清单被中断")):
+            interrupted = user_words.refresh_codex_session_archive(str(transcript), user_dir, sid)
+        self.assertFalse(interrupted["complete"])
+        self.assertTrue(interrupted["saved"]["available"])
+        self.assertFalse(interrupted["saved"]["verified"])
+        self.assertFalse(interrupted["saved"]["preserved"])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _: user_words.refresh_codex_session_archive(str(transcript), user_dir, sid), range(8)))
+        self.assertTrue(all(item["complete"] and item["saved"]["verified"] for item in results))
+        md = user_dir / f"{sid}.md"
+        manifest = user_dir / f"{sid}.json"
+        published = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(published["sha256"], hashlib.sha256(md.read_bytes()).hexdigest())
+        manifest.write_text('{"publication":{"sha256":"' + published["sha256"] + '"}}', encoding="utf-8")
+        gap = user_words.refresh_codex_session_archive("", user_dir, sid)
+        self.assertTrue(gap["saved"]["available"])
+        self.assertFalse(gap["saved"]["verified"])
+        self.assertFalse(gap["saved"]["preserved"])
+
+    def test_codex_legacy_manifest_migration_requires_matching_body_and_source_coverage(self) -> None:
+        for scenario in ("complete", "missing_segment", "bad_body_hash"):
+            with self.subTest(scenario=scenario):
+                sid = f"codex-v1-{scenario}"
+                older = self.tmp_root / ".codex" / "archived_sessions" / f"rollout-2026-01-01-{sid}.jsonl"
+                active = self.tmp_root / ".codex" / "sessions/2026/01/02" / f"rollout-2026-01-02-{sid}.jsonl"
+                user_dir = self.tmp_root / "user-words"
+                user_dir.mkdir(exist_ok=True)
+                md = user_dir / f"{sid}.md"
+                manifest = user_dir / f"{sid}.json"
+                for segment in (older, active):
+                    _append_jsonl(segment, {"type": "session_meta", "payload": {"id": sid, "source": "cli"}})
+
+                def user_message(segment, key, body):
+                    _append_jsonl(segment, {"type": "response_item", "payload": {
+                        "type": "message", "role": "user", "id": key, "content": body,
+                        "internal_chat_message_metadata_passthrough": {
+                            "content_item_metadata": [{"provenance": {"type": "user"}}],
+                        },
+                    }})
+
+                user_message(older, "old", "旧档案中的第一条原话")
+                parsed = user_words.extract_codex_session_words(str(active), sid)
+                v1_body = user_words.format_user_words_markdown(sid, parsed["words"]).replace(
+                    "# 会话用户原话归档", "# 会话用户原话全量留痕档案", 1,
+                )
+                user_words.atomic_write_text(md, v1_body)
+                user_words.atomic_write_json(manifest, {
+                    "format": "user-guard-codex-v1", "id": sid, "file": str(md), "count": 1,
+                    "last_time": "", "sources": parsed["sources"],
+                    "sha256": "0" * 64 if scenario == "bad_body_hash" else hashlib.sha256(md.read_bytes()).hexdigest(),
+                })
+                old_md, old_manifest = md.read_bytes(), manifest.read_bytes()
+                unavailable = user_words.refresh_codex_session_archive("", user_dir, sid)
+                self.assertFalse(unavailable["saved"]["verified"])
+                self.assertFalse(unavailable["saved"]["preserved"])
+                if scenario != "bad_body_hash":
+                    self.assertTrue(unavailable["saved"]["manifest_verified"])
+                    self.assertTrue(unavailable["saved"]["legacy_manifest"])
+                    self.assertEqual(unavailable["saved"]["sources"], parsed["sources"])
+                user_message(active, "new", "升级期间新增的用户原话")
+                if scenario == "missing_segment":
+                    older.rename(older.with_suffix(".unavailable"))
+                result = user_words.refresh_codex_session_archive(str(active), user_dir, sid)
+                if scenario == "complete":
+                    self.assertTrue(result["complete"])
+                    self.assertTrue(result["saved"]["verified"])
+                    self.assertEqual(result["saved"]["count"], 2)
+                    self.assertIn("升级期间新增的用户原话", md.read_text(encoding="utf-8"))
+                    self.assertEqual(json.loads(manifest.read_bytes())["format"], "user-guard-codex-v2")
+                else:
+                    self.assertFalse(result["complete"])
+                    self.assertFalse(result["saved"]["verified"])
+                    self.assertFalse(result["saved"]["preserved"])
+                    self.assertEqual(md.read_bytes(), old_md)
+                    self.assertEqual(manifest.read_bytes(), old_manifest)
+                    if scenario == "missing_segment":
+                        self.assertTrue(any(str(older) in issue for issue in result["issues"]))
+                    else:
+                        self.assertTrue(any("正文哈希与校验清单不匹配" in issue for issue in result["issues"]))
+
+    def test_codex_interrupted_publication_cannot_hide_a_missing_segment(self) -> None:
+        sid = "codex-interrupted-missing-segment"
+        older = self.tmp_root / ".codex" / "archived_sessions" / f"rollout-2026-01-01-{sid}.jsonl"
+        active = self.tmp_root / ".codex" / "sessions/2026/01/02" / f"rollout-2026-01-02-{sid}.jsonl"
+        user_dir = self.tmp_root / "user-words"
+        md = user_dir / f"{sid}.md"
+        manifest = user_dir / f"{sid}.json"
+        for segment in (older, active):
+            _append_jsonl(segment, {"type": "session_meta", "payload": {"id": sid, "source": "cli"}})
+
+        def user_message(segment, key, body):
+            _append_jsonl(segment, {"type": "response_item", "payload": {
+                "type": "message", "role": "user", "id": key, "content": body,
+                "internal_chat_message_metadata_passthrough": {
+                    "content_item_metadata": [{"provenance": {"type": "user"}}],
+                },
+            }})
+
+        user_message(older, "older", "早期分段独有原话")
+        self.assertTrue(user_words.refresh_codex_session_archive(str(active), user_dir, sid)["complete"])
+        old_manifest = manifest.read_bytes()
+        user_message(active, "new", "后续分段新增原话")
+        with mock.patch.object(user_words, "atomic_write_json", side_effect=OSError("写清单被中断")):
+            self.assertFalse(user_words.refresh_codex_session_archive(str(active), user_dir, sid)["complete"])
+        pending_body = md.read_bytes()
+        self.assertIn("早期分段独有原话", pending_body.decode())
+        self.assertIn("后续分段新增原话", pending_body.decode())
+        unavailable = older.with_suffix(".unavailable")
+        older.rename(unavailable)
+        failed = user_words.refresh_codex_session_archive(str(active), user_dir, sid)
+        self.assertFalse(failed["complete"])
+        self.assertFalse(failed["saved"]["verified"])
+        self.assertFalse(failed["saved"]["preserved"])
+        self.assertTrue(any(str(older) in issue for issue in failed["issues"]))
+        self.assertEqual(md.read_bytes(), pending_body)
+        self.assertEqual(manifest.read_bytes(), old_manifest)
+
+        unavailable.rename(older)
+        with mock.patch.object(user_words, "atomic_write_text", wraps=user_words.atomic_write_text) as writes:
+            restored = user_words.refresh_codex_session_archive(str(active), user_dir, sid)
+        self.assertTrue(restored["saved"]["verified"])
+        self.assertEqual(md.read_bytes(), pending_body)
+        self.assertEqual([call.args[0] for call in writes.call_args_list], [manifest])
+
+    def test_codex_later_system_provenance_corrects_and_reports_conflicts(self) -> None:
+        for first_origin, second_origin in ((None, "harness"), ("user", "agents_md"), ("harness", "user")):
+            with self.subTest(first=first_origin, later=second_origin):
+                sid = f"codex-source-{first_origin}-{second_origin}"
+                older = self.tmp_root / ".codex" / "archived_sessions" / f"rollout-2026-01-01-{sid}.jsonl"
+                active = self.tmp_root / ".codex" / "sessions/2026/01/02" / f"rollout-2026-01-02-{sid}.jsonl"
+                user_dir = self.tmp_root / "user-words"
+                for segment in (older, active):
+                    _append_jsonl(segment, {"type": "session_meta", "payload": {"id": sid, "source": "cli"}})
+
+                def message(segment, origin):
+                    metadata = {"content_item_metadata": [{"provenance": {"type": origin}}]} if origin else {}
+                    _append_jsonl(segment, {"type": "response_item", "payload": {
+                        "type": "message", "role": "user", "id": "shared-input", "content": "来源待判定的内容",
+                        "internal_chat_message_metadata_passthrough": metadata,
+                    }})
+
+                message(older, first_origin)
+                user_words.refresh_codex_session_archive(str(active), user_dir, sid)
+                message(active, second_origin)
+                result = user_words.refresh_codex_session_archive(str(active), user_dir, sid)
+                self.assertEqual(result["words"], [])
+                self.assertEqual(result["complete"], first_origin is None)
+                self.assertEqual(any("用户与系统来源冲突" in issue for issue in result["issues"]), first_origin is not None)
+                self.assertTrue(result["saved"]["manifest_verified"])
+                self.assertNotIn("来源待判定的内容", (user_dir / f"{sid}.md").read_text(encoding="utf-8"))
+
+    def test_codex_attachment_and_cross_segment_provenance_upgrade(self) -> None:
+        sid = "codex-attachment-history"
+        first = self.tmp_root / ".codex" / "archived_sessions" / f"rollout-2026-01-01-{sid}.jsonl"
+        second = self.tmp_root / ".codex" / "sessions/2026/01/02" / f"rollout-2026-01-02-{sid}.jsonl"
+        for transcript in (first, second):
+            _append_jsonl(transcript, {"type": "session_meta", "payload": {"id": sid, "source": "cli"}})
+        attachment = {"type": "input_image", "file_id": "fixture-image"}
+        _append_jsonl(first, {"type": "response_item", "payload": {
+            "type": "message", "role": "user", "id": "image-1", "content": [attachment],
+        }})
+        _append_jsonl(second, {"type": "response_item", "payload": {
+            "type": "message", "role": "user", "id": "image-1", "content": [attachment],
+            "internal_chat_message_metadata_passthrough": {"content_item_metadata": [
+                {"provenance": {"type": "user"}},
+            ]},
+        }})
+        user_dir = self.tmp_root / "user-words"
+        result = user_words.refresh_codex_session_archive(str(second), user_dir, sid)
+        self.assertTrue(result["complete"])
+        self.assertEqual(len(result["words"]), 1)
+        self.assertTrue(result["words"][0]["provenance_verified"])
+        self.assertEqual(result["words"][0]["source_path"], str(second))
+        body = (user_dir / f"{sid}.md").read_text(encoding="utf-8")
+        self.assertIn("图片附件", body)
+        self.assertIn(str(second), body)
+        self.assertNotIn("fixture-image", body)
+
+        _append_jsonl(second, {"type": "response_item", "payload": {
+            "type": "message", "role": "user", "id": "image-1",
+            "content": [{"type": "input_image", "file_id": "another-image"}],
+            "internal_chat_message_metadata_passthrough": {"content_item_metadata": [
+                {"provenance": {"type": "user"}},
+            ]},
+        }})
+        conflict = user_words.extract_codex_session_words(str(second), sid)
+        self.assertFalse(conflict["complete"])
+        self.assertEqual(len(conflict["words"]), 2)
+        self.assertTrue(any("内容冲突" in issue for issue in conflict["issues"]))
+
+    def test_codex_archive_updates_partial_history_and_preserves_missing_segment(self) -> None:
+        sid = "codex-archive-coverage"
+        older = self.tmp_root / ".codex" / "archived_sessions" / f"rollout-2026-01-01-{sid}.jsonl"
+        active = self.tmp_root / ".codex" / "sessions/2026/01/02" / f"rollout-2026-01-02-{sid}.jsonl"
+        user_dir = self.tmp_root / "user-words"
+        archive = user_dir / f"{sid}.md"
+        for segment in (older, active):
+            _append_jsonl(segment, {"type": "session_meta", "payload": {"id": sid, "source": "cli"}})
+
+        def user_message(segment, key, body, origin=None):
+            metadata = {"content_item_metadata": [{"provenance": {"type": origin}}]} if origin else {}
+            _append_jsonl(segment, {"type": "response_item", "payload": {
+                "type": "message", "role": "user", "id": key, "content": body,
+                "internal_chat_message_metadata_passthrough": metadata,
+            }})
+
+        user_message(older, "initial", "早期原话，初次缺少来源标记")
+        self.assertFalse(user_words.refresh_codex_session_archive(str(active), user_dir, sid)["complete"])
+        user_message(active, "later", "本轮新增且来源已核实", "user")
+        partial = user_words.refresh_codex_session_archive(str(active), user_dir, sid)
+        self.assertFalse(partial["complete"])
+        self.assertTrue(partial["saved"]["manifest_verified"])
+        self.assertIn("本轮新增且来源已核实", archive.read_text(encoding="utf-8"))
+        user_message(active, "initial", "早期原话，初次缺少来源标记", "user")
+        complete = user_words.refresh_codex_session_archive(str(active), user_dir, sid)
+        self.assertTrue(complete["complete"])
+        before = archive.read_bytes()
+        older.rename(older.with_suffix(".unavailable"))
+        gap = user_words.refresh_codex_session_archive(str(active), user_dir, sid)
+        self.assertFalse(gap["complete"])
+        self.assertTrue(gap["saved"]["preserved"])
+        self.assertTrue(any(str(older) in issue for issue in gap["issues"]))
+        self.assertEqual(archive.read_bytes(), before)
+
+    def test_codex_gate_and_archive_use_independent_lock_namespaces(self) -> None:
+        import handoff_gate
+
+        sid = "codex-independent-locks"
+        transcript = self.tmp_root / "rollout.jsonl"
+        _append_jsonl(transcript, {"type": "session_meta", "payload": {"id": sid, "source": "cli"}})
+        state = self.tmp_root / "state"
+        with user_words.session_state_lock(state / "user-words", sid):
+            response = handoff_gate.handle_codex_handoff(
+                {"session_id": sid, "hook_event_name": "SessionStart", "source": "compact",
+                 "transcript_path": str(transcript)}, state / "handoff",
+            )
+            self.assertIn("hookSpecificOutput", response)
+        with user_words.session_state_lock(state / "handoff", sid):
+            self.assertTrue(user_words.refresh_codex_session_archive(str(transcript), state / "user-words", sid)["complete"])
+
+    def test_implicit_question_result_remains_unverified_and_full_log_repairs_pending_checkpoint(self) -> None:
+        cid = "agy-archive-gap"
+        transcript = self.tmp_root / "transcript.jsonl"
+        full = self.tmp_root / "transcript_full.jsonl"
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 0, "content": "<USER_REQUEST>\n正文待补",
+                                  "truncated_fields": ["content"]})
+        _append_jsonl(transcript, {"type": "PLANNER_RESPONSE", "step_index": 1, "tool_calls": [{"name": "ask_question"}]})
+        _append_jsonl(transcript, {"type": "GENERIC", "step_index": 2, "content": "User selected: 未核对候选"})
+        _append_jsonl(transcript, {"type": "CHECKPOINT", "step_index": 3})
+        payload = {"conversationId": cid, "transcriptPath": str(transcript)}
+        first = session_context_loader.handle_pre_invocation(payload)
+        context = first["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn("截断正文待补", context)
+        self.assertIn("选项回答来源未核实", context)
+        self.assertNotIn("未核对候选", context)
+        for _ in range(4):
+            self.assertEqual(session_context_loader.handle_pre_invocation(payload)["injectSteps"], [])
+        _append_jsonl(full, {"type": "USER_INPUT", "step_index": 0, "content": "<USER_REQUEST>\n已补齐正文\n</USER_REQUEST>"})
+        updated = session_context_loader.handle_pre_invocation(payload)["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn("已补齐正文", updated)
+        self.assertNotIn("截断正文待补", updated)
+        self.assertIn("选项回答来源未核实", updated)
+        archive = self.plugin_data / "state" / f"{cid}_user_words.md"
+        self.assertIn("已补齐正文", archive.read_text(encoding="utf-8"))
+        self.assertNotIn("未核对候选", archive.read_text(encoding="utf-8"))
+
+    def test_agy_late_full_control_updates_latest_turn_and_goal(self) -> None:
+        import handoff_gate
+
+        cid = "agy-late-control"
+        state_dir = self.plugin_data / "state"
+        transcript = self.tmp_root / "transcript.jsonl"
+        full = self.tmp_root / "transcript_full.jsonl"
+        payload = {"conversationId": cid, "transcriptPath": str(transcript)}
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 0, "content": "请整理交接并停机"})
+        session_context_loader.handle_pre_invocation(payload)
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 1, "content": "先别交接",
+                                  "truncated_fields": ["content"]})
+        session_context_loader.handle_pre_invocation(payload)
+        self.assertEqual(handoff_gate.load_gate_state(state_dir, cid)["phase"], "drain")
+        _append_jsonl(full, {"type": "USER_INPUT", "step_index": 1, "content": "/goal\n先别交接"})
+        session_context_loader.handle_pre_invocation(payload)
+        gate = handoff_gate.load_gate_state(state_dir, cid)
+        self.assertEqual(gate["phase"], "overridden")
+        self.assertTrue(gate["isGoalActive"])
+
+        _append_jsonl(transcript, {"type": "PLANNER_RESPONSE", "step_index": 2,
+                                  "content": "<!-- GOAL_CANCELLED -->", "truncated_fields": ["content"]})
+        session_context_loader.handle_pre_invocation(payload)
+        self.assertTrue(handoff_gate.load_gate_state(state_dir, cid)["isGoalActive"])
+        _append_jsonl(full, {"type": "PLANNER_RESPONSE", "step_index": 2,
+                             "content": "已收尾。\n<!-- GOAL_CANCELLED -->"})
+        session_context_loader.handle_pre_invocation(payload)
+        self.assertFalse(handoff_gate.load_gate_state(state_dir, cid)["isGoalActive"])
+
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 3, "content": "/goal",
+                                  "truncated_fields": ["content"]})
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 4, "content": "取消 /goal\n请立即交接"})
+        session_context_loader.handle_pre_invocation(payload)
+        _append_jsonl(full, {"type": "USER_INPUT", "step_index": 3, "content": "/goal\n先别交接"})
+        session_context_loader.handle_pre_invocation(payload)
+        gate = handoff_gate.load_gate_state(state_dir, cid)
+        self.assertEqual(gate["phase"], "drain")
+        self.assertFalse(gate["isGoalActive"])
+
+    def test_agy_late_override_survives_newer_ordinary_user_message(self) -> None:
+        import handoff_gate
+
+        cid = "agy-late-override"
+        state_dir = self.plugin_data / "state"
+        transcript = self.tmp_root / "transcript.jsonl"
+        full = self.tmp_root / "transcript_full.jsonl"
+        payload = {"conversationId": cid, "transcriptPath": str(transcript)}
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 0, "content": "请整理交接并停机"})
+        session_context_loader.handle_pre_invocation(payload)
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 1, "content": "暂缓",
+                                  "truncated_fields": ["content"]})
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 2, "content": "查看进度"})
+        session_context_loader.handle_pre_invocation(payload)
+        self.assertEqual(handoff_gate.load_gate_state(state_dir, cid)["phase"], "drain")
+        _append_jsonl(full, {"type": "USER_INPUT", "step_index": 1, "content": "暂缓交接"})
+        session_context_loader.handle_pre_invocation(payload)
+        gate = handoff_gate.load_gate_state(state_dir, cid)
+        self.assertEqual(gate["phase"], "overridden")
+        self.assertTrue(gate["overriddenTurnHash"].startswith("1:"))
+        compaction = json.loads((state_dir / f"{cid}_compaction.json").read_text(encoding="utf-8"))
+        self.assertEqual(compaction["latestUserStepIndex"], 2)
+        self.assertEqual(compaction["latestHandoffStepIndex"], 1)
+
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 3, "content": "暂缓",
+                                  "truncated_fields": ["content"]})
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 4, "content": "请整理交接并停机"})
+        session_context_loader.handle_pre_invocation(payload)
+        _append_jsonl(full, {"type": "USER_INPUT", "step_index": 3, "content": "暂缓交接"})
+        session_context_loader.handle_pre_invocation(payload)
+        self.assertEqual(handoff_gate.load_gate_state(state_dir, cid)["phase"], "drain")
+
+    def test_mature_conversation_ignores_quoted_banner_and_yields_to_explicit_handoff(self) -> None:
+        import handoff_gate
+
+        cid = "agy-quoted-banner"
+        transcript = self.tmp_root / "transcript.jsonl"
+        state_dir = self.plugin_data / "state"
+        banner = handoff_gate.UI_BANNER_PHRASE
+        payload = {"conversationId": cid, "transcriptPath": str(transcript)}
+
+        def add(step_index, step_type, content="", source="USER_EXPLICIT"):
+            _append_jsonl(transcript, {"step_index": step_index, "type": step_type, "source": source, "content": content})
+
+        add(0, "USER_INPUT", "核对轨迹")
+        add(160, "CHECKPOINT", source="SYSTEM")
+        add(320, "CHECKPOINT", source="SYSTEM")
+        add(321, "USER_INPUT", f"历史引用如下。\n> {banner}\n> 先别交接\n请分析历史问题。")
+        add(322, "SYSTEM_MESSAGE", f"<SYSTEM_MESSAGE>\nThe following system message was injected by a hook:\n{banner}\n</SYSTEM_MESSAGE>", "SYSTEM_SDK")
+        session_context_loader.handle_pre_invocation(payload)
+        self.assertEqual(handoff_gate.load_gate_state(state_dir, cid)["phase"], "normal")
+        add(323, "USER_INPUT", "先别交接，继续当前对话")
+        session_context_loader.handle_pre_invocation(payload)
+        self.assertEqual(handoff_gate.load_gate_state(state_dir, cid)["phase"], "overridden")
+        add(324, "USER_INPUT", "~~~text\n请你开始交接\n~~~\n请逐句分析。")
+        session_context_loader.handle_pre_invocation(payload)
+        self.assertEqual(handoff_gate.load_gate_state(state_dir, cid)["phase"], "overridden")
+        add(325, "USER_INPUT", "请你开始交接")
+        session_context_loader.handle_pre_invocation(payload)
+        self.assertEqual(handoff_gate.load_gate_state(state_dir, cid)["phase"], "drain")
+        self.assertIn("user_request", handoff_gate.load_gate_state(state_dir, cid)["triggers"])
+
     def test_07_handoff_gate_telemetry_advisory_drain_and_override(self) -> None:
         """验证长会话遥测建档、Turn-1 防误伤、Stage-1 预警、检查点坍塌 drain 及 R8 显式暂缓"""
         import handoff_gate
@@ -474,7 +931,7 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
         self.assertEqual(handoff_gate.load_gate_state(self.plugin_data / "state", conv_thrash)["phase"], "overridden")
         self.assertEqual(out_ovr["injectSteps"], [])
 
-        # 5) 真实 protojson 双重引号路径图片读取计数、外层 <EPHEMERAL_MESSAGE> UI Banner 及超 4000 字符末尾 R8 暂缓识别
+        # 5) 受信系统记录、图片请求与轨迹结果，以及超 4000 字符末尾的独立暂缓指令
         conv_proto = "ag-handoff-proto"
         tp_pr = self.tmp_root / "proto.jsonl"
         img_file = self.tmp_root / "plot_01.png"
@@ -485,10 +942,12 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
                 "step_index": 0,
                 "source": "USER_EXPLICIT",
                 "type": "USER_INPUT",
-                "content": f"<EPHEMERAL_MESSAGE>\n{banner}\n</EPHEMERAL_MESSAGE>\n<USER_REQUEST>\n检查图片轨迹\n</USER_REQUEST>",
+                "content": "<USER_REQUEST>\n检查图片轨迹\n</USER_REQUEST>",
             },
         )
         _append_jsonl(tp_pr, {"step_index": 120, "source": "SYSTEM", "type": "CHECKPOINT"})
+        _append_jsonl(tp_pr, {"step_index": 121, "source": "SYSTEM_SDK", "type": "SYSTEM_MESSAGE",
+                             "content": f"<SYSTEM_MESSAGE>\n<EPHEMERAL_MESSAGE>\n{banner}\n</EPHEMERAL_MESSAGE>\n</SYSTEM_MESSAGE>"})
         _append_jsonl(
             tp_pr,
             {
@@ -498,11 +957,17 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
                 "tool_calls": [{"name": "read_file", "args": {"Path": json.dumps(str(img_file))}}],
             },
         )
+        _append_jsonl(tp_pr, {"step_index": 126, "source": "MODEL", "type": "GENERIC", "status": "DONE",
+                             "media": [{"uri": str(img_file), "mime_type": "image/png"}]})
         out_pr = session_context_loader.handle_pre_invocation({"conversationId": conv_proto, "transcriptPath": str(tp_pr)})
         self.assertEqual(handoff_gate.load_gate_state(self.plugin_data / "state", conv_proto)["phase"], "drain")
         self.assertEqual(len(out_pr["injectSteps"]), 1)
-        gate_pr = handoff_gate.load_gate_state(self.plugin_data / "state", conv_proto)
-        self.assertEqual(gate_pr["imageReads"].get(str(img_file.resolve()).casefold() if os.name == "nt" else str(img_file.resolve())), 2051)
+        comp_pr = json.loads((self.plugin_data / "state" / f"{conv_proto}_compaction.json").read_text(encoding="utf-8"))
+        self.assertEqual(comp_pr["transcriptImageCallCount"], 1)
+        self.assertEqual(comp_pr["transcriptImageResultCount"], 1)
+        image_key = str(img_file.resolve()).casefold() if os.name == "nt" else str(img_file.resolve())
+        self.assertEqual(comp_pr["transcriptImageAttemptSizes"][image_key], 2051)
+        self.assertEqual(comp_pr["transcriptImageSizes"][image_key], 2051)
 
         long_tail_r8 = ("补充长指令背景说明。\n" * 400) + "暂不交接，继续当前对话"
         _append_jsonl(tp_pr, {"step_index": 130, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": long_tail_r8})
@@ -587,7 +1052,7 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
         self.assertEqual(out_leg["injectSteps"], [], "升级重标定时不得重复注入已注入过的 CHECKPOINT")
         gate_leg = handoff_gate.load_gate_state(state_dir, conv_legacy)
         self.assertEqual(gate_leg["phase"], "normal")
-        self.assertEqual(gate_leg["gateSchemaVersion"], 2)
+        self.assertEqual(gate_leg["gateSchemaVersion"], 3)
 
         # 取消 /goal 与宽限期届满后重复发送相同文本 R8 暂缓指令必须生效
         conv_r8 = "ag-cancel-repeat-r8"
@@ -719,6 +1184,60 @@ class TestCodexHandoffAdapter(unittest.TestCase):
         self.assertTrue(self.state()["handoffRecorded"])
         self.assertNotIn("GOAL_CANCELLED", json.dumps(final))
 
+    def test_codex_stop_accepts_only_changed_current_handoff_document(self):
+        self.call("UserPromptSubmit", mode="enforce", prompt="请整理交接并停机")
+        path = self.root / "HANDOFF.md"
+        document = (
+            "已验证：已完成第一批核对。\nGit 工作区：保留当前修改。\n未完成：第二批验收。\n"
+            "## 新对话提示词\n请读取用户最新裁定，从第二批的完整验收开始。\n"
+        )
+        path.write_text(document, encoding="utf-8")
+        patch = "*** Begin Patch\n*** Update File: HANDOFF.md\n@@\n+本轮增加证据。\n*** End Patch"
+        self.call("PreToolUse", mode="enforce", tool_name="apply_patch", tool_input=patch, tool_use_id="proposal")
+        self.assertEqual(self.call("Stop", mode="enforce", last_assistant_message="文件已写")["decision"], "block")
+        path.write_text(document + "本轮增加证据。\n", encoding="utf-8")
+        result = self.call("Stop", mode="enforce", last_assistant_message="文件已写")
+        self.assertFalse(result["continue"])
+        self.assertTrue(self.state()["handoffRecorded"])
+
+        self.call("UserPromptSubmit", mode="enforce", turn_id="next", prompt="暂不交接")
+        self.call("UserPromptSubmit", mode="enforce", turn_id="new-handoff", prompt="请整理交接并停机")
+        self.assertEqual(self.call("Stop", mode="enforce", last_assistant_message="仍用前一次文档")["decision"], "block")
+
+    def test_codex_stop_rejects_candidate_redirected_outside_project(self):
+        import subprocess
+
+        project = self.root / "project"
+        project.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        outside_file = outside / "handoff.md"
+        outside_file.write_text(
+            "已验证：第一批通过。\nGit 工作区：当前干净。\n未完成：第二批。\n"
+            "## 新对话提示词\n请先核对工作区，再完成第二批验收。\n", encoding="utf-8",
+        )
+        original = project / "docs"
+        original.mkdir()
+        self.call("UserPromptSubmit", mode="enforce", prompt="请整理交接并停机", cwd=str(project))
+        patch = "*** Begin Patch\n*** Add File: docs/handoff.md\n+内容\n*** End Patch"
+        self.call("PreToolUse", mode="enforce", tool_name="apply_patch", tool_input=patch, cwd=str(project))
+        original.rmdir()
+        try:
+            original.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            if os.name != "nt":
+                raise
+            proc = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                 "New-Item -ItemType Junction -Path $env:UG_LINK -Target $env:UG_TARGET | Out-Null"],
+                env={**os.environ, "UG_LINK": str(original), "UG_TARGET": str(outside)},
+                capture_output=True, timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        rejected = self.call("Stop", mode="enforce", cwd=str(project), last_assistant_message="文件已写")
+        self.assertEqual(rejected["decision"], "block")
+        self.assertFalse(self.state()["handoffRecorded"])
+
     def test_user_override_is_per_turn_and_does_not_trigger_from_quoted_history(self):
         self.call("PostCompact", mode="enforce", limit=1)
         self.call("UserPromptSubmit", mode="enforce", limit=1,
@@ -749,15 +1268,116 @@ class TestCodexHandoffAdapter(unittest.TestCase):
         self.assertEqual(state_path.read_text(encoding="utf-8"), "{bad")
 
     def test_concurrent_compactions_and_strict_lock_timeout(self):
-        import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(lambda n: self.call("PostCompact", turn_id=f"parallel-{n}"), range(32)))
         self.assertEqual(self.state()["compactionCount"], 32)
+        anchor = self.state_dir / f".{self.sid}.lock"
+        inode = anchor.stat().st_ino
+        holder = (
+            "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); import user_words\n"
+            "with user_words.session_state_lock(Path(sys.argv[2]), sys.argv[3]):\n"
+            "    print('locked', flush=True)\n"
+            "    sys.stdin.readline()\n"
+        )
+        with subprocess.Popen(
+            [sys.executable, "-B", "-X", "utf8", "-c", holder, str(HOOKS_DIR), str(self.state_dir), self.sid],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as proc:
+            try:
+                self.assertEqual(proc.stdout.readline().strip(), "locked")
+                os.utime(anchor, (1, 1))
+                for strict in (True, False):
+                    with self.assertRaises(TimeoutError):
+                        with self.gate._gate_state_lock(self.state_dir, self.sid, timeout_sec=0.03, strict=strict):
+                            self.fail("未取得锁时不得进入状态更新")
+                self.assertEqual(anchor.stat().st_ino, inode)
+                proc.kill()
+            finally:
+                proc.communicate(timeout=5)
         with self.gate._gate_state_lock(self.state_dir, self.sid, strict=True):
-            with self.assertRaises(TimeoutError):
-                with self.gate._gate_state_lock(self.state_dir, self.sid, timeout_sec=0.03, strict=True):
-                    self.fail("未取得锁时不得进入状态更新")
-        self.assertEqual(list(self.state_dir.glob("*.lock")), [])
+            # 替换 token 模拟迟到清理，离开旧上下文时不得清除不属于它的记录。
+            with anchor.open("r+b") as stream:
+                stream.seek(1)
+                stream.write(b"x" * 32)
+        self.assertEqual(anchor.read_bytes()[1:], b"x" * 32)
+        with self.gate._gate_state_lock(self.state_dir, self.sid, strict=True):
+            self.assertEqual(anchor.stat().st_ino, inode)
+        self.assertEqual(anchor.read_bytes()[1:], b"")
+
+    def test_compaction_reconciles_delayed_large_and_multiple_records(self):
+        self.call("PostCompact", turn_id="delayed", trigger="auto")
+        self.assertEqual(self.state()["compactionFallbackCount"], 1)
+        _append_jsonl(self.transcript, {"type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "delayed",
+        }})
+        _append_jsonl(self.transcript, {"type": "compacted", "ordinal": 3, "payload": {
+            "window_id": "window-one", "replacement_history": ["x" * (300 * 1024)],
+        }})
+        _append_jsonl(self.transcript, {"type": "turn_context", "payload": {"turn_id": "delayed"}})
+        self.call("UserPromptSubmit", turn_id="next")
+        repaired = self.state()
+        self.assertEqual(repaired["compactionCount"], 1)
+        self.assertEqual(repaired["compactionRecordCount"], 1)
+        self.assertEqual(repaired["compactionFallbackCount"], 0)
+        self.assertEqual(repaired["compactionLedger"]["records"]["window:window-one"]["turnSource"], "following_turn_context")
+        for index in (2, 3):
+            _append_jsonl(self.transcript, {"type": "compacted", "payload": {"window_id": f"window-{index}"}})
+        _append_jsonl(self.transcript, {"type": "response_item", "payload": {"output": "x" * (300 * 1024)}})
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda _: self.call("PostCompact", turn_id="delayed", trigger="auto"), range(8)))
+        self.assertEqual(self.state()["compactionCount"], 3)
+        self.assertEqual(self.state()["compactionRecordCount"], 3)
+        self.assertEqual(self.state()["compactionFallbackCount"], 0)
+
+    def test_delayed_turn_context_cannot_prematurely_trigger_drain(self):
+        _append_jsonl(self.transcript, {"type": "turn_context", "payload": {"turn_id": "previous-turn"}})
+        _append_jsonl(self.transcript, {"type": "compacted", "payload": {"window_id": "window-one"}})
+        self.call("PostCompact", mode="enforce", limit=2, turn_id="current-turn", trigger="auto")
+        early = self.state()
+        self.assertEqual(early["compactionCount"], 1)
+        self.assertEqual(early["phase"], "advisory")
+        self.assertTrue(early["compactionIssues"])
+        _append_jsonl(self.transcript, {"type": "turn_context", "payload": {"turn_id": "current-turn"}})
+        self.call("SessionStart", mode="enforce", limit=2, source="compact")
+        repaired = self.state()
+        self.assertEqual(repaired["compactionCount"], 1)
+        self.assertEqual(repaired["phase"], "advisory")
+        self.assertEqual(repaired["compactionLedger"]["records"]["window:window-one"]["turn"], "current-turn")
+        _append_jsonl(self.transcript, {"type": "compacted", "payload": {"window_id": "window-two"}})
+        self.call("PostCompact", mode="enforce", limit=2, turn_id="current-turn", trigger="auto")
+        self.assertEqual(self.state()["compactionCount"], 2)
+        self.assertEqual(self.state()["phase"], "drain")
+
+    def test_unassigned_compaction_does_not_duplicate_fallback(self):
+        self.call("PostCompact", turn_id="undetermined", trigger="auto")
+        row = b'{"type":"compacted","payload":{"window_id":"known-record"}}'
+        with self.transcript.open("ab") as stream:
+            stream.write(row[:-1])
+        self.call("SessionStart", source="compact")
+        self.assertEqual(self.state()["compactionRecordCount"], 0)
+        self.assertTrue(self.state()["compactionIssues"])
+        with self.transcript.open("ab") as stream:
+            stream.write(row[-1:] + b"\n")
+        self.call("SessionStart", source="compact")
+        self.assertEqual(self.state()["compactionCount"], 1)
+        self.assertEqual(self.state()["compactionRecordCount"], 1)
+        self.assertEqual(self.state()["compactionFallbackCount"], 0)
+        self.assertTrue(self.state()["compactionIssues"])
+
+    def test_canonical_identity_is_shared_by_archive_and_gate(self):
+        state_dir = self.root / "session-context"
+        log = self.root / "archive.log"
+        payload = {"session_id": self.sid, "transcript_path": str(self.transcript), "source": "resume"}
+        self.assertEqual(session_context_loader.handle_codex_session_start(
+            {**payload, "agent_id": "another-agent"}, str(state_dir), str(log),
+        ), {})
+        self.assertFalse(log.exists())
+        self.transcript.write_text("", encoding="utf-8")
+        _append_jsonl(self.transcript, {"type": "session_meta", "payload": {"id": self.sid, "source": "unknown"}})
+        self.assertIn("来源未知", self.call("PostCompact")["systemMessage"])
+        context = session_context_loader.handle_codex_session_start(payload, str(state_dir), str(log))
+        self.assertIn("来源未知", context["hookSpecificOutput"]["additionalContext"])
+        self.assertFalse((self.root / "user-words").exists())
 
 
 if __name__ == "__main__":

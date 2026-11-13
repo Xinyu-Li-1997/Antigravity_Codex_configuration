@@ -16,7 +16,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "^(?:run_command|read_file|manage_task|write_file|edit_file|invoke_subagent|define_subagent|send_message|swarm|schedule|browser_.*)$",
+        "matcher": ".*",
         "hooks": [
           {
             "type": "command",

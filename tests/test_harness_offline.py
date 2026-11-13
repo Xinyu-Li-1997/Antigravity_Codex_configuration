@@ -1,5 +1,6 @@
 """双向编排的离线回归，所有模型调用均使用替身。"""
 import contextlib
+import base64
 import datetime
 import importlib.util
 import io
@@ -23,8 +24,15 @@ spec.loader.exec_module(harness)
 
 
 def backends(budget=120000):
+    catalogs = {'codex': [{'slug': 'fixture-code', 'provider': 'openai', 'supported_efforts': ['high', 'max']}],
+                'agy': [{'slug': 'gemini-7-pro-high'}]}
+    fetched_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     return {name: {'available': True, 'binary': name + ('.exe' if os.name == 'nt' else ''),
-                   'safe_input_budget_tokens': budget, 'model': None, 'windows_interop': False, 'models': []}
+                   'safe_input_budget_tokens': budget, 'requested_input_budget_tokens': budget,
+                   'model': None, 'windows_interop': False, 'models': catalogs[name],
+                   'authentication_status': 'authenticated',
+                   'model_catalog': {'source': name + '_client_cache', 'model_count': len(catalogs[name]),
+                                     'fetched_at': fetched_at, 'freshness': 'within_assessment_window'}}
             for name in ('codex', 'agy')}
 
 
@@ -93,6 +101,25 @@ class HarnessTests(unittest.TestCase):
         self.assertIsNone(result['agy']['configured_window_tokens'])
         self.assertNotIn('supports_true_1m', result['codex'])
 
+    def test_top_level_toml_handles_quoted_keys_numbers_and_comments(self):
+        path = self.root / 'config.toml'
+        path.write_text(
+            'arbitrary = [\n  "value", # ]\n]\n'
+            'text = """\nmodel_context_window = 17\n[ignored]\n"""\n'
+            '"model" = "gpt-9-fixture#literal" # comment\n'
+            "'model_context_window' = 500_000 # not 500\n"
+            '"model_auto_compact_token_limit" = 0x6_DD_D0 # 450000\n'
+            'model_reasoning_effort = "h\\u0069gh"\n'
+            '[profiles.fixture]\nmodel_context_window = 7\n',
+            encoding='utf-8-sig')
+        expected = {'model': 'gpt-9-fixture#literal', 'model_context_window': 500000,
+                    'model_auto_compact_token_limit': 450000, 'model_reasoning_effort': 'high'}
+        self.assertEqual(harness._top_level_toml(path), expected)
+        with patch.object(harness, 'tomllib', None):
+            self.assertEqual(harness._top_level_toml(path), expected)
+            path.write_text("model_context_window = 500_000x\n'other' = 300\n", encoding='utf-8')
+            self.assertEqual(harness._top_level_toml(path), {})
+
     def test_probe_context_metadata_belongs_to_selected_model(self):
         cache = {'models': [{'slug': 'catalog-first', 'priority': 1, 'context_window': 500000},
                             {'slug': 'user-choice', 'priority': 2, 'context_window': 200000}]}
@@ -116,10 +143,10 @@ class HarnessTests(unittest.TestCase):
         files = {
             codex_root / 'config.toml': 'model = "interactive-choice"\nmodel_reasoning_effort = "ultra"\n',
             codex_root / 'models_cache.json': json.dumps({'fetched_at': '2020-01-01T08:00:00+08:00', 'models': [
-                {'slug': 'code-model', 'priority': 1, 'context_window': 500000, 'supported_efforts': ['high', 'xhigh', 'ultra']},
-                {'slug': 'math-model', 'priority': 2, 'description': 'Frontier intelligence for the most demanding work.',
+                {'slug': 'code-model', 'provider': 'openai', 'priority': 1, 'context_window': 500000, 'supported_efforts': ['high', 'xhigh', 'ultra']},
+                {'slug': 'math-model', 'provider': 'openai', 'priority': 2, 'description': 'Frontier intelligence for the most demanding work.',
                  'supported_efforts': ['high', 'max', 'ultra']},
-                {'slug': 'fast-model', 'priority': 3, 'description': 'Lightweight model', 'supported_efforts': ['low']},
+                {'slug': 'fast-model', 'provider': 'openai', 'priority': 3, 'description': 'Lightweight model', 'supported_efforts': ['low']},
             ]}),
             codex_root / 'cache' / 'cae_quota_state.json': '{"exhausted": true, "cooldown_until_epoch": 1}',
             cli / 'settings.json': '{"model": "Interactive CLI Choice"}',
@@ -151,6 +178,12 @@ class HarnessTests(unittest.TestCase):
                          ('math-model', 'max', 'task_specialty_math_max', 'specialty_deep_reasoning', 'catalog_declared'))
         surface = report['recommendations']['codex']['surface_review']
         self.assertEqual((surface['model'], surface['reasoning_effort']), ('fast-model', 'low'))
+        matrix = {row['model']: row for row in codex['capability_matrix']}
+        self.assertEqual(matrix['code-model']['capacity']['model_default_window_tokens'], 500000)
+        self.assertIsNone(matrix['code-model']['capacity']['model_declared_max_window_tokens'])
+        self.assertEqual(matrix['math-model']['declared_efforts'], ['high', 'max', 'ultra'])
+        self.assertEqual(matrix['math-model']['catalog_freshness'], 'stale')
+        self.assertEqual({row['category'] for row in agy['capability_matrix']}, {'unknown'})
         self.assertEqual(set(path for path in self.root.rglob('*') if path.is_file()), set(files))
         for path, contents in files.items():
             self.assertEqual(path.read_text(encoding='utf-8'), contents)
@@ -170,6 +203,92 @@ class HarnessTests(unittest.TestCase):
             with self.subTest(stamp=stamp):
                 catalog = harness._catalog_metadata(cache, {'fetched_at': stamp}, [{}], 'cache', now)
                 self.assertEqual((catalog['freshness'], catalog['age_seconds']), (expected, age))
+
+    def test_codex_stdio_lists_models_after_initialization_without_turn(self):
+        fake = self.root / 'model_list_fixture.py'
+        fake.write_text("""
+import json, sys
+
+def read():
+    return json.loads(sys.stdin.readline())
+
+def reply(request, result):
+    print(json.dumps({'id': request['id'], 'result': result}), flush=True)
+
+initialize = read()
+assert initialize['method'] == 'initialize'
+assert initialize['params']['capabilities']['experimentalApi'] is True
+reply(initialize, {})
+assert read() == {'method': 'initialized'}
+request = read()
+assert request['method'] == 'model/list'
+assert request['params'] == {'includeHidden': False, 'limit': 100}
+reply(request, {'data': [{'model': 'gpt-9-alpha'}], 'nextCursor': 'page-2'})
+request = read()
+assert request['method'] == 'model/list'
+assert request['params']['cursor'] == 'page-2'
+reply(request, {'data': [{'model': 'gpt-9-beta'}], 'nextCursor': None})
+assert sys.stdin.readline() == ''
+""", encoding='utf-8')
+        listing = harness._query_codex_stdio([sys.executable, '-B', str(fake)], self.root, None, None, 10)
+        self.assertEqual(set(listing), {'gpt-9-alpha', 'gpt-9-beta'})
+
+    def test_codex_refresh_joins_current_catalog_and_exact_cache_slug(self):
+        engines = backends()
+        info = engines['codex']
+        info.update(config_home=str(self.root), models=[
+            {'slug': 'gpt-9-obsolete', 'context_window': 900000, 'max_context_window': 950000},
+        ], model_catalog={'freshness': 'stale'})
+        cache = self.root / 'models_cache.json'
+
+        def refresh(actual_info):
+            self.assertEqual(actual_info['config_home'], str(self.root))
+            cache.write_text(json.dumps({'fetched_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'models': [
+                {'slug': 'gpt-9-current', 'context_window': 300000, 'max_context_window': 500000},
+                {'slug': 'gpt-9-obsolete', 'context_window': 900000, 'max_context_window': 950000},
+            ]}), encoding='utf-8')
+            return {'gpt-9-current': {'model': 'gpt-9-current', 'supportedReasoningEfforts': [{'effort': 'xhigh'}]},
+                    'gpt-9-unmatched': {'model': 'gpt-9-unmatched', 'max_context_window': 999999}}
+
+        with patch.object(harness, '_query_codex_listing', side_effect=refresh) as query:
+            harness._prepare_execution(engines, ('codex:default',), harness._QuotaBatch())
+            harness._prepare_execution(engines, ('codex:default',), harness._QuotaBatch())
+        query.assert_called_once()
+        chosen = harness.resolve_execution_profile(engines, 'codex:default', 'max', estimated_tokens=170000)
+        self.assertEqual(chosen['model'], 'gpt-9-current')
+        self.assertEqual(chosen['capacity']['cli_context_window_tokens'], 500000)
+        self.assertEqual(chosen['declared_effort'], 'xhigh')
+        self.assertEqual(chosen['model_listing']['source'], 'codex_app_server_model_list')
+        self.assertIsNone(harness.resolve_execution_profile(
+            engines, 'codex:gpt-9-unmatched')['capacity']['cli_context_window_tokens'])
+        self.assertIsNone(harness.resolve_execution_profile(
+            engines, 'codex:gpt-9-obsolete')['capacity']['cli_context_window_tokens'])
+
+    def test_codex_stale_after_refresh_blocks_exec_and_quota_precedes_listing(self):
+        engines = backends()
+        info = engines['codex']
+        config = self.root / 'config'
+        config.mkdir()
+        info.update(config_home=str(config), model_catalog={'freshness': 'future_timestamp'})
+        cache = config / 'models_cache.json'
+        cache.write_text(json.dumps({'fetched_at': '2020-01-01T00:00:00Z', 'models': info['models']}), encoding='utf-8')
+        args = self.args('task', '--target', str(self.root), '--kind', 'review', '--task', '核对', '--engine', 'codex:default')
+        models = {'gpt-9-current': {'model': 'gpt-9-current'}}
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, '_query_codex_listing', return_value=models) as query, \
+             patch.object(harness, 'run_process') as worker:
+            code, report = self.capture(harness.cmd_task, args)
+            self.assertEqual(code, 1)
+            self.assertEqual(report['model_catalog']['freshness'], 'stale')
+            self.assertEqual(report['requested_engine'], 'codex:default')
+            query.assert_called_once_with(info)
+            query.reset_mock()
+            harness._record_quota_exhausted('codex', info, 'hit your usage limit')
+            code, report = self.capture(harness.cmd_task, args)
+            self.assertEqual(code, 5)
+            self.assertTrue(report['preflight_blocked'])
+            query.assert_not_called()
+            worker.assert_not_called()
 
     def test_assess_discovery_uses_cli_listing_without_refreshing_cache(self):
         cache = self.root / '.gemini' / 'antigravity-cli' / 'cache' / 'cae_models_cache.json'
@@ -191,13 +310,13 @@ class HarnessTests(unittest.TestCase):
     def test_non_delegating_profile_does_not_inherit_or_guess_ultra(self):
         engines = backends()
         engines['codex'].update(model='only-delegating', reasoning_effort='ultra', models=[
-            {'slug': 'only-delegating', 'priority': 1, 'supported_efforts': ['ultra']},
-            {'slug': 'eligible', 'priority': 2, 'supported_efforts': ['high']},
+            {'slug': 'only-delegating', 'provider': 'openai', 'priority': 1, 'supported_efforts': ['ultra']},
+            {'slug': 'eligible', 'provider': 'openai', 'priority': 2, 'supported_efforts': ['high']},
         ])
-        engines['agy']['models'] = [{'slug': 'vendor-first-ultra'}, {'slug': 'vendor-second-high'}]
+        engines['agy']['models'] = [{'slug': 'gemini-6-pro-ultra'}, {'slug': 'gemini-5-pro-high'}]
         self.assertEqual(harness.resolve_execution_profile(engines, 'codex:default', 'max')['model'], 'eligible')
-        self.assertEqual(harness.resolve_execution_profile(engines, 'agy:default', 'max')['model'], 'vendor-second-high')
-        self.assertEqual(harness.resolve_execution_profile(engines, 'agy:default', 'ultra')['model'], 'vendor-first-ultra')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'agy:default', 'max')['model'], 'gemini-5-pro-high')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'agy:default', 'ultra')['model'], 'gemini-6-pro-ultra')
         unverified = harness.resolve_execution_profile(engines, 'codex:unlisted', 'high')
         self.assertEqual((unverified['cli_effort'], unverified['effort_source']), ('high', 'unverified_request'))
         unverified = harness.resolve_execution_profile(engines, 'agy:unlisted-high', 'high')
@@ -216,22 +335,71 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(harness.select_task_tier(text='不要使用 ultra，检查结果')[0], 'high')
 
     def test_explicit_model_has_own_budget_cap(self):
-        engines = backends(700000)
-        engines['codex']['models'] = [{'slug': 'small', 'context_window': 500000, 'max_context_window': 872000}]
-        self.assertEqual(harness._budget_for_spec(engines, 'codex:small'), 450000)
-        engines['codex']['configured_window_tokens'] = 900000
-        self.assertEqual(harness._budget_for_spec(engines, 'codex:small'), 784800)
+        engines = backends()
+        engines['codex'].update(configured_window_tokens=900000, requested_input_budget_tokens=None, models=[
+            {'slug': 'larger', 'context_window': 500000, 'max_context_window': 872000},
+            {'slug': 'small', 'context_window': 100000, 'max_context_window': 128000},
+            {'slug': 'default-only', 'context_window': 200000}])
+        for model, expected_window in (('larger', 872000), ('small', 128000), ('default-only', 200000)):
+            with self.subTest(model=model):
+                profile = harness.resolve_execution_profile(engines, f'codex:{model}')
+                self.assertEqual(profile['capacity']['cli_context_window_tokens'], expected_window)
+                self.assertEqual(profile['capacity']['input_budget_tokens'], expected_window * 9 // 10)
+        unknown = harness.resolve_execution_profile(engines, 'codex:unlisted')
+        self.assertIsNone(unknown['capacity']['cli_context_window_tokens'])
+        self.assertIsNotNone(unknown['execution_blocked_reason'])
+        engines['codex'].pop('configured_window_tokens')
+        unknown = harness.resolve_execution_profile(engines, 'codex:unlisted')
+        self.assertIsNone(unknown['execution_blocked_reason'])
+        self.assertEqual(unknown['capacity']['input_budget_tokens'], 120000)
+
+    def test_catalog_effective_window_caps_budget_without_changing_cli_window(self):
+        engines = backends()
+        info = engines['codex']
+        info.update(requested_input_budget_tokens=850000, models=[
+            {'slug': 'gpt-9-fixture', 'context_window': 500000, 'max_context_window': 872000,
+             'effective_context_window_percent': 95},
+        ])
+
+        def capacity():
+            return harness.resolve_execution_profile(engines, 'codex:gpt-9-fixture')['capacity']
+
+        explicit = capacity()
+        self.assertEqual(explicit['cli_context_window_tokens'], 872000)
+        self.assertEqual(explicit['catalog_effective_window_tokens'], 828400)
+        self.assertEqual(explicit['effective_window_source'], 'catalog_percent_of_selected_window')
+        self.assertEqual(explicit['input_budget_tokens'], 828400)
+        self.assertFalse(explicit['capacity_verified'])
+
+        info['requested_input_budget_tokens'] = None
+        default = capacity()
+        self.assertEqual(default['planning_cap_tokens'], 828400)
+        self.assertEqual(default['input_budget_tokens'], 745560)
+        self.assertEqual(default['policy_reserve_tokens'], 82840)
+
+        info['effective_compaction_tokens'] = 500000
+        compact = capacity()
+        self.assertEqual(compact['catalog_effective_window_tokens'], 828400)
+        self.assertEqual(compact['planning_cap_tokens'], 500000)
+        self.assertEqual(compact['input_budget_tokens'], 450000)
+
+        info.pop('effective_compaction_tokens')
+        info['models'][0]['effective_context_window_percent'] = 101
+        unknown = capacity()
+        self.assertIsNone(unknown['catalog_effective_window_tokens'])
+        self.assertEqual(unknown['planning_cap_tokens'], 872000)
+        self.assertEqual(unknown['input_budget_tokens'], 784800)
 
     def test_plan_skips_oversize_with_explicit_coverage(self):
-        records = [{'rel_path': 'small.lean', 'tokens': 20}, {'rel_path': 'large.f90', 'tokens': 200}]
-        plan = harness.select_audit_plan(220, records, backends(100), caller='codex', shard_tokens=100)
+        records = [{'rel_path': 'small.lean', 'tokens': 20}, {'rel_path': 'large.f90', 'tokens': 2000}]
+        plan = harness.select_audit_plan(2020, records, backends(1000), caller='codex', shard_tokens=100)
         self.assertEqual(plan['left_engine'], 'agy:default')
         self.assertEqual(plan['right_engine'], 'codex:default')
         self.assertEqual(len(plan['skipped_files']), 2)
         self.assertEqual(plan['left_units'][0]['files'], ['small.lean'])
         self.assertIn('跨分片', plan['coverage_notice'])
         with self.assertRaises(harness.HarnessError):
-            harness.select_audit_plan(220, records, backends(100), strategy='single-pass', caller='codex')
+            harness.select_audit_plan(2020, records, backends(1000), strategy='single-pass', caller='codex')
 
     def test_whole_alias_and_unconfigured_preview(self):
         records = [{'rel_path': 'solver.py', 'tokens': 20}]
@@ -356,6 +524,86 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(result['rounds_used'], 2)
         self.assertTrue(result['handoff_to_caller'])
 
+    def test_gate_snapshot_failures_stop_at_the_unverified_stage(self):
+        phases = (
+            ('preflight', [PermissionError('initial denied')], 0, 0),
+            ('post_worker', [{}, PermissionError('worker denied')], 1, 0),
+            ('post_verify', [{}, {}, PermissionError('verifier denied')], 1, 1),
+            ('final', [{}, {}, {}, PermissionError('final denied')], 1, 1),
+            ('pre_worker', [{}, {}, {}, PermissionError('retry denied')], 1, 1),
+        )
+        for phase, snapshots, worker_calls, verifier_calls in phases:
+            with self.subTest(phase=phase):
+                worker = Mock(return_value='worker receipt')
+                verifier = Mock(return_value=(1 if phase == 'pre_worker' else 0, 'verifier receipt'))
+                with patch.object(harness, 'snapshot_files', side_effect=snapshots) as snapshot:
+                    result = harness.run_physics_gate_loop(self.root, '改代码', 'verify', worker, verifier, max_rounds=3)
+                self.assertEqual(snapshot.call_count, len(snapshots))
+                self.assertEqual(worker.call_count, worker_calls)
+                self.assertEqual(verifier.call_count, verifier_calls)
+                self.assertEqual(result['rounds_used'], worker_calls)
+                self.assertEqual(result['status'], 'failed')
+                self.assertFalse(result['gate_passed'])
+                self.assertFalse(result['scope_verified'])
+                self.assertEqual(result['scope_check'], 'unverified')
+                self.assertEqual(result['scope_error_phase'], phase)
+                self.assertIsNone(result['changed_files'])
+                if worker_calls:
+                    self.assertEqual(result['history'][0]['worker_summary'], 'worker receipt')
+                if verifier_calls:
+                    self.assertEqual(result['history'][0]['verify_output_tail'], 'verifier receipt')
+
+    def test_gate_cli_retains_actual_worker_profile_on_post_worker_snapshot_failure(self):
+        engines = backends()
+        denied = self.root / 'balance.py'
+        open_file = Path.open
+
+        def unreadable(path, *args, **kwargs):
+            if path == denied and args == ('rb',):
+                raise PermissionError(13, 'denied after worker', str(path))
+            return open_file(path, *args, **kwargs)
+
+        def run(command, cwd, input_text=None, timeout_sec=600, **kwargs):
+            self.assertFalse(kwargs.get('shell'))
+            denied.write_text('balance = 0\n', encoding='utf-8')
+            Path(command[command.index('-o') + 1]).write_text(json.dumps(TASK), encoding='utf-8')
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        args = self.args('task', '--engine', 'codex:default', '--target', str(self.root), '--kind', 'code',
+                         '--task', '写出平衡量', '--verify-cmd', 'verify', '--write-scope', 'balance.py')
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, 'run_process', side_effect=run) as runner, \
+             patch.object(Path, 'open', unreadable):
+            code, report = self.capture(harness.cmd_task, args)
+        self.assertEqual(code, 1)
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(report['scope_error_phase'], 'post_worker')
+        self.assertEqual(report['scope_error_path'], 'balance.py')
+        self.assertFalse(report['scope_verified'])
+        self.assertEqual(report['rounds_used'], 1)
+        entry = report['history'][0]
+        self.assertTrue(entry['invocation']['invocation_started'])
+        self.assertEqual(entry['invocation']['returncode'], 0)
+        self.assertEqual(entry['execution_profile']['model'], 'fixture-code')
+        self.assertEqual(json.loads(entry['worker_summary']), TASK)
+        self.assertIsNone(entry['verify_exit_code'])
+
+    def test_snapshot_reports_unreadable_root_and_subdirectory(self):
+        nested = self.root / 'unreadable'
+        nested.mkdir()
+        scandir = os.scandir
+        for blocked, rel in ((self.root, '.'), (nested, 'unreadable')):
+            with self.subTest(blocked=blocked):
+                def deny(path):
+                    if Path(path) == blocked:
+                        raise PermissionError(13, 'scandir denied', str(path))
+                    return scandir(path)
+
+                with patch.object(harness.os, 'scandir', side_effect=deny), \
+                     self.assertRaises(harness.HarnessError) as error:
+                    harness.snapshot_files(self.root)
+                self.assertEqual(error.exception.details['snapshot_path'], rel)
+
     def test_scope_violation_preserves_existing_dirty_files(self):
         existing = self.root / 'existing.txt'
         existing.write_text('user change', encoding='utf-8')
@@ -404,7 +652,7 @@ class HarnessTests(unittest.TestCase):
     def test_audit_partial_and_all_failed(self):
         (self.root / 'a.py').write_text('x=1', encoding='utf-8')
         args = self.args('audit', '--target', str(self.root), '--caller', 'codex')
-        def worker(engine, *args):
+        def worker(engine, *args, **kwargs):
             if engine.startswith('codex'):
                 raise harness.OutputParseError('empty')
             return AUDIT
@@ -490,8 +738,8 @@ class HarnessTests(unittest.TestCase):
     def test_large_window_still_allows_existing_single_pass(self):
         (self.root / 'config.toml').write_text('model = "large"\nmodel_context_window = 872000\n', encoding='utf-8')
         (self.root / 'models_cache.json').write_text(json.dumps({'models': [
-            {'slug': 'large', 'context_window': 500000, 'max_context_window': 872000},
-            {'slug': 'small', 'context_window': 100000, 'max_context_window': 100000}]}), encoding='utf-8')
+            {'slug': 'large', 'provider': 'openai', 'context_window': 500000, 'max_context_window': 872000},
+            {'slug': 'small', 'provider': 'openai', 'context_window': 100000, 'max_context_window': 100000}]}), encoding='utf-8')
         with patch.object(harness, '_find_binary', return_value='fake'), patch.object(harness, '_codex_home', return_value=(self.root, False)):
             engines = harness.probe_backends()
         self.assertEqual(engines['codex']['safe_input_budget_tokens'], 784800)
@@ -500,11 +748,70 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(plan['mode'], 'single-pass')
         self.assertEqual(harness._budget_for_spec(engines, 'codex:small'), 90000)
 
+    def test_audit_plans_and_calls_the_same_model_and_window(self):
+        path = self.root / 'solver.f90'
+        path.write_bytes(b'a' * 579000)  # 193k by the planning estimate
+        (self.root / 'more.f90').write_bytes(b'b' * 822000)
+        engines = backends()
+        engines['codex'].update(model='interactive', configured_window_tokens=900000,
+                                effective_compaction_tokens=450000, requested_input_budget_tokens=None,
+                                model_catalog={**engines['codex']['model_catalog'], 'model_count': 2},
+                                models=[
+                                    {'slug': 'interactive', 'context_window': 100000, 'max_context_window': 110000},
+                                    {'slug': 'gpt-9-code', 'context_window': 272000, 'max_context_window': 500000,
+                                     'supported_efforts': ['high', 'max']},
+                                ])
+        commands = []
+
+        def runner(command, cwd, input_text, timeout_sec, **kwargs):
+            self.assertIn('model_context_window=500000', command)
+            self.assertIn('model_reasoning_effort="high"', command)
+            self.assertEqual(command[command.index('-m') + 1], 'gpt-9-code')
+            commands.append(command)
+            name = 'solver.f90' if '- solver.f90\n' in input_text else 'more.f90'
+            output = {**AUDIT, 'read_files': [name]}
+            Path(command[command.index('-o') + 1]).write_text(json.dumps(output), encoding='utf-8')
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        args = self.args('audit', '--target', str(self.root), '--single', '--left', 'codex:default', '--focus', '检查格式转换')
+        with patch.object(harness, '_args_backends', return_value=engines), patch.object(harness, 'run_process', side_effect=runner):
+            code, report = self.capture(harness.cmd_audit, args)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(report['plan']['mode'], 'sharded')
+        self.assertEqual(report['plan']['skipped_files'], [])
+        left = report['plan']['execution_profiles']['left']
+        self.assertEqual(left['model'], 'gpt-9-code')
+        self.assertEqual(left['catalog_usage'], 'unverified_client_cache')
+        self.assertEqual(left['capacity']['selected_window_tokens'], 500000)
+        self.assertEqual(left['capacity']['input_budget_tokens'], 405000)
+        self.assertTrue(all(unit['exceeds_soft_shard_target'] for unit in report['plan']['left_units']))
+        self.assertTrue(all(unit['estimated_prompt_tokens'] > 0 for unit in report['plan']['left_units']))
+        self.assertFalse(report['reading_coverage_verified'])
+
+    def test_audit_focus_consumes_budget_and_out_of_scope_findings_are_rejected(self):
+        records = [{'rel_path': 'a.py', 'tokens': 20}]
+        args = {'dual_blind': False, 'caller': 'antigravity'}
+        self.assertEqual(harness.select_audit_plan(20, records, backends(1000), **args)['mode'], 'single-pass')
+        plan = harness.select_audit_plan(20, records, backends(1000), focus='x' * 2400, **args)
+        self.assertEqual(plan['left_units'], [])
+        self.assertEqual(plan['skipped_files'][0]['reason'], 'over_input_budget')
+        (self.root / 'a.py').write_text('x=1', encoding='utf-8')
+        result = {**AUDIT, 'findings': [{'file': '../other.py', 'line_start': 1, 'line_end': 1,
+                                         'severity': 'high', 'category': 'test', 'description': 'outside', 'evidence': 'outside'}]}
+        cli_args = self.args('audit', '--target', str(self.root), '--single', '--left', 'codex:default')
+        with patch.object(harness, '_args_backends', return_value=backends()), \
+             patch.object(harness, 'invoke_readonly_engine', return_value=result):
+            code, report = self.capture(harness.cmd_audit, cli_args)
+        self.assertEqual(code, 4)
+        self.assertEqual(report['received_count'], 0)
+        self.assertEqual(report['single_source_count'], 0)
+
     def test_file_target_is_retained_in_prompt_and_receipt(self):
         file = self.root / 'specific.lean'
         file.write_text('theorem', encoding='utf-8')
         args = self.args('task', '--kind', 'math', '--target', str(file), '--task', '核对', '--caller', 'codex')
-        def worker(engine, root, prompt, *args):
+        def worker(engine, root, prompt, *args, **kwargs):
             self.assertIn(str(file), prompt)
             return TASK
         with patch.object(harness, '_args_backends', return_value=backends()), patch.object(harness, 'invoke_engine', side_effect=worker):
@@ -583,12 +890,13 @@ class HarnessTests(unittest.TestCase):
 
     def test_specialty_model_routing_and_thinking_tier_grading(self):
         engines = backends()
+        engines['codex']['requested_input_budget_tokens'] = None
         engines['codex']['models'] = harness._model_records({'models': [
-            {'slug': 'model-legacy-fast', 'priority': 0, 'visibility': 'list',
+            {'provider': 'openai', 'slug': 'model-legacy-fast', 'priority': 0, 'visibility': 'list',
              'context_window': 272000, 'max_context_window': 872000,
              'description': 'Older fast and efficient model.',
              'supported_reasoning_levels': [{'effort': 'low'}, {'effort': 'medium'}, {'effort': 'high'}, {'effort': 'max'}]},
-            {'slug': 'model-workhorse', 'priority': 1, 'visibility': 'list',
+            {'provider': 'openai', 'slug': 'model-workhorse', 'priority': 1, 'visibility': 'list',
              'context_window': 500000, 'max_context_window': 872000,
              'description': 'Latest workhorse model for coding and everyday work.',
              'supported_reasoning_levels': [
@@ -599,8 +907,8 @@ class HarnessTests(unittest.TestCase):
                  {'effort': 'max', 'description': 'Maximum reasoning depth for the hardest problems'},
                  {'effort': 'ultra', 'description': 'Maximum reasoning with automatic task delegation'},
              ]},
-            {'slug': 'model-demanding', 'priority': 2, 'visibility': 'list',
-             'context_window': 272000, 'max_context_window': 872000,
+            {'provider': 'openai', 'slug': 'model-demanding', 'priority': 2, 'visibility': 'list',
+             'context_window': 272000, 'max_context_window': 300000,
              'description': 'Frontier intelligence for the most demanding work.',
              'supported_reasoning_levels': [
                  {'effort': 'low', 'description': 'Fast responses'},
@@ -610,25 +918,25 @@ class HarnessTests(unittest.TestCase):
                  {'effort': 'max', 'description': 'Maximum reasoning depth for the hardest problems'},
                  {'effort': 'ultra', 'description': 'Maximum reasoning with automatic task delegation'},
              ]},
-            {'slug': 'model-hidden', 'priority': 3, 'visibility': 'hide',
+            {'provider': 'openai', 'slug': 'model-hidden', 'priority': 3, 'visibility': 'hide',
              'description': 'Fast and affordable agentic coding model.',
              'supported_reasoning_levels': [{'effort': 'low'}, {'effort': 'medium'}, {'effort': 'high'}]},
-            {'slug': 'model-fast', 'priority': 4, 'visibility': 'list',
+            {'provider': 'openai', 'slug': 'model-fast', 'priority': 4, 'visibility': 'list',
              'context_window': 272000, 'max_context_window': 872000,
              'description': 'Fast and affordable model for easier tasks.',
              'supported_reasoning_levels': [{'effort': 'low'}, {'effort': 'medium'}, {'effort': 'high'}, {'effort': 'max'}]},
         ]})
-        # 使用含 'mini' 子串的合成前缀 'omini'，防止子串误判把旗舰当成轻量模型
+        # 'gemini' 含 'mini' 子串，不能据此把所有原生模型当成轻量模型
         engines['agy']['models'] = [
-            {'slug': 'omini-prime-medium', 'display_name': 'Omini Prime (Medium)'},
-            {'slug': 'omini-prime-high', 'display_name': 'Omini Prime (High)'},
-            {'slug': 'omini-prime-low', 'display_name': 'Omini Prime (Low)'},
-            {'slug': 'omini-deep-high', 'display_name': 'Omini Deep (High)'},
-            {'slug': 'omini-deep-xhigh', 'display_name': 'Omini Deep (XHigh)'},
-            {'slug': 'omini-deep-medium', 'display_name': 'Omini Deep (Medium)'},
-            {'slug': 'omini-deep-low', 'display_name': 'Omini Deep (Low)'},
-            {'slug': 'omini-flash-high', 'display_name': 'Omini Flash (High)'},
-            {'slug': 'omini-flash-low', 'display_name': 'Omini Flash (Low)'},
+            {'slug': 'gemini-7-pro-medium', 'display_name': 'Gemini 7 Pro (Medium)'},
+            {'slug': 'gemini-7-pro-high', 'display_name': 'Gemini 7 Pro (High)'},
+            {'slug': 'gemini-7-pro-low', 'display_name': 'Gemini 7 Pro (Low)'},
+            {'slug': 'gemini-7-deep-high', 'display_name': 'Gemini 7 Deep (High)'},
+            {'slug': 'gemini-7-deep-xhigh', 'display_name': 'Gemini 7 Deep (XHigh)'},
+            {'slug': 'gemini-7-deep-medium', 'display_name': 'Gemini 7 Deep (Medium)'},
+            {'slug': 'gemini-7-deep-low', 'display_name': 'Gemini 7 Deep (Low)'},
+            {'slug': 'gemini-7-flash-high', 'display_name': 'Gemini 7 Flash (High)'},
+            {'slug': 'gemini-7-flash-low', 'display_name': 'Gemini 7 Flash (Low)'},
             {'slug': 'othervendor-pro-high', 'display_name': 'OtherVendor Pro (High)'},
             {'slug': 'othervendor-pro-low', 'display_name': 'OtherVendor Pro (Low)'},
         ]
@@ -640,10 +948,10 @@ class HarnessTests(unittest.TestCase):
                          ('model-demanding', 'max', 'specialty_deep_reasoning'))
         a_math = harness.resolve_execution_profile(engines, 'agy:default', tier, '推导一维守恒律离散残差', kind='math', estimated_tokens=500)
         self.assertEqual((a_math['model'], a_math['reasoning_effort'], a_math['cli_effort'], a_math['profile_source']),
-                         ('omini-deep-xhigh', 'xhigh', None, 'specialty_deep_reasoning'))
+                         ('gemini-7-deep-xhigh', 'xhigh', None, 'specialty_deep_reasoning'))
 
-        # 输入超深度推理模型默认窗口 75% 时，自动回退至大上下文工程主力模型
-        c_math_big = harness.resolve_execution_profile(engines, 'codex:default', 'max', '大输入推导', kind='math', estimated_tokens=230000)
+        # 输入超过深度推理模型的规划预算时，自动回退至大上下文工程主力模型
+        c_math_big = harness.resolve_execution_profile(engines, 'codex:default', 'max', '大输入推导', kind='math', estimated_tokens=400000)
         self.assertEqual((c_math_big['model'], c_math_big['reasoning_effort']), ('model-workhorse', 'max'))
 
         # 显式指定 ultra 时才放行委派挡位
@@ -659,7 +967,7 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual((c_code['model'], c_code['reasoning_effort'], c_code['profile_source']),
                          ('model-workhorse', 'high', 'frontier_catalog'))
         a_code = harness.resolve_execution_profile(engines, 'agy:default', tier_code, '整理命令行参数解析辅助函数', kind='code', estimated_tokens=1500)
-        self.assertEqual((a_code['model'], a_code['reasoning_effort']), ('omini-prime-high', 'high'))
+        self.assertEqual((a_code['model'], a_code['reasoning_effort']), ('gemini-7-pro-high', 'high'))
 
         # 否定词不应误触发降挡，且 DGSEM/边界条件审查自动拉满单模型纯思考最高挡并匹配深度推理模型
         tier_neg, reason_neg = harness.select_task_tier('auto', 'review', '不要低档，仔细检查 DGSEM 边界条件与守恒性', 2, 1000)
@@ -673,7 +981,7 @@ class HarnessTests(unittest.TestCase):
         c_med = harness.resolve_execution_profile(engines, 'codex:default', tier_pol, kind='polish')
         self.assertEqual((c_med['model'], c_med['reasoning_effort']), ('model-workhorse', 'medium'))
         a_med = harness.resolve_execution_profile(engines, 'agy:default', tier_pol, kind='polish')
-        self.assertEqual(a_med['model'], 'omini-prime-medium')
+        self.assertEqual(a_med['model'], 'gemini-7-pro-medium')
         tier_pol_long, reason_pol_long = harness.select_task_tier('auto', 'polish', '整章学术论文语言润色', 5, 6000)
         self.assertEqual((tier_pol_long, reason_pol_long), ('high', 'complexity_long_polish'))
 
@@ -684,9 +992,9 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual((c_low['model'], c_low['reasoning_effort'], c_low['profile_source']),
                          ('model-fast', 'low', 'specialty_fast_lightweight'))
         a_low = harness.resolve_execution_profile(engines, 'agy:default', tier_low, '省额度用低档快速看一下', kind='review')
-        self.assertEqual((a_low['model'], a_low['profile_source']), ('omini-flash-low', 'specialty_fast_lightweight'))
+        self.assertEqual((a_low['model'], a_low['profile_source']), ('gemini-7-flash-low', 'specialty_fast_lightweight'))
         a_low_no_lite = harness.resolve_execution_profile(engines, 'agy:default', 'low', '不要轻量模型，用低档看一下', kind='review')
-        self.assertEqual(a_low_no_lite['model'], 'omini-prime-low')
+        self.assertEqual(a_low_no_lite['model'], 'gemini-7-pro-low')
         c_low_no_lite = harness.resolve_execution_profile(engines, 'codex:default', 'low', '不要轻量模型，用低档看一下', kind='review')
         self.assertEqual((c_low_no_lite['model'], c_low_no_lite['reasoning_effort']), ('model-workhorse', 'low'))
         a_explicit_3p = harness.resolve_execution_profile(engines, 'agy:othervendor-pro-high', 'high', '指定模型审查', kind='review')
@@ -695,36 +1003,37 @@ class HarnessTests(unittest.TestCase):
         # 5. 新一代轻量高速标识 (hydrogen) 与混动路由器共存：深思与主力锁定 flagship (carbon)，low 挡精准命中同代 hydrogen（不误用旧代 flash），显式/模糊调用均可用
         g4_engines = backends()
         g4_engines['agy']['models'] = [
-            {'slug': 'omega-hydrogen-xhigh', 'display_name': 'Omega 4 Hydrogen XHigh'},
-            {'slug': 'omega-carbon-medium', 'display_name': 'Omega 4 Carbon (Medium)'},
-            {'slug': 'omega-carbon-high', 'display_name': 'Omega 4 Carbon (High)'},
-            {'slug': 'omega-carbon-low', 'display_name': 'Omega 4 Carbon (Low)'},
-            {'slug': 'omega-argon-high', 'display_name': 'Omega 4 Argon (High)'},
-            {'slug': 'omega-hydrogen-low', 'display_name': 'Omega 4 Hydrogen (Low)'},
-            {'slug': 'omega-pro-orchestrator', 'display_name': 'Orchestrator (Carbon)'},
-            {'slug': 'omega-pro-orchestrator-argon', 'display_name': 'Orchestrator (Argon)'},
-            {'slug': 'omega-3.8-flash-low', 'display_name': 'Omega 3.8 Flash (Low)'},
+            {'slug': 'gemini-4-hydrogen-xhigh', 'display_name': 'Gemini 4 Hydrogen XHigh'},
+            {'slug': 'gemini-4-carbon-medium', 'display_name': 'Gemini 4 Carbon (Medium)'},
+            {'slug': 'gemini-4-carbon-high', 'display_name': 'Gemini 4 Carbon (High)'},
+            {'slug': 'gemini-4-carbon-low', 'display_name': 'Gemini 4 Carbon (Low)'},
+            {'slug': 'gemini-4-argon-high', 'display_name': 'Gemini 4 Argon (High)'},
+            {'slug': 'gemini-4-hydrogen-low', 'display_name': 'Gemini 4 Hydrogen (Low)'},
+            {'slug': 'gemini-pro-orchestrator', 'display_name': 'Orchestrator (Carbon)'},
+            {'slug': 'gemini-pro-orchestrator-argon', 'display_name': 'Orchestrator (Argon)'},
+            {'slug': 'gemini-3.8-flash-low', 'display_name': 'Gemini 3.8 Flash (Low)'},
         ]
         g4_work = harness.resolve_execution_profile(g4_engines, 'agy:default', 'high', '常规功能实现', kind='code')
         g4_deep = harness.resolve_execution_profile(g4_engines, 'agy:default', 'max', '推导熵守恒格式', kind='math')
         g4_fast = harness.resolve_execution_profile(g4_engines, 'agy:default', 'low', '省额度快速扫查', kind='review')
         g4_no_light = harness.resolve_execution_profile(g4_engines, 'agy:default', 'low', '不要 hydrogen 低档看下', kind='review')
-        self.assertEqual((g4_work['model'], g4_work['profile_source']), ('omega-carbon-high', 'frontier_catalog'))
-        self.assertEqual((g4_deep['model'], g4_deep['profile_source']), ('omega-carbon-high', 'specialty_deep_reasoning'))
-        self.assertEqual((g4_fast['model'], g4_fast['profile_source']), ('omega-hydrogen-low', 'specialty_fast_lightweight'))
-        self.assertEqual(g4_no_light['model'], 'omega-carbon-low')
-        self.assertEqual(harness.resolve_execution_profile(g4_engines, 'agy:Orchestrator (Carbon)', 'high')['model'], 'omega-pro-orchestrator')
-        self.assertEqual(harness.resolve_execution_profile(g4_engines, 'agy:orchestrator-argon', 'high')['model'], 'omega-pro-orchestrator-argon')
-        self.assertEqual(harness.resolve_execution_profile(g4_engines, 'agy:carbon', 'medium')['model'], 'omega-carbon-medium')
-        self.assertEqual(harness.resolve_execution_profile(engines, 'codex:fast', 'low')['model'], 'model-fast')
+        self.assertEqual((g4_work['model'], g4_work['profile_source']), ('gemini-4-carbon-high', 'frontier_catalog'))
+        self.assertEqual((g4_deep['model'], g4_deep['profile_source']), ('gemini-4-carbon-high', 'specialty_deep_reasoning'))
+        self.assertEqual((g4_fast['model'], g4_fast['profile_source']), ('gemini-4-hydrogen-low', 'specialty_fast_lightweight'))
+        self.assertEqual(g4_no_light['model'], 'gemini-4-carbon-low')
+        self.assertEqual(harness.resolve_execution_profile(g4_engines, 'agy:Orchestrator (Carbon)', 'high')['model'], 'gemini-pro-orchestrator')
+        self.assertEqual(harness.resolve_execution_profile(g4_engines, 'agy:orchestrator-argon', 'high')['model'], 'gemini-pro-orchestrator-argon')
+        self.assertEqual(harness.resolve_execution_profile(g4_engines, 'agy:carbon', 'medium')['model'], 'gemini-4-carbon-medium')
+        with self.assertRaises(harness.HarnessError):
+            harness.resolve_execution_profile(engines, 'codex:fast', 'low')
 
         # 自然语言显式/模糊点名模型 + CFD 物理术语/否定词零误触 + Codex 模糊预算 + agy:<alias> 目录发现
         nl_argon = harness.resolve_execution_profile(g4_engines, 'agy:default', 'high', '请调用 Argon 模型复核推导', kind='review')
-        self.assertEqual((nl_argon['model'], nl_argon['profile_source']), ('omega-argon-high', 'prompt_fuzzy_model'))
+        self.assertEqual((nl_argon['model'], nl_argon['profile_source']), ('gemini-4-argon-high', 'prompt_fuzzy_model'))
         nl_carbon_med = harness.resolve_execution_profile(g4_engines, 'agy:default', 'high', '请调用 Carbon (Medium) 模型复核', kind='review')
-        self.assertEqual((nl_carbon_med['model'], nl_carbon_med['profile_source']), ('omega-carbon-medium', 'prompt_fuzzy_model'))
-        nl_orch = harness.resolve_execution_profile(g4_engines, 'agy:default', 'high', '请使用混动 Orchestrator 路由检查', kind='review')
-        self.assertEqual((nl_orch['model'], nl_orch['profile_source']), ('omega-pro-orchestrator', 'prompt_fuzzy_model'))
+        self.assertEqual((nl_carbon_med['model'], nl_carbon_med['profile_source']), ('gemini-4-carbon-medium', 'prompt_fuzzy_model'))
+        nl_orch = harness.resolve_execution_profile(g4_engines, 'agy:default', 'high', '请使用 Orchestrator (Carbon) 模型检查', kind='review')
+        self.assertEqual((nl_orch['model'], nl_orch['profile_source']), ('gemini-pro-orchestrator', 'prompt_fuzzy_model'))
         nl_codex = harness.resolve_execution_profile(engines, 'codex:default', 'max', '请调用 demanding 模型推导', kind='math')
         self.assertEqual((nl_codex['model'], nl_codex['profile_source']), ('model-demanding', 'prompt_fuzzy_model'))
 
@@ -732,21 +1041,12 @@ class HarnessTests(unittest.TestCase):
             g4_engines, 'agy:default', 'high',
             '计算 hydrogen detonation 爆轰波与 carbon 热流，采用 k-omega 模型与 Navier-Stokes 模型离散；采用 hydrogen 模型计算爆轰', kind='code',
         )
-        self.assertEqual((cfd_safe['model'], cfd_safe['profile_source']), ('omega-carbon-high', 'frontier_catalog'))
+        self.assertEqual((cfd_safe['model'], cfd_safe['profile_source']), ('gemini-4-carbon-high', 'frontier_catalog'))
         self.assertIsNone(harness._match_effort_level(['ultra'], 'high', ['ultra']))
         neg_prompt = harness.resolve_execution_profile(g4_engines, 'agy:default', 'high', '不要用 Argon 模型，常规复核', kind='review')
-        self.assertEqual((neg_prompt['model'], neg_prompt['profile_source']), ('omega-carbon-high', 'frontier_catalog'))
+        self.assertEqual((neg_prompt['model'], neg_prompt['profile_source']), ('gemini-4-carbon-high', 'frontier_catalog'))
 
-        self.assertEqual(harness._budget_for_spec(engines, 'codex:demanding'), int(272000 * 0.90))
-
-        fake_agy_bin = self.root / ('agy.exe' if os.name == 'nt' else 'agy')
-        fake_agy_bin.write_text('stub', encoding='utf-8')
-        fresh_backends = backends()
-        fresh_backends['agy']['binary'] = str(fake_agy_bin)
-        with patch.object(harness, 'probe_backends', return_value=g4_engines) as mock_probe:
-            harness._ensure_live_agy_catalog(self.args('probe'), fresh_backends, ('agy:carbon',))
-        mock_probe.assert_called_once()
-        self.assertEqual(fresh_backends['agy']['models'], g4_engines['agy']['models'])
+        self.assertEqual(harness._budget_for_spec(engines, 'codex:demanding'), 270000)
 
         # 单文件表面拼写检查自动降至 low
         tier_typo, reason_typo = harness.select_task_tier('auto', 'review', '检查注释错别字与 typo', 1, 300)
@@ -763,7 +1063,7 @@ class HarnessTests(unittest.TestCase):
 
         def check_agy_cmd(command, cwd, input_text, timeout_sec, **kwargs):
             self.assertIn('--model', command)
-            self.assertEqual(command[command.index('--model') + 1], 'omini-deep-xhigh')
+            self.assertEqual(command[command.index('--model') + 1], 'gemini-7-deep-xhigh')
             self.assertNotIn('--effort', command)
             stream = json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'structured_output': TASK}})
             return subprocess.CompletedProcess(command, 0, stream, '')
@@ -775,32 +1075,138 @@ class HarnessTests(unittest.TestCase):
             out = harness.invoke_engine(a_math['spec'], self.root, '推导', engines, harness.TASK_JSON_SCHEMA, True, 30, 'readonly-collaborator', None, a_math['cli_effort'])
             self.assertEqual(out, TASK)
 
+    def test_catalog_routing_is_permutation_invariant_and_rejects_ambiguous_aliases(self):
+        engines = backends()
+        engines['codex']['models'] = [
+            {'slug': 'gpt-8-router', 'priority': 0, 'supported_efforts': ['max']},
+            {'slug': 'hosted-gpt', 'provider': 'thirdparty', 'priority': 0, 'supported_efforts': ['max']},
+            {'slug': 'unidentified', 'priority': 0, 'supported_efforts': ['max']},
+            {'slug': 'gpt-8-alpha', 'priority': 1, 'supported_efforts': ['high']},
+            {'slug': 'gpt-8-beta', 'priority': 1, 'supported_efforts': ['high']},
+        ]
+        engines['agy']['models'] = [
+            {'slug': 'claude-example-high'}, {'slug': 'gpt-oss-example-high'},
+            {'slug': 'unknown-high'}, {'slug': 'gemini-4-pro-orchestrator'},
+            {'slug': 'gemini-3-pro-high'}, {'slug': 'gemini-4-carbon-high'}, {'slug': 'gemini-4-argon-high'},
+        ]
+        for _ in range(2):
+            self.assertEqual(harness.resolve_execution_profile(engines, 'codex:default')['model'], 'gpt-8-alpha')
+            self.assertEqual(harness.resolve_execution_profile(engines, 'agy:default')['model'], 'gemini-4-carbon-high')
+            for alias in ('codex:gpt-8', 'agy:gemini'):
+                with self.subTest(alias=alias), self.assertRaises(harness.HarnessError) as exc:
+                    harness.resolve_execution_profile(engines, alias)
+                self.assertGreater(len(exc.exception.details['matching_models']), 1)
+            for name in engines:
+                engines[name]['models'].reverse()
+        self.assertEqual(harness.resolve_execution_profile(engines, 'agy:unknown-high')['model_category'], 'unknown')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'codex:hosted-gpt')['model_category'], 'hosted_or_third_party')
+
+    def test_tier_policy_ignores_terms_in_prose_quotes_and_negations(self):
+        for prompt in ('Use a fast Fourier transform on edge nodes',
+                       'Refactor bridge dispatch',
+                       'Summarize the discussion of ultra and xhigh',
+                       'Review "root cause, WENO, concurrency" as sample text',
+                       'No need to discuss conservation or deadlock',
+                       '请不要分析根因及并发，核对输出排版',
+                       '避免推导熵稳定格式，整理结果',
+                       '只读核对文档对“最高挡”的描述'):
+            with self.subTest(prompt=prompt), patch.dict(os.environ, {'CAE_DEFAULT_TIER': 'ultra'}, clear=True):
+                self.assertEqual(harness.select_task_tier(text=prompt, file_count=80, estimated_tokens=900000)[0], 'high')
+        self.assertEqual(harness.select_task_tier(text='Review a race condition in message dispatch')[0], 'max')
+        self.assertEqual(harness.select_task_tier(text='核对离散守恒性')[0], 'max')
+        self.assertEqual(harness.select_task_tier(text='拼写检查', file_count=12, estimated_tokens=6000)[0], 'low')
+        self.assertEqual(harness.select_task_tier('ultra', text='审查')[0], 'ultra')
+
+    def test_orchestrator_fixed_configuration_for_slug_display_and_unique_alias(self):
+        engines = backends()
+        engines['agy']['models'] = [
+            {'slug': 'gemini-pro-orchestrator', 'display_name': 'Orchestrator (Carbon)'},
+            {'slug': 'gemini-pro-orchestrator-argon', 'display_name': 'Orchestrator (Argon)'},
+        ]
+        commands = []
+
+        def runner(command, cwd, input_text, timeout_sec, **kwargs):
+            commands.append(command)
+            self.assertNotIn('--effort', command)
+            model = command[command.index('--model') + 1]
+            stream = '\n'.join([json.dumps({'event': 'init', 'init': {'model': model}}),
+                               json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'structured_output': TASK}})])
+            return subprocess.CompletedProcess(command, 0, stream, '')
+
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, 'run_process', side_effect=runner):
+            for model in ('gemini-pro-orchestrator', 'Orchestrator (Carbon)', 'carbon-orchestrator'):
+                with self.subTest(model=model):
+                    args = self.args('task', '--target', str(self.root), '--kind', 'review', '--task', '核对说明',
+                                     '--engine', 'agy:' + model, '--tier', 'xhigh')
+                    code, report = self.capture(harness.cmd_task, args)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(report['requested_tier'], 'xhigh')
+                    self.assertEqual(report['effort_source'], 'fixed_configuration')
+                    self.assertIsNone(report['declared_effort'])
+                    self.assertIsNone(report['effective_effort'])
+                    self.assertEqual(report['invocation']['actual_model'], 'gemini-pro-orchestrator')
+            with self.assertRaises(harness.HarnessError):
+                harness.resolve_execution_profile(engines, 'agy:orchestrator')
+        self.assertEqual(len(commands), 3)
+
+    def test_gate_does_not_claim_escalation_when_command_variant_is_unchanged(self):
+        engines = backends()
+        engines['agy']['models'] = [{'slug': 'gemini-pro-orchestrator'}]
+        seen = []
+
+        def runner(command, cwd, input_text=None, timeout_sec=600, **kwargs):
+            if kwargs.get('shell'):
+                return subprocess.CompletedProcess(command, 0 if len(seen) > 1 else 1, 'verify', '')
+            seen.append(command)
+            return subprocess.CompletedProcess(command, 0, json.dumps(TASK), '')
+
+        args = self.args('gate', '--worker', 'agy:gemini-pro-orchestrator', '--target', str(self.root),
+                         '--task', '整理赋值逻辑', '--verify-cmd', 'verify', '--max-rounds', '2')
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, 'run_process', side_effect=runner):
+            code, report = self.capture(harness.cmd_gate, args)
+        self.assertEqual(code, 0)
+        self.assertEqual(report['rounds_used'], 2)
+        self.assertEqual(report['selected_tier'], 'high')
+        self.assertEqual(report['effort_source'], 'fixed_configuration')
+        self.assertFalse(report['history'][1]['escalated'])
+        self.assertNotIn('--effort', report['history'][1]['invocation']['argv'])
+
     def test_gate_round2_auto_escalates_thinking_tier_to_max(self):
         target_py = self.root / 'helper.py'
         target_py.write_text('x = 0\n', encoding='utf-8')
         engines = backends()
         engines['codex']['models'] = [
-            {'slug': 'model-workhorse', 'priority': 1, 'visibility': 'list',
+            {'slug': 'model-workhorse', 'provider': 'openai', 'priority': 1, 'visibility': 'list',
              'supported_efforts': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
              'delegating_efforts': ['ultra']},
         ]
         seen_efforts = []
 
-        def fake_worker(spec, root, prompt, _b, timeout_sec=600, effort=None, retry_quota=False):
-            seen_efforts.append((spec, effort))
+        def fake_run(command, root, input_text=None, timeout_sec=600, **kwargs):
+            if kwargs.get('shell'):
+                return subprocess.CompletedProcess(command, 0 if len(seen_efforts) == 2 else 1, 'verify', '')
+            effort = next(value for value in command if value.startswith('model_reasoning_effort='))
+            seen_efforts.append((command[command.index('-m') + 1], effort))
             target_py.write_text(f'x = {len(seen_efforts)}\n', encoding='utf-8')
-            return json.dumps(TASK, ensure_ascii=False)
+            Path(command[command.index('-o') + 1]).write_text(json.dumps(TASK), encoding='utf-8')
+            return subprocess.CompletedProcess(command, 0, '', '')
 
         verify_cmd = f'"{sys.executable}" -B -c "import pathlib,sys; sys.exit(0 if \'x = 2\' in pathlib.Path(\'helper.py\').read_text() else 1)"'
         args = self.args('gate', '--caller', 'antigravity', '--target', str(self.root),
                          '--task', '整理返回值赋值逻辑', '--write-scope', '*.py', '--verify-cmd', verify_cmd, '--max-rounds', '3')
-        with patch.object(harness, '_args_backends', return_value=engines), patch.object(harness, 'invoke_edit_worker', side_effect=fake_worker):
+        with patch.object(harness, '_args_backends', return_value=engines), patch.object(harness, 'run_process', side_effect=fake_run):
             code, report = self.capture(harness.cmd_gate, args)
         self.assertEqual(code, 0)
-        self.assertEqual(seen_efforts, [('codex:model-workhorse', 'high'), ('codex:model-workhorse', 'max')])
+        self.assertEqual(seen_efforts, [('model-workhorse', 'model_reasoning_effort="high"'),
+                                        ('model-workhorse', 'model_reasoning_effort="max"')])
         self.assertEqual(report['rounds_used'], 2)
         self.assertEqual(report['selected_tier'], 'max')
         self.assertEqual(report['tier_reason'], 'gate_retry_escalated_max')
+        self.assertFalse(report['history'][0]['escalated'])
+        self.assertTrue(report['history'][1]['escalated'])
+        self.assertIn('model_reasoning_effort="max"', report['history'][1]['invocation']['argv'])
 
     def test_wsl_unauthenticated_linux_agy_falls_back_to_windows_agy_exe(self):
         linux_agy = self.root / 'linux-home' / '.gemini' / 'bin' / 'agy'
@@ -815,7 +1221,12 @@ class HarnessTests(unittest.TestCase):
 
         engines = backends()
         engines['agy'].update(binary=str(linux_agy), windows_interop=False,
-                              config_home=str(linux_agy.parents[1]), authentication_status='not_checked')
+                              config_home=str(linux_agy.parents[1]), authentication_status='not_checked',
+                              model_catalog={'freshness': 'within_assessment_window'},
+                              models=[{'slug': 'gemini-7-pro-high'}])
+        windows_settings = win_agy.parents[1] / 'antigravity-cli' / 'settings.json'
+        windows_settings.parent.mkdir(parents=True)
+        windows_settings.write_text('{"model": "Windows configured model"}', encoding='utf-8')
 
         def fake_which(cmd):
             return {'powershell.exe': '/mnt/c/ps.exe', 'taskkill.exe': '/mnt/c/tk.exe', 'wslpath': '/usr/bin/wslpath'}.get(cmd)
@@ -833,6 +1244,9 @@ class HarnessTests(unittest.TestCase):
             if command == [str(linux_agy), 'models']:
                 return subprocess.CompletedProcess(command, 1, '', 'Error: Please sign in to view available models.')
             self.assertEqual(command[0], 'powershell.exe')
+            decoded = base64.b64decode(command[-1]).decode('utf-16le')
+            if "$info.Arguments = 'models'" in decoded:
+                return subprocess.CompletedProcess(command, 0, 'gemini-8-carbon-high\tGemini 8 Carbon (High)\n', '')
             stream = json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'structured_output': TASK}})
             return subprocess.CompletedProcess(command, 0, stream, '')
 
@@ -842,11 +1256,17 @@ class HarnessTests(unittest.TestCase):
              patch.object(harness, '_windows_env', return_value='C:\\Temp'), \
              patch.object(harness, '_wsl_path', side_effect=fake_wsl_path), \
              patch.object(harness, 'run_process', side_effect=fake_run):
-            out = harness.invoke_engine('agy:suite-prime-high', self.root, '审查', engines, harness.TASK_JSON_SCHEMA)
+            receipt = {}
+            out = harness.invoke_engine('agy:default', self.root, '审查', engines, harness.TASK_JSON_SCHEMA, receipt=receipt)
         self.assertEqual(out, TASK)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
         self.assertTrue(engines['agy']['windows_interop'])
         self.assertEqual(engines['agy']['binary'], str(win_agy))
+        self.assertEqual(engines['agy']['model'], 'Windows configured model')
+        self.assertEqual(engines['agy']['model_catalog']['source'], 'agy_models_cli')
+        self.assertEqual(receipt['requested_engine'], 'agy:default')
+        self.assertEqual(receipt['model_requested_to_cli'], 'gemini-8-carbon-high')
+        self.assertEqual(receipt['execution_environment']['fallback_from']['binary'], str(linux_agy))
 
     def test_quota_exhaustion_cooldown_and_preflight_gate(self):
         import datetime as _dt
@@ -874,7 +1294,8 @@ class HarnessTests(unittest.TestCase):
         self.assertTrue(report1['user_confirmation_required'])
         self.assertEqual(report1['quota_cooldown']['reset_hint'], reset_str)
         self.assertEqual(report1['quota_cooldown']['cooldown_source'], 'parsed_reset_time')
-        quota_file = cfg_dir / 'cache' / 'cae_quota_state.json'
+        events = harness._quota_events_dir(harness._quota_state_path('codex', engines['codex']))
+        quota_file = events / (report1['quota_cooldown']['event_id'] + '.json')
         self.assertTrue(quota_file.is_file())
 
         # 2. 跨进程新会话（清空内存态）再次发起时：事前直接拦截，绝不启动后端子进程
@@ -915,10 +1336,180 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(report3['quota_status'], 'unknown_until_called')
 
         # 6. 过期冷却文件自动清理放行
-        quota_file.parent.mkdir(parents=True, exist_ok=True)
         quota_file.write_text(json.dumps({'backend': 'codex', 'exhausted': True, 'cooldown_until_epoch': 1.0}), encoding='utf-8')
         self.assertIsNone(harness._load_active_quota_cooldown('codex', engines['codex']))
         self.assertFalse(quota_file.exists())
+
+    def test_audit_quota_fuse_survives_inflight_success_and_keeps_coverage(self):
+        for name in ('a.py', 'b.py', 'c.py'):
+            (self.root / name).write_text('x = 1\n', encoding='utf-8')
+        engines = backends()
+        cfg = tempfile.TemporaryDirectory(prefix='cae-test-config-')
+        self.addCleanup(cfg.cleanup)
+        engines['codex']['config_home'] = cfg.name
+        calls, ready, quota_saved = [], threading.Barrier(2), threading.Event()
+        record_quota = harness._record_quota_exhausted
+
+        def signal_after_quota(*args, **kwargs):
+            cooldown = record_quota(*args, **kwargs)
+            quota_saved.set()
+            return cooldown
+
+        def runner(command, cwd, input_text, timeout_sec, **kwargs):
+            name = next(line[2:] for line in input_text.splitlines() if line.startswith('- '))
+            calls.append(name)
+            if name in ('a.py', 'b.py'):
+                ready.wait(timeout=5)
+            if name == 'a.py':
+                return subprocess.CompletedProcess(command, 1, '', 'hit your usage limit')
+            if name == 'b.py':
+                self.assertTrue(quota_saved.wait(5))
+            Path(command[command.index('-o') + 1]).write_text(
+                json.dumps({**AUDIT, 'read_files': [name]}), encoding='utf-8')
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        original = harness.concurrent.futures.ThreadPoolExecutor
+        args = self.args('audit', '--target', str(self.root), '--single', '--left', 'codex:default',
+                         '--strategy', 'sharded', '--shard-tokens', '1', '--retry-quota')
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness.concurrent.futures, 'ThreadPoolExecutor', side_effect=lambda **kw: original(max_workers=2)), \
+             patch.object(harness, '_record_quota_exhausted', side_effect=signal_after_quota), \
+             patch.object(harness, 'run_process', side_effect=runner):
+            code, report = self.capture(harness.cmd_audit, args)
+        self.assertEqual(code, 3)
+        self.assertTrue(report['quota_fuse_triggered'])
+        self.assertEqual(set(calls), {'a.py', 'b.py'})
+        self.assertEqual(report['completed_units'][0]['read_files'], ['b.py'])
+        self.assertEqual(report['completed_count'], 1)
+        self.assertTrue(next(error for error in report['errors'] if error['planned_files'] == ['c.py'])['preflight_blocked'])
+        events = harness._quota_events_dir(harness._quota_state_path('codex', engines['codex']))
+        self.assertTrue((events / (report['quota_cooldown']['event_id'] + '.json')).is_file())
+
+    def test_retry_success_preserves_new_quota_failure_from_another_process(self):
+        writer = self.root / 'quota_writer.py'
+        writer.write_text("""
+import importlib.util, json, os, sys, time
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location('harness_fixture', sys.argv[1])
+harness = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(harness)
+info = {'config_home': sys.argv[2]}
+assert sys.stdin.readline().strip() == 'record failure'
+if sys.argv[3] == 'legacy':
+    state = harness._quota_state_path('codex', info, legacy=True)
+    pending = state.with_suffix('.pending')
+    pending.write_text(json.dumps({'backend': 'codex', 'exhausted': True, 'event_id': 'new-from-legacy',
+                                   'cooldown_until_epoch': time.time() + 3600}), encoding='utf-8')
+    os.replace(pending, state)
+else:
+    harness._record_quota_exhausted('codex', info, 'new failure from another process')
+""", encoding='utf-8')
+        for mode in ('current', 'legacy'):
+            with self.subTest(mode=mode):
+                info = {'config_home': str(self.root / mode)}
+                state = harness._quota_state_path('codex', info)
+                events = harness._quota_events_dir(state)
+                if mode == 'legacy':
+                    state = harness._quota_state_path('codex', info, legacy=True)
+                    state.parent.mkdir(parents=True)
+                    first_id = 'old-legacy'
+                    state.write_text(json.dumps({'backend': 'codex', 'exhausted': True, 'event_id': first_id,
+                                                 'cooldown_until_epoch': time.time() + 300}), encoding='utf-8')
+                    old = state
+                else:
+                    first_id = harness._record_quota_exhausted('codex', info, 'old cooldown')['event_id']
+                    old = events / (first_id + '.json')
+                retry = harness._QuotaBatch(retry=True)
+                harness._enforce_preflight_quota({'codex': info}, ('codex:default',), batch=retry)
+                child = subprocess.Popen([sys.executable, '-B', str(writer), str(SCRIPT), info['config_home'], mode],
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                original_unlink = Path.unlink
+                original_publish = harness._publish_quota_record
+                child_started = threading.Event()
+
+                def record_new_failure():
+                    child_started.set()
+                    _, errors = child.communicate('record failure\n', timeout=10)
+                    self.assertEqual(child.returncode, 0, errors)
+
+                def unlink_after_new_failure(path, *args, **kwargs):
+                    if path == old:
+                        record_new_failure()
+                    return original_unlink(path, *args, **kwargs)
+
+                def acknowledge_after_new_failure(path, record):
+                    if path.parent.name == 'acknowledged':
+                        record_new_failure()
+                    return original_publish(path, record)
+
+                try:
+                    with patch.object(Path, 'unlink', unlink_after_new_failure), \
+                         patch.object(harness, '_publish_quota_record', acknowledge_after_new_failure):
+                        harness._mark_quota_success('codex', info, retry)
+                    self.assertTrue(child_started.is_set())
+                    cooldown = harness._load_active_quota_cooldown('codex', info, cleanup_expired=False)
+                    self.assertIsNotNone(cooldown)
+                    self.assertNotEqual(cooldown['event_id'], first_id)
+                    with self.assertRaises(harness.HarnessError) as blocked:
+                        harness._enforce_preflight_quota({'codex': info}, ('codex:default',), batch=retry)
+                    self.assertEqual(blocked.exception.status, 'quota_exhausted')
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.communicate(timeout=10)
+
+    def test_agy_stale_catalog_refresh_checks_quota_and_does_not_swallow_failures(self):
+        engines = backends()
+        info = engines['agy']
+        info.update(model_catalog={'freshness': 'stale'}, config_home=str(self.root / 'native'))
+        args = self.args('task', '--target', str(self.root), '--kind', 'review', '--task', '整理正文', '--engine', 'agy:default')
+        listing = Mock(return_value=subprocess.CompletedProcess(['agy', 'models'], 1, '', 'network unavailable'))
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, '_run_agy_listing', listing), patch.object(harness, 'invoke_engine') as worker:
+            code, report = self.capture(harness.cmd_task, args)
+            self.assertEqual(code, 1)
+            self.assertIn('停止派工', report['error'])
+            worker.assert_not_called()
+            listing.assert_called_once()
+            listing.reset_mock()
+            harness._record_quota_exhausted('agy', info, 'usage limit')
+            code, report = self.capture(harness.cmd_task, args)
+            self.assertEqual(code, 5)
+            self.assertTrue(report['preflight_blocked'])
+            listing.assert_not_called()
+            worker.assert_not_called()
+
+    def test_agy_listing_quota_precedes_auth_fallback_and_scopes_by_execution_side(self):
+        engines = backends()
+        native = engines['agy']
+        native.update(config_home=str(self.root), execution_side='posix', model_catalog={'freshness': 'stale'})
+        windows = {**native, 'execution_side': 'windows', 'windows_interop': True}
+        response = subprocess.CompletedProcess(['agy', 'models'], 1, '', 'Please sign in; resource_exhausted')
+        with patch.object(harness, '_run_agy_listing', return_value=response), \
+             patch.object(harness, '_fallback_agy_info') as fallback, self.assertRaises(harness.HarnessError) as caught:
+            harness._refresh_agy_listing(native, harness._QuotaBatch(), refresh_model_cache=True)
+        fallback.assert_not_called()
+        self.assertEqual(caught.exception.status, 'quota_exhausted')
+        self.assertEqual(caught.exception.details['quota_execution_side'], 'posix')
+        harness._enforce_preflight_quota({'agy': windows}, ('agy:default',))
+        self.assertFalse(harness._quota_state_path('agy', windows).exists())
+        with self.assertRaises(harness.HarnessError):
+            harness._enforce_preflight_quota(engines, ('agy:default',))
+
+    def test_agy_auth_fallback_checks_windows_cooldown_before_listing(self):
+        engines = backends()
+        native = engines['agy']
+        native.update(config_home=str(self.root / 'native'), execution_side='posix')
+        windows = {**native, 'config_home': str(self.root / 'windows'), 'execution_side': 'windows', 'windows_interop': True}
+        harness._record_quota_exhausted('agy', windows, 'usage limit')
+        response = subprocess.CompletedProcess(['agy', 'models'], 1, '', 'Please sign in to view available models.')
+        with patch.object(harness, '_run_agy_listing', return_value=response) as listing, \
+             patch.object(harness, '_fallback_agy_info', return_value=windows), self.assertRaises(harness.HarnessError) as caught:
+            harness._refresh_agy_listing(native, harness._QuotaBatch(), refresh_model_cache=True)
+        listing.assert_called_once_with(native)
+        self.assertTrue(caught.exception.details['preflight_blocked'])
+        self.assertEqual(caught.exception.details['quota_execution_side'], 'windows')
 
     def test_unknown_and_nonpositive_arguments_fail(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

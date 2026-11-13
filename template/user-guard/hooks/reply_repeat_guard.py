@@ -1,7 +1,7 @@
 """
 reply_repeat_guard.py - 反重力 Stop 交接终审与防连续同质等待刷屏门禁 (user-guard)
 
-核心职责（适配 Antigravity Stop 钩子协议规范，仅在 terminationReason == "NO_TOOL_CALL" 且非 continuationActive 时检查）：
+正常模型停机时检查交接与重复等待。后台是否空闲和 Stop 钩子续跑状态独立判定。
 1. 长会话 Stage-2 (drain/freeze) 交接终审（联动 handoff_gate.py）：
    - 核验是否已落盘非空交接文档或回复中已给出可粘贴【新对话提示词】；开启 /goal 时同时强制校验末尾是否附带 `<!-- GOAL_CANCELLED -->` 终止标记（每回合至多阻断 1 次）。
 2. 日常防连续同质等待刷屏：
@@ -9,7 +9,7 @@ reply_repeat_guard.py - 反重力 Stop 交接终审与防连续同质等待刷�
    - 检测模型最新回复是否为短状态等待回复（<=300 字符、含后台运行等待词、不含向用户提问或等待用户拍板词）；
    - 严格执行相邻归一化文本同质比对（保留数字以区分真实迭代步数/残差进展！）：
      仅当同一回合连续 3 次输出同质无增量的短状态等待回复时，触发 1 次 decision="continue" 阻断提醒；
-   - 配合 continuationActive 检查与已拦截签名去重，100% 杜绝循环唤醒死锁。
+   - 同一用户回合至多触发一次续跑。
 """
 
 import difflib
@@ -304,7 +304,7 @@ def extract_current_turn_latest_reply(transcript_path_str: Optional[str]) -> Tup
     if not transcript_path_str:
         return "turn_0_initial", None, ""
 
-    tp = user_words.resolve_compact_transcript_path(Path(transcript_path_str))
+    tp = user_words.resolve_compact_transcript_path(Path(transcript_path_str).expanduser())
     if not tp.exists() or not tp.is_file():
         return "turn_0_initial", None, ""
 
@@ -340,7 +340,7 @@ def extract_current_turn_latest_reply(transcript_path_str: Optional[str]) -> Tup
             if isinstance(content, str) and content.strip():
                 raw_idx = st.get("step_index")
                 latest_step_idx = int(raw_idx) if isinstance(raw_idx, int) else pos
-                latest_text = content.strip()
+                latest_text = content
                 trunc_fields = st.get("truncated_fields") or []
                 latest_is_truncated = isinstance(trunc_fields, list) and "content" in trunc_fields
 
@@ -349,10 +349,7 @@ def extract_current_turn_latest_reply(transcript_path_str: Optional[str]) -> Tup
             tp.parent / "transcript_full.jsonl",
             {latest_step_idx},
         )
-        if latest_step_idx in full_map and isinstance(full_map[latest_step_idx], str):
-            full_text = full_map[latest_step_idx].strip()
-            if full_text:
-                latest_text = full_text
+        latest_text = full_map.get(latest_step_idx, "")
 
     return turn_key, latest_step_idx, latest_text
 
@@ -361,10 +358,13 @@ def _load_repeat_state(state_file: Path, conversation_id: str) -> Dict[str, Any]
     if state_file.exists():
         try:
             data = json.loads(state_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
+            if (isinstance(data, dict) and data.get("version") == 2
+                    and data.get("conversationId") == conversation_id and isinstance(data.get("turns"), dict)):
                 return data
-        except Exception:
-            pass
+            raise ValueError("状态格式或会话身份不符")
+        except (OSError, ValueError) as exc:
+            log_event("Stop:repeat_state_error", conversation_id, f"防重复状态读取失败（{exc}），保留原文件")
+            raise
     return {"version": 2, "conversationId": conversation_id, "turns": {}}
 
 
@@ -378,21 +378,34 @@ def _save_repeat_state(state_file: Path, state: Dict[str, Any], conversation_id:
 def handle_stop_repeat_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
     """处理 Stop 事件防复读刷屏检测"""
     conversation_id = str(payload.get("conversationId") or "unknown_session").strip()
-    termination_reason = str(payload.get("terminationReason") or "")
+    termination_reason = str(payload.get("terminationReason") or "").strip().casefold()
 
     # 1. 非正常无工具结束时直接放行
-    if termination_reason != "NO_TOOL_CALL":
+    if (termination_reason not in ("model_stop", "no_tool_call") or payload.get("error")
+            or not user_words.valid_session_id(conversation_id)):
         return {"decision": "allow"}
 
     # 2. 官方防死循环协议规范：若当前回合已处于 Stop 钩子触发的续跑状态，立即放行，绝不循环唤醒
-    if bool(payload.get("continuationActive", False)):
+    if payload.get("continuationActive") is True:
         return {"decision": "allow"}
 
-    turn_key, step_idx, latest_reply = extract_current_turn_latest_reply(payload.get("transcriptPath"))
     state_dir, _ = get_data_dirs()
+    try:
+        with user_words.session_state_lock(state_dir, conversation_id):
+            return _handle_stop_locked(payload, state_dir, conversation_id)
+    except (OSError, ValueError) as exc:
+        log_event("Stop:state_error", conversation_id, f"Stop 状态未更新（{exc}）")
+        return {"decision": "allow"}
+
+
+def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_id: str) -> Dict[str, Any]:
+    turn_key, step_idx, latest_reply = extract_current_turn_latest_reply(payload.get("transcriptPath"))
 
     # 若当前会话处于长会话 Stage-2 (drain/freeze)，优先验收交接完整性与 /goal 停止标记（每回合至多阻断 1 次）
-    handoff_resp = handoff_gate.check_stop_handoff(payload, state_dir, turn_key, latest_reply or "")
+    last_input = user_words.clean_user_content(payload.get("lastUserInput"))
+    handoff_resp = handoff_gate.check_stop_handoff_locked(
+        payload, state_dir, turn_key, latest_reply, goal_active=user_words.agy_goal_command(last_input),
+    )
     if handoff_resp is not None:
         return handoff_resp
 
@@ -413,7 +426,8 @@ def handle_stop_repeat_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # 同一 step_index 幂等保护（防止重复投递误累加）
-    if step_idx is not None and turn_rec.get("lastStepIndex") == step_idx:
+    last_step = turn_rec.get("lastStepIndex")
+    if step_idx is not None and isinstance(last_step, int) and step_idx <= last_step:
         return {"decision": "allow"}
 
     if not is_short_status_reply(latest_reply):
@@ -440,7 +454,8 @@ def handle_stop_repeat_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
     blocked_sigs: List[str] = turn_rec.setdefault("blockedSignatures", [])
     sig = hashlib.sha256(curr_norm.encode("utf-8")).hexdigest()[:16]
 
-    if count >= 3 and sig not in blocked_sigs:
+    # fullyIdle=false 仍可能需要交接，也允许单次防重复提醒。它只表示存在后台任务。
+    if count >= 3 and not blocked_sigs:
         blocked_sigs.append(sig)
         _save_repeat_state(state_file, state, conversation_id)
         log_event(

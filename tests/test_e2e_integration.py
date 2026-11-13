@@ -3,12 +3,13 @@ test_e2e_integration.py - 全系统端到端集成验证、隐私脱敏审计与
 
 覆盖验证：
 1. 插件清单、规则 (rules/AGENTS.md)、钩子编排 (hooks.json) 与只读子代理静态合规校验；
-2. 全仓库源码、测试与文档 100% 隐私脱敏校验（零个人用户名、电脑型号与显卡标识硬编码）；
+2. 仓库文本中的主目录、硬件型号和凭据字面量模式扫描；
 3. 真实 CLI 子进程级联管道联调（UTF-8 中文符号无损传输、PreInvocation 增量压缩注入、PreToolUse 门禁、Stop 门禁）；
 4. install.py 镜像同步安装器沙箱测试（自动清除旧版脏文件与废弃 *_stop_gate.json、保护有效原话归档、零 __pycache__ 污染）。
 """
 
 import contextlib
+import datetime
 import io
 import json
 import importlib.util
@@ -137,8 +138,8 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertIn('name = "readonly-', toml_text)
             self.assertIn("严禁修改任何文件", toml_text)
 
-    def test_02_zero_personal_info_leakage_across_repo(self) -> None:
-        """全仓库源码、配置、测试与文档 100% 脱敏审计（零硬编码个人主目录、主机路径或 API 密钥）"""
+    def test_02_repository_personal_path_hardware_and_credential_patterns(self) -> None:
+        """扫描仓库文本中与个人路径、具体硬件型号和常见凭据匹配的内容。"""
         allowed_placeholders = {
             "...", "<user>", "user", "username", "yourname", "example",
             "alice", "bob", "public", "default", "test", "mock",
@@ -152,6 +153,13 @@ class TestEndToEndIntegration(unittest.TestCase):
             re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
             re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
             re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+            re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|AKIA[A-Z0-9]{16})\b"),
+            re.compile(r"\b(?:access_token|api[_-]?key|client_secret)\s*[:=]\s*['\"][A-Za-z0-9_.-]{24,}['\"]", re.I),
+        )
+        hardware_patterns = (
+            re.compile(r"\b(?:GeForce\s+)?RTX\s+[2345]\d{3}\s*(?:Ti|Super)?\b", re.I),
+            re.compile(r"\b(?:Radeon\s+)?RX\s+[5679]\d{3}\s*(?:XT|XTX)?\b", re.I),
+            re.compile(r"\b(?:HP\s+)?OMEN\s+\d{2}[A-Za-z]\b", re.I),
         )
 
         # 动态获取当前机器真实主目录与当前本地克隆路径（任何真实机器路径绝不可硬编码进仓库）
@@ -172,7 +180,7 @@ class TestEndToEndIntegration(unittest.TestCase):
                         self.assertNotIn(
                             hv,
                             content,
-                            f"文件 {rel_name} 中检测到当前机器主目录路径硬编码: {hv}",
+                            f"文件 {rel_name} 中检测到本机绝对路径",
                         )
 
                 if p.name != "test_e2e_integration.py":
@@ -182,8 +190,8 @@ class TestEndToEndIntegration(unittest.TestCase):
                             if captured and captured not in allowed_placeholders and not captured.startswith("$"):
                                 self.fail(f"文件 {rel_name} 中检测到未脱敏的用户路径片段: {m.group(0)}")
 
-                for sp in secret_patterns:
-                    self.assertIsNone(sp.search(content), f"文件 {rel_name} 中检测到疑似密钥或私钥字面量")
+                for pattern in secret_patterns + hardware_patterns:
+                    self.assertFalse(pattern.search(content), f"文件 {rel_name} 中检测到疑似凭据或硬件型号")
 
         self.assertGreaterEqual(checked_count, 16)
 
@@ -347,6 +355,12 @@ class TestEndToEndIntegration(unittest.TestCase):
             )
             self.assertEqual(hook_proc.returncode, 0, f"原生安装命令执行失败: {hook_proc.stderr}")
             self.assertEqual(json.loads(hook_proc.stdout.strip())["injectSteps"], [])
+            first_snapshot = {file.relative_to(sandbox_plugin): (file.read_bytes(), file.stat().st_mtime_ns)
+                              for file in sandbox_plugin.rglob("*") if file.is_file()}
+            repeated = subprocess.run(proc.args, capture_output=True, text=True, encoding="utf-8", timeout=20)
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            self.assertEqual({file.relative_to(sandbox_plugin): (file.read_bytes(), file.stat().st_mtime_ns)
+                              for file in sandbox_plugin.rglob("*") if file.is_file()}, first_snapshot)
 
     def test_05_dry_run_preserves_source_and_all_install_targets(self) -> None:
         """预演保留源树缓存、目标陈旧文件与其他技能，且不创建新目录。"""
@@ -503,10 +517,9 @@ class TestEndToEndIntegration(unittest.TestCase):
                     custom.mkdir()
                     alias = root / "custom alias"
                     _create_directory_link(alias, custom)
-                    self.assertEqual(
-                        INSTALLER.validate_install_target(alias / "new-plugin", repo),
-                        custom.resolve() / "new-plugin",
-                    )
+                    with self.assertRaisesRegex(ValueError, "祖先链接"):
+                        INSTALLER.validate_install_target(alias / "new-plugin", repo)
+                    self.assertEqual(list(custom.iterdir()), [])
 
     def test_11_custom_sibling_target_never_mutates_default_mcp_config(self) -> None:
         """显式安装至 ~/.gemini/config/plugins/<staging> 时禁止修改真实 mcp_config.json。"""
@@ -670,20 +683,38 @@ class TestEndToEndIntegration(unittest.TestCase):
             source = settings.read_bytes()
             models = [{"slug": "alpha-core-high", "display_name": "Alpha Core (High)"},
                       {"slug": "alpha-core-ultra", "display_name": "Alpha Core (Ultra)"}]
-            with mock.patch.object(INSTALLER.shutil, "which", return_value=None), \
-                    mock.patch.object(INSTALLER.Path, "home", return_value=Path(tmp)), \
-                    mock.patch.object(INSTALLER, "_load_wsl_windows_agy_cache", return_value=models), \
+            cache = cli_dir / "cache" / "cae_models_cache.json"
+            with mock.patch.object(INSTALLER, "_native_cli", return_value="native-agy") as discover, \
+                    mock.patch.object(INSTALLER.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        ["native-agy", "models"], 0, stdout="".join(f'{item["slug"]}\t{item["display_name"]}\n' for item in models)
+                    )) as query, \
                     contextlib.redirect_stdout(io.StringIO()):
                 INSTALLER.configure_agy_frontier_max_default(gemini_root)
                 self.assertEqual(settings.read_bytes(), source)
+                discover.assert_not_called()
+                query.assert_not_called()
+                self.assertFalse(cache.exists())
+                INSTALLER.configure_agy_frontier_max_default(gemini_root, dry_run=True, overwrite=True)
+                discover.assert_not_called()
+                query.assert_not_called()
+                self.assertFalse(cache.exists())
+                self.assertEqual(settings.read_bytes(), source)
                 INSTALLER.configure_agy_frontier_max_default(gemini_root, overwrite=True)
+                query.assert_called_once()
                 self.assertEqual(json.loads(settings.read_bytes()), {"model": "Alpha Core (High)", "other": True})
+                snapshot = json.loads(cache.read_bytes())
+                self.assertEqual(snapshot["source"], "agy_models_cli")
+                self.assertEqual(snapshot["models"], models)
+                self.assertEqual(datetime.datetime.fromisoformat(snapshot["fetched_at"]).utcoffset(), datetime.timedelta(0))
+                cache_before = (cache.read_bytes(), cache.stat().st_mtime_ns)
                 settings.unlink()
                 desktop_settings = gemini_root / "config" / "config.json"
                 desktop_settings.parent.mkdir()
                 desktop_settings.write_bytes(b'{"userSettings":{"model":"Orchestrator (Core)"}}\n')
                 INSTALLER.configure_agy_frontier_max_default(gemini_root)
                 self.assertFalse(settings.exists())
+                self.assertEqual((cache.read_bytes(), cache.stat().st_mtime_ns), cache_before)
+                query.assert_called_once()
                 desktop_settings.unlink()
                 INSTALLER.configure_agy_frontier_max_default(gemini_root)
                 self.assertEqual(json.loads(settings.read_bytes())["model"], "Alpha Core (High)")
@@ -909,9 +940,7 @@ class TestEndToEndIntegration(unittest.TestCase):
         """分别执行反重力门禁和独立 Codex 提示钩子的子进程。"""
         hooks_cfg = json.loads((ACTIVE_PLUGIN_DIR / "hooks.json").read_text(encoding="utf-8"))["user-guard-lifecycle"]
         pre_cmd = hooks_cfg["PreInvocation"][0]["command"]
-        ptu_cmd = hooks_cfg["PreToolUse"][0]["hooks"][0]["command"]
         stop_cmd = hooks_cfg["Stop"][0]["command"]
-        self.assertIn("invoke_subagent", hooks_cfg["PreToolUse"][0]["matcher"])
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -939,6 +968,18 @@ class TestEndToEndIntegration(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, f"{raw_cmd} 失败: {proc.stderr}")
                 return json.loads(proc.stdout.strip())
 
+            def dispatch_pre_tool(name: str, args: dict) -> dict:
+                commands = [
+                    handler["command"] for group in hooks_cfg["PreToolUse"]
+                    if re.search(group["matcher"], name)
+                    for handler in group["hooks"]
+                ]
+                self.assertEqual(len(commands), 1, f"{name} 应由已注册的 PreToolUse 处理")
+                return run_sub(commands[0], {
+                    "conversationId": "e2e-handoff-conv", "cwd": str(ws_dir),
+                    "workspacePaths": [str(ws_dir)], "toolCall": {"name": name, "args": args},
+                })
+
             # 写入人类首条含 /goal 指令与 16 次 CHECKPOINT，直接激发 Stage-2 drain
             lines = [json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "/goal\n执行端到端长会话验证"}, ensure_ascii=False)]
             for idx in range(1, 17):
@@ -951,19 +992,19 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertIn("Stage-2 drain", out_pre["injectSteps"][0]["systemMessage"]["systemMessage"])
 
             # 子进程调用 invoke_subagent 必被阻断；写交接档放行
-            out_subagent = run_sub(ptu_cmd, {"conversationId": conv_id, "cwd": str(ws_dir), "workspacePaths": [str(ws_dir)], "toolCall": {"name": "invoke_subagent", "args": {}}})
+            out_subagent = dispatch_pre_tool("invoke_subagent", {})
             self.assertEqual(out_subagent["decision"], "deny")
 
-            out_handoff = run_sub(
-                ptu_cmd,
-                {
-                    "conversationId": conv_id,
-                    "cwd": str(ws_dir),
-                    "workspacePaths": [str(ws_dir)],
-                    "toolCall": {"name": "write_file", "args": {"Path": str(ws_dir / "HANDOFF_NEXT.md"), "Content": "# handoff"}},
-                },
+            out_handoff = dispatch_pre_tool(
+                "write_to_file", {"TargetFile": str(ws_dir / "HANDOFF_NEXT.md"), "CodeContent": "# handoff"},
             )
             self.assertEqual(out_handoff["decision"], "allow")
+            gate_path = next(plugin_data.rglob(f"{conv_id}_handoff_gate.json"))
+            gate_state = json.loads(gate_path.read_bytes())
+            gate_state["phase"] = "freeze"
+            gate_path.write_text(json.dumps(gate_state), encoding="utf-8")
+            self.assertEqual(dispatch_pre_tool("new_tool_without_guard_alias", {})["decision"], "deny")
+            self.assertEqual(dispatch_pre_tool("finish", {})["decision"], "allow")
 
             # Stop 子进程验收缺失 prompt / GOAL_CANCELLED 时阻断，补全后放行
             with open(tp, "a", encoding="utf-8", newline="\n") as f:
@@ -979,7 +1020,11 @@ class TestEndToEndIntegration(unittest.TestCase):
                             "step_index": 1607,
                             "source": "MODEL",
                             "type": "PLANNER_RESPONSE",
-                            "content": "交接已完成。\n\n### 新对话提示词\n```markdown\n请基于 HANDOFF_NEXT.md 接续验证并提交。\n```\n<!-- GOAL_CANCELLED -->",
+                            "content": (
+                                "已验证安装钩子可运行。Git 工作区已核对。未完成真实宿主验收。\n\n"
+                                "### 新对话提示词\n```markdown\n请先读取用户原话，再核对当前工作区并完成宿主验收。\n"
+                                "```\n<!-- GOAL_CANCELLED -->"
+                            ),
                         },
                         ensure_ascii=False,
                     )
@@ -1060,7 +1105,7 @@ class TestEndToEndIntegration(unittest.TestCase):
                 f'"{sys.executable}" -B "{(loader_path.parent / "handoff_gate.py").as_posix()}" '
                 f'--client codex --mode enforce --compact-limit 1 --state-dir "{(loader_path.parent / "state" / "handoff").as_posix()}"'
             )}
-            legacy = {"hooks": {"SessionStart": [{"matcher": "^(compact|resume)$", "hooks": [valid, sibling]}, other_group],
+            legacy = {"description": "用户原有说明\n第二行", "hooks": {"SessionStart": [{"matcher": "^(compact|resume)$", "hooks": [valid, sibling]}, other_group],
                                 "Notification": other_event, "Stop": [{"hooks": [other_gate, shared_path_gate]}]}}
             hooks_path.write_text(json.dumps(legacy), encoding="utf-8")
             cmd = [sys.executable, "-B", "-X", "utf8", str(REPO_ROOT / "install.py"), "--app", "codex",
@@ -1084,10 +1129,29 @@ class TestEndToEndIntegration(unittest.TestCase):
 
             result = install("--codex-handoff-mode", "enforce", "--codex-handoff-compactions", "2")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn(b"--mode enforce --compact-limit 2", hooks_path.read_bytes())
+            enforce_bytes = hooks_path.read_bytes()
+            self.assertIn(b"--mode enforce --compact-limit 2", enforce_bytes)
+            result = install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(hooks_path.read_bytes(), enforce_bytes)
+            migrated = json.loads(enforce_bytes)
+            migrated["description"] = legacy["description"]
+            hooks_path.write_text(json.dumps(migrated), encoding="utf-8")
+            result = install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(hooks_path.read_bytes(), enforce_bytes)
             result = install("--codex-handoff-mode", "off")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(hooks_path.read_bytes()), legacy)
+            disabled_bytes = hooks_path.read_bytes()
+            self.assertEqual(json.loads(disabled_bytes), {
+                **legacy, "description": legacy["description"] + "\n[user-guard codex-handoff v1 mode=off compact_limit=2]",
+            })
+            result = install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(hooks_path.read_bytes(), disabled_bytes)
+            result = install("--codex-handoff-mode", "advisory")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b"--mode advisory --compact-limit 2", hooks_path.read_bytes())
 
             for malformed in (b"{bad json", b'{"hooks":{"SessionStart":{}}}', b'{"hooks":{},"hooks":{}}'):
                 with self.subTest(malformed=malformed):
@@ -1098,7 +1162,7 @@ class TestEndToEndIntegration(unittest.TestCase):
                     self.assertEqual(hooks_path.read_bytes(), malformed)
 
 
-    def test_20_codex_loader_upgrade_checks_old_python_runtime(self) -> None:
+    def test_20_codex_loader_upgrade_probes_only_trusted_interpreter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "codex"
             root.mkdir()
@@ -1106,16 +1170,63 @@ class TestEndToEndIntegration(unittest.TestCase):
             old = {"type": "command", "command": f'"{sys.executable}" -B "{loader}" --client codex',
                    "timeout": 33, "statusMessage": "custom status"}
             sibling = {"type": "command", "command": "custom-hook"}
+            untrusted_dir = Path(tmp) / "untrusted"
+            untrusted_dir.mkdir()
+            untrusted = untrusted_dir / Path(sys.executable).name
+            untrusted.write_bytes(b"not an interpreter")
+            custom_program = {"type": "command", "command": f'"{untrusted}" -B "{loader}" --client codex'}
+            custom_flags = {"type": "command", "command": f'"{sys.executable}" -c "raise SystemExit(0)" "{loader}" --client codex'}
             path = root / "hooks.json"
-            path.write_text(json.dumps({"hooks": {"SessionStart": [{"matcher": "^(compact|resume)$", "hooks": [old, sibling]}]}}), encoding="utf-8")
-            with mock.patch.object(INSTALLER, "_is_working_python_cmd", return_value=False) as check:
+            path.write_text(json.dumps({"hooks": {"SessionStart": [
+                {"matcher": "^(compact|resume)$", "hooks": [old, sibling, custom_program, custom_flags]},
+            ]}}), encoding="utf-8")
+            before = path.read_bytes()
+            with mock.patch.object(INSTALLER.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)) as check, \
+                    contextlib.redirect_stderr(io.StringIO()) as diagnostics:
                 plan = INSTALLER._plan_codex_hooks(path, REPO_ROOT / "template/codex/hooks.json", "python -X utf8 -I -B", "advisory", 0)
-            check.assert_called_once_with([sys.executable, "-B"])
-            handlers = plan[1]["hooks"]["SessionStart"][0]["hooks"]
+            self.assertEqual(check.call_count, 1)
+            invoked = check.call_args.args[0]
+            self.assertEqual(Path(invoked[0]), Path(sys.executable))
+            self.assertEqual(invoked[1:], ["-X", "utf8", "-I", "-B", "-c",
+                                          "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"])
+            self.assertIn("自定义脚本命令", diagnostics.getvalue())
+            self.assertEqual(path.read_bytes(), before)
+            handlers = json.loads(plan.change.content)["hooks"]["SessionStart"][0]["hooks"]
             self.assertNotEqual(handlers[0]["command"], old["command"])
             self.assertEqual(handlers[0]["timeout"], 33)
             self.assertEqual(handlers[0]["statusMessage"], "custom status")
-            self.assertEqual(handlers[1], sibling)
+            self.assertEqual(handlers[1:4], [sibling, custom_program, custom_flags])
+
+    @unittest.skipUnless(os.name == "nt", "Windows PATH 的应用执行别名")
+    def test_20_shadowed_windows_python_loader_uses_working_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alias = str(root / "WindowsApps" / "python.exe")
+            python = str(root / "python" / "python.exe")
+            launcher = str(root / "py.exe")
+            candidates = [("python.exe", python, []), ("py.exe", launcher, ["-3"])]
+            resolved = {"python.exe": alias, "py.exe": launcher}
+            script = (root / "hooks" / "session_context_loader.py").as_posix()
+            old = {"type": "command", "command": f'python.exe -I -B "{script}" --client codex',
+                   "statusMessage": "已有状态提示"}
+            hooks_path = root / "hooks.json"
+            hooks_path.write_text(json.dumps({"hooks": {"SessionStart": [
+                {"matcher": "^(compact|resume)$", "hooks": [old]},
+            ]}}), encoding="utf-8")
+            original = hooks_path.read_bytes()
+            template = REPO_ROOT / "template/codex/hooks.json"
+            with mock.patch.object(INSTALLER, "_hook_python_candidates", return_value=candidates), \
+                    mock.patch.object(INSTALLER.shutil, "which", side_effect=resolved.get), \
+                    mock.patch.object(INSTALLER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as probe:
+                cmd = INSTALLER.detect_hook_python_command()
+                plan = INSTALLER._plan_codex_hooks(hooks_path, template, cmd)
+            self.assertEqual(cmd, "py.exe -3 -X utf8 -I -B")
+            probe.assert_called_once()
+            self.assertEqual(probe.call_args.args[0][:2], [launcher, "-3"])
+            self.assertEqual(hooks_path.read_bytes(), original)
+            loader = json.loads(plan.change.content)["hooks"]["SessionStart"][0]["hooks"][0]
+            self.assertTrue(loader["command"].startswith(cmd + " "))
+            self.assertEqual(loader["statusMessage"], old["statusMessage"])
 
     @unittest.skipIf(os.name == "nt", "POSIX Shell 路径转义")
     def test_21_posix_codex_hook_special_path_round_trip(self) -> None:
@@ -1124,14 +1235,340 @@ class TestEndToEndIntegration(unittest.TestCase):
             root.mkdir()
             path = root / "hooks.json"
             template = REPO_ROOT / "template/codex/hooks.json"
-            cmd = "python3 -X utf8 -I -B"
-            first = INSTALLER._plan_codex_hooks(path, template, cmd, "advisory", 0)
-            path.write_text(json.dumps(first[1]), encoding="utf-8")
-            self.assertIsNone(INSTALLER._plan_codex_hooks(path, template, cmd, "advisory", 0))
-            disabled = INSTALLER._plan_codex_hooks(path, template, cmd, "off", 0)
-            remaining = [handler for groups in disabled[1]["hooks"].values() for group in groups for handler in group["hooks"]]
+            interpreter = root / 'python$cash`tick" space'
+            interpreter.symlink_to(sys.executable)
+            with mock.patch.object(INSTALLER.sys, "executable", str(interpreter)), \
+                    mock.patch.object(INSTALLER.shutil, "which", return_value=None):
+                cmd = INSTALLER.detect_hook_python_command()
+                first = INSTALLER._plan_codex_hooks(path, template, cmd)
+                path.write_bytes(first.change.content)
+                self.assertIsNone(INSTALLER._plan_codex_hooks(path, template, cmd).change)
+                scripts = root / "hooks"
+                scripts.mkdir()
+                for name in ("session_context_loader.py", "user_words.py"):
+                    shutil.copy2(TEMPLATE_DIR / "hooks" / name, scripts / name)
+                installed = json.loads(first.change.content)["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+                payload = {"hook_event_name": "SessionStart", "session_id": "fallback-round-trip", "source": "startup"}
+                result = subprocess.run(["/bin/sh", "-c", installed], input=json.dumps(payload), cwd=root,
+                                        capture_output=True, text=True, encoding="utf-8", timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["hookSpecificOutput"]["hookEventName"], "SessionStart")
+                self.assertTrue((root / "hooks" / "logs" / "session-context.jsonl").is_file())
+                disabled = INSTALLER._plan_codex_hooks(path, template, cmd, "off", 0)
+            hooks = json.loads(disabled.change.content)["hooks"]
+            remaining = [handler for groups in hooks.values() for group in groups for handler in group["hooks"]]
             self.assertEqual(len(remaining), 1)
             self.assertIn("session_context_loader.py", remaining[0]["command"])
+
+    def test_22_codex_toml_preflight_preserves_quoted_keys_comments_and_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex = root / "codex"
+            codex.mkdir()
+            config = codex / "config.toml"
+            config.write_bytes(
+                b'"sandbox_mode" = "danger-full-access" # keep sandbox comment\r\n'
+                b'"approval_policy" = "never" # keep approval\r\n'
+                b'"model" = "account-choice" # keep model\r\n'
+                b"'model_reasoning_effort' = 'high' # keep effort\r\n"
+                b'"model_reasoning_summary" = "detailed"\r\n'
+                b'["sandbox_workspace_write"] # sandbox header\r\n'
+                b'"network_access" = false # keep network\r\n'
+                b'["features"] # features header\r\n'
+                b'"memories" = true # keep opt in\r\n'
+                b'[memories] # memory header\r\n'
+                b'"generate_memories" = true\r\n'
+                b'["desktop"."external-agent-import-sync-item-types"] # imports\r\n'
+                b"'HOOKS' = true # keep import\r\n"
+                b'[hooks.state."handler#1"] # preserve trust\r\n'
+                b'"trusted_hash" = "sha256:example"\r\n'
+                b'["mcp_servers"."zotero"] # remote transport\r\n'
+                b'"url" = "https://example.org/mcp" # keep remote URL\r\n'
+                b'"bearer_token_env_var" = "ZOTERO_TOKEN"\r\n'
+            )
+            before = config.read_bytes()
+            zotero = root / "zotero-mcp-stub"
+            zotero.write_bytes(b"stub")
+            cmd = [sys.executable, "-B", str(REPO_ROOT / "install.py"), "--app", "codex", "--codex-home", str(codex),
+                   "--skip-test", "--zotero-cmd", str(zotero)]
+            dry = subprocess.run(cmd + ["--dry-run"], capture_output=True, text=True, encoding="utf-8", timeout=20)
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            self.assertEqual(config.read_bytes(), before)
+            self.assertFalse((codex / "hooks.json").exists())
+            run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=20)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            updated = config.read_bytes()
+            self.assertIn(b'"sandbox_mode" = "workspace-write" # keep sandbox comment\r\n', updated)
+            for line in before.splitlines(keepends=True)[1:]:
+                self.assertIn(line, updated)
+            parsed = INSTALLER._parse_toml(updated.decode("utf-8"), config)
+            self.assertEqual(parsed["features"], {"memories": True, "chronicle": False})
+            self.assertEqual(parsed["approval_policy"], "never")
+            self.assertEqual(parsed["sandbox_workspace_write"], {"network_access": False})
+            self.assertEqual(parsed["hooks"]["state"]["handler#1"]["trusted_hash"], "sha256:example")
+            self.assertEqual(parsed["mcp_servers"]["zotero"], {
+                "url": "https://example.org/mcp", "bearer_token_env_var": "ZOTERO_TOKEN",
+            })
+            mtime = config.stat().st_mtime_ns
+            run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=20)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual((config.read_bytes(), config.stat().st_mtime_ns), (updated, mtime))
+
+            # 在没有 tomllib 的解释器分支重做同一编辑，保守拒绝不支持的复杂值。
+            config.write_bytes(before)
+            with mock.patch.object(INSTALLER, "tomllib", None), contextlib.redirect_stdout(io.StringIO()):
+                planned = INSTALLER._plan_codex_config(codex, include_sandbox=True, include_model=True,
+                                                       overwrite_model=False, zotero_exe=str(zotero))
+                self.assertEqual(planned.content, updated)
+                complex_config = b'description = """\n[features]\nmultiline\n"""\n'
+                config.write_bytes(complex_config)
+                with self.assertRaisesRegex(ValueError, r"Python 3\.11\+"):
+                    INSTALLER._plan_codex_config(codex, include_sandbox=True, include_model=False,
+                                                overwrite_model=False, zotero_exe=None)
+                self.assertEqual(config.read_bytes(), complex_config)
+
+    def test_23_config_errors_abort_both_targets_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin = root / "agy-config" / "plugins" / "user-guard"
+            mcp = plugin.parent.parent / "mcp_config.json"
+            codex = root / "codex"
+            plugin.mkdir(parents=True)
+            codex.mkdir()
+            config = codex / "config.toml"
+            hooks_path = codex / "hooks.json"
+            (plugin / "old.txt").write_bytes(b"must not be cleaned")
+            zotero = root / "zotero-mcp-stub"
+            zotero.write_bytes(b"stub")
+            cmd = [sys.executable, "-B", str(REPO_ROOT / "install.py"), "--app", "both", "--target-dir", str(plugin),
+                   "--codex-home", str(codex), "--skip-test", "--zotero-cmd", str(zotero)]
+
+            def snapshot() -> dict:
+                return {entry.relative_to(root): (entry.read_bytes(), entry.stat().st_mtime_ns) if entry.is_file() else None
+                        for entry in root.rglob("*")}
+
+            cases = [(config, data) for data in (b"invalid TOML", b'a = 1\na = 2\n', b"[features\n")]
+            cases += [(mcp, data) for data in (
+                b"", b"{bad json", b"[]", b'{"mcpServers": []}', b'{"mcpServers": {"zotero": false}}',
+                b'{"mcpServers": {"zotero": {}, "zotero": {}}}', b'{"mcpServers": {"other": NaN}}',
+            )]
+            cases += [(hooks_path, data) for data in (
+                br'{"description":"\ud800","hooks":{}}',
+                b'{"hooks":{"Notification":[{"hooks":[{"type":"command","command":"custom","custom":1e999}]}]}}',
+            )]
+            for path, content in cases:
+                with self.subTest(path=path.name, content=content):
+                    mcp.write_bytes(b'{"mcpServers": {}}\n')
+                    config.write_bytes(b'model = "example"\n')
+                    hooks_path.write_bytes(b'{"hooks":{}}\n')
+                    path.write_bytes(content)
+                    before = snapshot()
+                    for options in (["--dry-run"], []):
+                        result = subprocess.run(cmd + options, capture_output=True, text=True, encoding="utf-8", timeout=20)
+                        self.assertNotEqual(result.returncode, 0, result.stdout)
+                        self.assertIn(path.name, result.stderr)
+                        self.assertEqual(snapshot(), before)
+
+    def test_24_early_link_rejection_leaves_all_install_targets_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin = root / "agy-config" / "plugins" / "user-guard"
+            plugin.mkdir(parents=True)
+            (plugin / "old.txt").write_bytes(b"retain")
+            external = root / "external"
+            external.mkdir()
+            marker = external / "keep.txt"
+            marker.write_bytes(b"external sentinel")
+            zotero = root / "zotero-mcp-stub"
+            zotero.write_bytes(b"stub")
+            probe = root / "link-probe"
+            try:
+                _create_directory_link(probe, external)
+            except OSError:
+                self.skipTest("当前系统没有创建目录链接或联接的权限")
+            cmd = [sys.executable, "-B", str(REPO_ROOT / "install.py"), "--app", "both", "--target-dir", str(plugin),
+                   "--skip-test", "--zotero-cmd", str(zotero)]
+
+            def reject(codex: Path, link: Path) -> None:
+                result = subprocess.run(cmd + ["--codex-home", str(codex)], capture_output=True, text=True,
+                                        encoding="utf-8", timeout=20)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(link.name, result.stderr)
+                self.assertEqual(list(external.iterdir()), [marker])
+                self.assertEqual(marker.read_bytes(), b"external sentinel")
+                self.assertEqual(list(plugin.iterdir()), [plugin / "old.txt"])
+                self.assertEqual((plugin / "old.txt").read_bytes(), b"retain")
+                self.assertFalse((codex / "hooks.json").exists())
+                self.assertFalse((codex / "config.toml").exists())
+                self.assertFalse((codex / "AGENTS.md").exists())
+
+            for name in ("agents", "hooks", "skills"):
+                with self.subTest(name=name):
+                    codex = root / ("codex-" + name)
+                    codex.mkdir()
+                    link = codex / name
+                    _create_directory_link(link, external)
+                    reject(codex, link)
+                    self.assertEqual(list(codex.iterdir()), [link])
+            reject(probe / "codex", probe)
+            mcp = plugin.parent.parent / "mcp_config.json"
+            _create_directory_link(mcp, external)
+            unused_codex = root / "unused-codex"
+            reject(unused_codex, mcp)
+            self.assertFalse(unused_codex.exists())
+
+            for name in ("AGENTS.md", "config.toml", "hooks.json", "agents/readonly-reader.toml", "hooks/user_words.py"):
+                with self.subTest(file=name):
+                    codex = root / ("files-" + name.replace("/", "-"))
+                    target = codex / name
+                    target.parent.mkdir(parents=True)
+                    # 硬链接在 Windows 无需符号链接特权，验证直接文件别名同样拒绝。
+                    try:
+                        os.link(marker, target)
+                    except OSError:
+                        self.skipTest("当前文件系统不支持硬链接")
+                    result = subprocess.run(cmd + ["--codex-home", str(codex), "--no-zotero"], capture_output=True,
+                                            text=True, encoding="utf-8", timeout=20)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn(target.name, result.stderr)
+                    self.assertEqual(target.read_bytes(), b"external sentinel")
+                    self.assertEqual(marker.read_bytes(), b"external sentinel")
+                    self.assertEqual(list(plugin.iterdir()), [plugin / "old.txt"])
+
+    def test_25_agy_zotero_preserves_existing_remote_and_stdio_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin = root / "agy-config" / "plugins" / "user-guard"
+            config = plugin.parent.parent / "mcp_config.json"
+            config.parent.mkdir()
+            zotero = root / "zotero-mcp-stub"
+            zotero.write_bytes(b"stub")
+            cmd = [sys.executable, "-B", str(REPO_ROOT / "install.py"), "--app", "antigravity",
+                   "--target-dir", str(plugin), "--skip-test", "--zotero-cmd", str(zotero)]
+            for data in (
+                b'{"mcpServers":{"zotero":{"serverUrl":"https://example.org/mcp","headers":{"X-Example":"yes"}}}}\n',
+                b'{"mcpServers":{"zotero":{"command":"host-managed-zotero","args":["serve"],"env":{"CUSTOM":"true"}}}}\n',
+            ):
+                with self.subTest(data=data):
+                    config.write_bytes(data)
+                    mtime = config.stat().st_mtime_ns
+                    run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=20)
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    self.assertEqual((config.read_bytes(), config.stat().st_mtime_ns), (data, mtime))
+            config.write_bytes(b'{"mcpServers":{"other":{"serverUrl":"https://example.org/mcp"}},"custom":true}\n')
+            run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=20)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            merged = json.loads(config.read_bytes())
+            self.assertTrue(merged["custom"])
+            self.assertEqual(merged["mcpServers"]["other"], {"serverUrl": "https://example.org/mcp"})
+            self.assertEqual(merged["mcpServers"]["zotero"]["command"], str(zotero))
+
+    def test_26_executable_evidence_does_not_treat_config_as_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".codex").mkdir()
+            (home / ".gemini" / "config").mkdir(parents=True)
+            wsl = {"status": "unknown", "installed_distros": ["stopped"], "running_distros": [], "apps": {}}
+            with mock.patch.object(INSTALLER.Path, "home", return_value=home), \
+                    mock.patch.object(INSTALLER, "_native_cli", return_value=None), \
+                    mock.patch.object(INSTALLER, "_first_executable", return_value=None), \
+                    mock.patch.object(INSTALLER, "_find_windows_codex_package", return_value=(None, None)), \
+                    mock.patch.object(INSTALLER, "_is_wsl", return_value=False), \
+                    mock.patch.object(INSTALLER, "_probe_windows_wsl", return_value=wsl), \
+                    mock.patch.object(INSTALLER, "detect_zotero_mcp_executable", return_value=None), \
+                    mock.patch.dict(os.environ, {"CODEX_HOME": ""}):
+                result = INSTALLER.detect_installed_apps()
+                self.assertEqual(result["recommended_app_mode"], "none")
+                for name in ("antigravity", "codex"):
+                    self.assertFalse(result[name]["native_installed"])
+                    self.assertEqual(result[name]["native_status"], "config_only")
+                    self.assertEqual(result[name]["authentication_status"], "not_checked")
+                    self.assertFalse(result[name]["interop_available"])
+
+            with mock.patch.object(INSTALLER.shutil, "which", return_value="wsl.exe"), \
+                    mock.patch.object(INSTALLER, "_wsl_distro_list", side_effect=[["running", "stopped"], ["running"]]), \
+                    mock.patch.object(INSTALLER.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        [], 0, stdout="agy\t/opt/bin/agy\ttrue\ncodex\t\ttrue\n",
+                    )) as probe:
+                result = INSTALLER._probe_windows_wsl()
+                self.assertEqual(result["status"], "unknown")
+                self.assertEqual(result["installed_distros"], ["running", "stopped"])
+                self.assertEqual(result["apps"]["agy"][0]["binary"], "/opt/bin/agy")
+                self.assertIsNone(result["apps"]["codex"][0]["binary"])
+                probe.assert_called_once()
+                self.assertEqual(probe.call_args.args[0][:4], ["wsl.exe", "--distribution", "running", "--exec"])
+
+    def test_26_wsl_windows_profile_requires_successful_absolute_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = r"C:\Users\example"
+            result = subprocess.CompletedProcess
+            cases = (
+                ([result([], 1, stdout=profile)], None),
+                ([result([], 0, stdout="")], None),
+                ([result([], 0, stdout=r"Users\example")], None),
+                ([result([], 0, stdout=profile), result([], 1, stdout=str(root))], None),
+                ([result([], 0, stdout=profile), result([], 0, stdout="\n")], None),
+                ([result([], 0, stdout=profile), result([], 0, stdout=".")], None),
+                ([result([], 0, stdout=profile), result([], 0, stdout=str(root / "missing"))], None),
+                ([result([], 0, stdout=profile), result([], 0, stdout=str(root))], root),
+            )
+            executables = {"cmd.exe": str(root / "cmd.exe"), "wslpath": str(root / "wslpath")}
+            for commands, expected in cases:
+                with self.subTest(commands=commands), \
+                        mock.patch.object(INSTALLER, "_is_wsl", return_value=True), \
+                        mock.patch.object(INSTALLER.shutil, "which", side_effect=executables.get), \
+                        mock.patch.object(INSTALLER.subprocess, "run", side_effect=commands) as run:
+                    self.assertEqual(INSTALLER._probe_wsl_windows_profile_dir(), expected)
+                    self.assertEqual(run.call_count, len(commands))
+
+    def test_28_installer_regression_does_not_inherit_runtime_state_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin = root / "agy" / "plugins" / "user-guard"
+            codex = root / "codex"
+            state, logs = root / "external-state", root / "external-logs"
+            state.mkdir()
+            logs.mkdir()
+            for path in (state, logs):
+                (path / "keep").write_bytes(b"runtime sentinel")
+            argv = ["install.py", "--app", "both", "--target-dir", str(plugin), "--codex-home", str(codex), "--no-zotero"]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.dict(os.environ, {"USER_GUARD_STATE_DIR": str(state), "USER_GUARD_LOGS_DIR": str(logs)}), \
+                    mock.patch.object(INSTALLER, "detect_hook_python_command", return_value="python -X utf8 -I -B"), \
+                    mock.patch.object(INSTALLER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                INSTALLER.main()
+                self.assertEqual(os.environ["USER_GUARD_STATE_DIR"], str(state))
+                self.assertEqual(os.environ["USER_GUARD_LOGS_DIR"], str(logs))
+            run.assert_called_once()
+            self.assertIn("unittest", run.call_args.args[0])
+            env = run.call_args.kwargs["env"]
+            self.assertNotIn("USER_GUARD_STATE_DIR", env)
+            self.assertNotIn("USER_GUARD_LOGS_DIR", env)
+            self.assertEqual(Path(env["USER_GUARD_INSTALLED_DIR"]), plugin.resolve())
+            self.assertEqual(Path(env["USER_GUARD_INSTALLED_CODEX_DIR"]), codex.resolve())
+            for path in (state, logs):
+                self.assertEqual(list(path.iterdir()), [path / "keep"])
+                self.assertEqual((path / "keep").read_bytes(), b"runtime sentinel")
+
+    @unittest.skipIf(os.name == "nt" or not shutil.which("bash"), "需要 POSIX Bash")
+    def test_27_shell_probe_stdout_is_json_and_old_python_does_not_block_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = root / "python3"
+            old.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            old.chmod(0o755)
+            (root / "python").symlink_to(sys.executable)
+            env = os.environ.copy()
+            env["PATH"] = str(root) + os.pathsep + env.get("PATH", "")
+            result = subprocess.run(
+                ["bash", str(REPO_ROOT / "install.sh"), "--probe-apps"], env=env,
+                capture_output=True, text=True, encoding="utf-8", timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("recommended_app_mode", json.loads(result.stdout))
+            self.assertIn("启动", result.stderr)
 
 
 if __name__ == "__main__":

@@ -2,12 +2,14 @@
 """Codex / Antigravity 双向任务、分片审计与可执行验收。"""
 import argparse
 import base64
+import collections
 import concurrent.futures
 import datetime
 import fnmatch
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import signal
@@ -17,8 +19,13 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+
+try:
+    import tomllib
+except ImportError:  # Python 3.9 / 3.10
+    tomllib = None
 
 for _name in ('stdin', 'stdout', 'stderr'):
     _stream = getattr(sys, _name, None)
@@ -41,15 +48,16 @@ QUOTA_ERROR_RE = re.compile(
 EFFORT_LADDER = ('minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
 TIER_CHOICES = ('auto', 'ultra', 'max', 'xhigh', 'high', 'medium', 'low')
 CATALOG_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
-NEGATION_PREFIXES = ('不', '别', '勿', '莫', '非', '禁', '无须', '无需', 'not ', 'no ')
 HIGH_COMPLEXITY_CUES = (
-    '守恒', '通量', '黎曼', 'riemann', '雅可比', 'jacobian', '熵', 'entropy',
-    'fvm', 'fem', 'fdm', 'dg', 'dgsem', 'weno', '高阶格式', '通量重构',
-    '有限体积', '有限元', '谱元', '间断伽辽金', '重构', '收敛阶', '稳定性', 'cfl', '边界条件',
-    '特征分解', '证明', '定理', '引理', '推导', '变分', '根因', '死锁', '竞态', '并发',
-    '跨模块', '架构', '数值耗散', '激波',
+    '守恒', 'conservation', '通量重构', '黎曼', 'riemann', '雅可比', 'jacobian',
+    '熵稳定', 'entropy stability', 'dgsem', 'weno', '高阶格式', '间断伽辽金',
+    '收敛阶', 'order of convergence', '数值稳定性', '边界条件', '特征分解',
+    '证明', 'prove', '定理', '引理', '推导', 'derive', '变分',
+    '根因', 'root cause', '死锁', 'deadlock', '竞态', 'race condition', '并发', 'concurrency',
+    '数值耗散', '激波',
 )
 TRIVIAL_SURFACE_CUES = ('错别字', 'typo', '拼写', '缩进', '空行', '注释微调', '文案微调', '格式微调')
+QUOTA_LOCK = threading.RLock()
 AUDIT_JSON_SCHEMA = {
     'type': 'object', 'properties': {
         'summary': {'type': 'string'},
@@ -74,7 +82,7 @@ TASK_JSON_SCHEMA = {
 }
 _CANCELLED = threading.Event()
 _EVENT_LOCK = threading.Lock()
-_SESSION_QUOTA_BLOCKED: Dict[str, Dict[str, Any]] = {}
+_SESSION_QUOTA_BLOCKED = {}
 
 
 class HarnessError(RuntimeError):
@@ -101,29 +109,84 @@ def _read_json(path):
         return {}
 
 
-def _top_level_toml(path):
+_CODEX_TOML_KEYS = {'model', 'model_reasoning_effort', 'model_context_window', 'model_auto_compact_token_limit'}
+_TOML_LINE_TOKEN = re.compile(r'''"""(?:\\[\s\S]|(?!"{3})[\s\S])*"""|'{3}[\s\S]*?'{3}|"(?:\\.|[^"\\\n])*"|'[^'\n]*'|#[^\n]*|[\[\]{}\n]''')
+_TOML_INTEGER = re.compile(r'(?:[+-]?(?:0|[1-9](?:_?[0-9])*)|0x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0o[0-7](?:_?[0-7])*|0b[01](?:_?[01])*)')
+
+
+def _toml_simple_string(raw):
+    if re.fullmatch(r"'[^'\r\n]*'", raw):
+        return raw[1:-1]
+    if not re.fullmatch(r'"(?:[^"\\\x00-\x1f]|\\(?:["\\btnfr]|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}))*"', raw):
+        return None
     try:
-        text = path.read_text(encoding='utf-8-sig')
-    except OSError:
-        return {}
-    result = {}
-    for line in text.splitlines():
-        if line.lstrip().startswith('['):
-            break
-        match = re.match(r'\s*(model|model_reasoning_effort|model_context_window|model_auto_compact_token_limit)\s*=\s*(.*)', line)
-        if match:
-            raw = match.group(2).strip()
-            if raw.startswith(('"', "'")):
-                result[match.group(1)] = raw[1:raw.find(raw[0], 1)]
-            else:
-                number = re.match(r'\d+', raw)
-                if number:
-                    result[match.group(1)] = int(number.group())
+        def unescape(match):
+            value = match.group()
+            return chr(int(value[2:], 16)) if value[1] == 'U' else json.loads('"' + value + '"')
+
+        return re.sub(r'\\(?:U[0-9a-fA-F]{8}|u[0-9a-fA-F]{4}|.)', unescape, raw[1:-1])
+    except (ValueError, OverflowError):
+        return None
+
+
+def _toml_scalar_subset(text):
+    """3.9/3.10 fallback: read only the supported top-level scalar keys."""
+    result, seen = {}, set()
+    parts, pos, depth = [], 0, 0
+    for token in _TOML_LINE_TOKEN.finditer(text + '\n'):
+        raw = token.group()
+        parts.append(text[pos:token.start()])
+        pos = token.end()
+        if raw.startswith('#'):
+            continue
+        if raw.startswith(('"""', "'''")):
+            parts.append('<multiline_string>')
+            continue
+        if raw == '[' and not depth and not ''.join(parts).strip():
+            break  # First table; following bare keys are not top level.
+        if raw in ('[', '{'):
+            depth += 1
+        elif raw in (']', '}'):
+            depth -= 1
+        if depth < 0:
+            return {}
+        if raw != '\n' or depth:
+            parts.append(raw)
+            continue
+        line = ''.join(parts)
+        parts.clear()
+        match = re.fullmatch(r'''\s*([A-Za-z0-9_-]+|"(?:\\.|[^"\\])*"|'[^']*')\s*=\s*(.*?)\s*''', line)
+        if not match:
+            continue
+        key, value = match.groups()
+        key = _toml_simple_string(key) if key.startswith(('"', "'")) else key
+        if key not in _CODEX_TOML_KEYS:
+            continue
+        if key in seen:
+            return {}
+        seen.add(key)
+        if _TOML_INTEGER.fullmatch(value):
+            result[key] = int(value, 0) if value.startswith(('0x', '0o', '0b')) else int(value)
+        else:
+            parsed = _toml_simple_string(value)
+            if parsed is not None:
+                result[key] = parsed
     return result
 
 
+def _top_level_toml(path):
+    try:
+        text = path.read_text(encoding='utf-8-sig')
+        if tomllib is None:
+            return _toml_scalar_subset(text)
+        config = tomllib.loads(text)
+        return {key: config[key] for key in _CODEX_TOML_KEYS if key in config}
+    except (OSError, ValueError):
+        return {}
+
+
 def _positive_int(value):
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
         return None
     try:
         number = int(value)
@@ -248,10 +311,11 @@ def _model_records(cache):
     if not isinstance(items, list):
         return []
     fields = ('slug', 'display_name', 'description', 'priority', 'visibility', 'default_reasoning_level',
-              'context_window', 'max_context_window', 'effective_context_window_percent')
+              'context_window', 'max_context_window', 'effective_context_window_percent',
+              'provider', 'model_provider', 'category', 'routing_type', 'model_specialty', 'modelSpecialty', 'supported_in_api')
     records = []
     for item in items:
-        if not isinstance(item, dict) or not item.get('slug'):
+        if not isinstance(item, dict) or not isinstance(item.get('slug'), str) or not item['slug'].strip():
             continue
         rec = {key: item[key] for key in fields if key in item}
         levels = item.get('supported_reasoning_levels')
@@ -271,7 +335,7 @@ def _model_records(cache):
         elif isinstance(item.get('supported_efforts'), list):
             efforts = [e for e in item['supported_efforts'] if e in EFFORT_LADDER]
             rec['supported_efforts'] = efforts
-            delegating = [e for e in efforts if e == 'ultra']
+            delegating = [e for e in efforts if e == 'ultra' or e in (item.get('delegating_efforts') or [])]
             if delegating:
                 rec['delegating_efforts'] = delegating
         records.append(rec)
@@ -296,92 +360,94 @@ def _agy_slug_tier(slug):
     return (match.group(1), match.group(2)) if match else ('', '')
 
 
-def _agy_display_tier(label):
-    match = re.match(r'^(.+?)\s*\((Minimal|Low|Medium|High|XHigh|Max|Ultra)\)\s*$', str(label or '').strip(), re.IGNORECASE)
-    if not match:
-        return '', ''
-    family = re.sub(r'[^a-z0-9.]+', '-', match.group(1).lower()).strip('-')
-    return family, match.group(2).lower()
+def _catalog_order(item):
+    priority = item.get('priority')
+    if type(priority) is not int or priority < 0:
+        priority = 9999
+    description = str(item.get('description') or '').strip().lower()
+    return (bool(re.match(r'(?:older|previous|legacy)\b', description)), priority,
+            str(item.get('slug') or '').lower())
 
 
-def _select_codex_frontier_record(models, configured_model=None):
-    visible = [item for item in models if item.get('visibility') != 'hide'] or list(models)
-    if any('priority' in item for item in visible):
-        return min(visible, key=lambda item: (_positive_int(item.get('priority')) or 9999, 0))
-    if configured_model:
-        matched = next((item for item in visible if item.get('slug') == configured_model), None)
-        if matched:
-            return matched
-    return visible[0] if visible else {}
+def _is_agy_orchestrator(record):
+    # Published Antigravity fixed composite: planning/review and execution
+    # alternate within the same agent. It does not accept a reasoning tier.
+    return 'orchestrator' in _tokens_lower(f"{record.get('slug', '')} {record.get('display_name', '')}")
 
 
-def _select_codex_specialty_record(models, configured_model=None, kind='review', tier='high', prompt_text='', estimated_tokens=0):
-    visible = [
-        item for item in models
-        if item.get('visibility') != 'hide' and 'auto-review' not in str(item.get('slug') or '').lower()
-    ] or list(models)
-    if not visible:
-        return {}, 'cli_default'
-    if tier != 'ultra':
-        eligible = [item for item in visible if not _only_delegating_efforts(item, tier)]
-        visible = eligible or visible
-    workhorse = _select_codex_frontier_record(visible, configured_model)
-    current_gen = [
-        item for item in visible
-        if not str(item.get('description') or '').strip().lower().startswith('older ')
-    ] or visible
-    ordered_current = sorted(current_gen, key=lambda item: (_positive_int(item.get('priority')) or 9999, 0))
+def _model_category(prefix, record):
+    slug = str(record.get('slug') or '').lower()
+    label = str(record.get('display_name') or '')
+    category = str(record.get('category') or record.get('routing_type') or '').lower()
+    provider = str(record.get('provider') or record.get('model_provider') or '').lower()
+    if prefix == 'agy' and _is_agy_orchestrator(record):
+        return 'fixed_composite'
+    tags = _tokens_lower(f'{slug} {label}')
+    if tags & ROUTER_MODEL_TAGS or category in ('router', 'composite', 'hybrid', 'auto', 'fixed_composite'):
+        return 'router_or_composite'
+    if 'auto-review' in slug or record.get('visibility') == 'hide':
+        return 'hidden_or_internal'
+    if category in ('hosted', 'third_party', 'hosted_or_third_party', 'third-party'):
+        return 'hosted_or_third_party'
+    if prefix == 'agy' and slug.startswith('gemini-') and provider in ('', 'google', 'gemini'):
+        return 'native'
+    if prefix == 'codex' and provider in ('', 'openai') and (
+            provider == 'openai' or re.match(r'^(?:gpt-[0-9]+(?:\.[0-9]+)?(?:-|$)|o[1-9]\d*(?:-|$))', slug)):
+        return 'native'
+    if provider or re.match(r'^(?:claude-|gpt-oss-|deepseek-|qwen-|mistral-|llama-)', slug):
+        return 'hosted_or_third_party'
+    return 'unknown'
 
-    if tier == 'low' and not _has_negated_cue(prompt_text or '', ('轻量', '极速', 'lite', 'mini', 'fast', 'flash')):
-        fast_rec = next(
-            (
-                item for item in ordered_current
-                if re.search(
-                    r'\b(?:fast and affordable|easier tasks|lightweight|mini|lite|flash)\b',
-                    f"{item.get('slug', '')} {item.get('description', '')}",
-                    re.IGNORECASE,
-                )
-            ),
-            None,
-        )
-        if fast_rec:
-            return fast_rec, 'specialty_fast_lightweight'
 
-    wants_deep = kind in ('math', 'direction') or (
-        kind == 'review'
-        and tier in ('max', 'xhigh', 'ultra')
-        and _has_positive_cue(prompt_text or '', ('证明', '定理', '引理', '推导', '守恒', '熵', '收敛阶', '稳定性'))
-    )
-    if wants_deep:
-        deep_rec = next(
-            (
-                item for item in ordered_current[:4]
-                if re.search(
-                    r'\b(?:most demanding|frontier intelligence|deepest reasoning|hardest problems)\b',
-                    str(item.get('description') or ''),
-                    re.IGNORECASE,
-                )
-            ),
-            None,
-        )
-        if deep_rec:
-            deep_ctx = _positive_int(deep_rec.get('context_window'))
-            if not deep_ctx or estimated_tokens <= int(deep_ctx * 0.75):
-                return deep_rec, 'specialty_deep_reasoning'
+def _select_codex_frontier_record(models):
+    native = [record for record in models if _model_category('codex', record) == 'native']
+    return min(native, key=_catalog_order) if native else {}
 
-    return workhorse, ('frontier_catalog' if workhorse.get('slug') else 'cli_default')
+
+def _model_specialty(record):
+    specialty = str(record.get('model_specialty') or record.get('modelSpecialty') or '').lower()
+    description = str(record.get('description') or '').lower()
+    if specialty in ('fast', 'lightweight', 'speed') or _tokens_lower(record.get('slug')) & FAST_MODEL_TAGS or re.search(
+            r'\b(?:fast and affordable|easier tasks|lightweight)\b', description):
+        return 'fast'
+    if specialty in ('deep', 'reasoning', 'deep_reasoning') or re.search(
+            r'\b(?:most demanding|frontier intelligence|deepest reasoning|hardest problems)\b', description):
+        return 'deep'
+    return 'engineering'
+
+
+def _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_tokens):
+    models = [item for item in info.get('models', []) if _model_category('codex', item) == 'native']
+    eligible = sorted((item for item in models if not _only_delegating_efforts(item, tier)), key=_catalog_order)
+    if not eligible:
+        return {}, 'no_non_delegating_effort' if models else 'no_native_catalog_candidate'
+
+    def budget(record):
+        return _execution_budget('codex', info, record)['input_budget_tokens']
+
+    if tier == 'low' and not _has_negated_cue(prompt_text, ('轻量', '极速', 'lite', 'mini', 'fast', 'flash')):
+        fast = [item for item in eligible if _model_specialty(item) == 'fast' and estimated_tokens <= budget(item)]
+        if fast:
+            return fast[0], 'specialty_fast_lightweight'
+    if (kind in ('math', 'direction') or (kind == 'review' and tier in ('max', 'xhigh', 'ultra')
+                                         and _has_positive_cue(prompt_text, HIGH_COMPLEXITY_CUES))):
+        deep = [item for item in eligible if _model_specialty(item) == 'deep' and estimated_tokens <= budget(item)]
+        if deep:
+            return deep[0], 'specialty_deep_reasoning'
+    workhorse = [item for item in eligible if _model_specialty(item) == 'engineering'] or eligible
+    fitting = [item for item in workhorse if estimated_tokens <= budget(item)]
+    if not fitting and kind in ('audit', 'code', 'gate'):
+        return max(workhorse, key=budget), 'largest_engineering_budget'
+    return (fitting or workhorse)[0], 'frontier_catalog'
 
 
 def _match_effort_level(supported, target_tier, delegating_efforts=None):
     valid = [item for item in supported if item in EFFORT_LADDER]
-    if not valid:
-        return None
     if target_tier != 'ultra':
         blocked = set(delegating_efforts or ()) | {'ultra'}
-        non_delegating = [item for item in valid if item not in blocked]
-        if not non_delegating:
-            return None
-        valid = non_delegating
+        valid = [item for item in valid if item not in blocked]
+    if not valid:
+        return None
     if target_tier in ('max', 'ultra'):
         return max(valid, key=EFFORT_LADDER.index)
     target_rank = EFFORT_LADDER.index(target_tier)
@@ -394,96 +460,74 @@ def _only_delegating_efforts(record, tier):
     return bool(efforts and tier != 'ultra' and not _match_effort_level(efforts, tier, record.get('delegating_efforts')))
 
 
-def _codex_profile(record, slug, tier, source, fallback_effort=None, fallback_source='unknown'):
-    effort = _match_effort_level(record.get('supported_efforts', []), tier, record.get('delegating_efforts'))
-    if effort:
-        effort_source = 'catalog_declared'
-    elif _only_delegating_efforts(record, tier):
-        effort_source = 'no_non_delegating_effort'
-    else:
-        effort = fallback_effort
-        effort_source = fallback_source if effort else 'unknown'
-    return {'spec': f'codex:{slug}' if slug else 'codex:default', 'model': slug or None,
-            'reasoning_effort': effort, 'cli_effort': effort, 'tier': tier,
-            'profile_source': source, 'effort_source': effort_source}
-
-
 def _require_execution_profile(profile):
-    if profile['effort_source'] == 'no_non_delegating_effort':
-        raise HarnessError('当前选路未找到可用的非委派挡位，请指定其他模型或显式选择委派挡位',
-                           execution_profile=profile)
+    error = profile.get('execution_blocked_reason')
+    if error:
+        raise HarnessError(error, execution_profile=profile)
+
+
+_CUE_BOUNDARIES = re.compile(r'[，。；、,;.!?！？\n]+|\b(?:but|however|instead)\b|但是|而是|而只', re.I)
+_NEGATION = re.compile(
+    r"(?:不(?:要|用|必|需|须|考虑|讨论|涉及|检查|核查|分析|推导|证明|处理|复核|验证)|"
+    r"无需|无须|禁止|排除|避免|跳过|别|勿|莫)[^，。；、,;.!?！？\n]{0,12}$|"
+    r"\b(?:no|not|without|exclude|skip|avoid|don't)\b(?:\s+[\w-]+){0,5}\s*$", re.I)
+
+
+def _semantic_text(text):
+    return re.sub(r'(?m)^\s*>[^\n]*|\x60{3}[\s\S]*?\x60{3}|\x60[^\x60\n]*\x60|'
+                  r'“[^”]*”|‘[^’]*’|"[^"\n]*"|(?<!\w)\x27[^\x27\n]*\x27(?!\w)',
+                  ' ', str(text or ''))
+
+
+def _cue_pattern(cue):
+    if cue.isascii():
+        return r'(?<![A-Za-z0-9_])' + re.escape(cue) + r'(?![A-Za-z0-9_])'
+    return re.escape(cue)
+
+
+def _has_cue(text, cues, *, negated=False):
+    pattern = re.compile('|'.join(_cue_pattern(cue) for cue in cues), re.I)
+    for clause in _CUE_BOUNDARIES.split(_semantic_text(text)):
+        for match in pattern.finditer(clause):
+            if bool(_NEGATION.search(clause[:match.start()])) == negated:
+                return True
+    return False
 
 
 def _has_negated_cue(text, cues):
-    lowered = (text or '').lower()
-    for cue in cues:
-        target = cue.lower()
-        is_ascii = target.isascii() and target.isalpha()
-        start = 0
-        while True:
-            idx = lowered.find(target, start)
-            if idx < 0:
-                break
-            end = idx + len(target)
-            boundary_ok = (not is_ascii) or (
-                (idx == 0 or not lowered[idx - 1].isalpha())
-                and (end == len(lowered) or not lowered[end].isalpha())
-            )
-            prefix = lowered[max(0, idx - 4):idx]
-            if boundary_ok and any(neg in prefix for neg in NEGATION_PREFIXES):
-                return True
-            start = end
-    return False
+    return _has_cue(text, cues, negated=True)
 
 
 def _has_positive_cue(text, cues):
-    lowered = text.lower()
-    for cue in cues:
-        target = cue.lower()
-        start = 0
-        while True:
-            idx = lowered.find(target, start)
-            if idx < 0:
-                break
-            prefix = lowered[max(0, idx - 4):idx]
-            if not any(neg in prefix for neg in NEGATION_PREFIXES):
-                return True
-            start = idx + len(target)
-    return False
+    return _has_cue(text, cues)
 
 
 def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1, estimated_tokens=0):
-    """按任务性质与输入复杂度智能分级思考挡位：攻坚拉满单模型纯思考最高挡(max)，常规任务用 high，短润色用 medium，表面检查用 low。"""
+    """输入大小决定容量，任务性质决定默认推理挡位。"""
     if requested_tier and requested_tier != 'auto':
         return requested_tier, 'explicit_tier_flag'
     sample = (text or '').strip()
-    lowered = sample.lower()
-    if any(re.search(r'(?<![a-z])ultra(?![a-z])', clause) and not re.search(
-            r'(?:不(?:要|用)?|别|勿|无需|禁止|\bnot\b|\bno\b)[\s\w]{0,8}ultra', clause)
-           for clause in re.split(r'[，。；、,;.!?！？\n]', lowered)):
-        return 'ultra', 'user_description_ultra'
-    if _has_positive_cue(sample, ('最大档', '最大挡', '最高档', '最高挡', '最先进', '顶配', '满血', '深度推理', 'max档', 'max挡')):
-        return 'max', 'user_description_max'
-    if _has_positive_cue(sample, ('超高档', '超高挡', '次顶档', '次顶挡', 'xhigh')):
-        return 'xhigh', 'user_description_xhigh'
-    if _has_positive_cue(sample, ('低档', '低挡', '最低档', '最低挡', '省额度', '省token', '省钱', '快速扫', '快扫', '快速看', '简单看', '轻量档', '轻量模型', '极速', 'low档', 'low挡')) or re.search(r'(?<![a-z])(?:lite|mini|fast|flash)(?![a-z])', lowered):
-        return 'low', 'user_description_low'
-    if _has_positive_cue(sample, ('中档', '中挡', '中等档', '中等挡', '常规档', '均衡档', 'medium档', 'medium挡')):
-        return 'medium', 'user_description_medium'
-    if _has_positive_cue(sample, ('高档', '高挡', '次高档', '次高挡', 'high档', 'high挡')):
-        return 'high', 'user_description_high'
-    if kind == 'polish' and not _has_positive_cue(sample, ('证明', '推导', '定理', '引理', '根因')):
+    prose_requests = {
+        'max': ('用最高挡', '用最高档', '选最高挡', '选最高档', '用最大挡', '用最大档', '使用 max 挡', 'use max effort'),
+        'xhigh': ('用超高挡', '用超高档', '使用 xhigh 挡', 'use xhigh effort'),
+        'low': ('用低挡', '用低档', '低挡快速', '低档快速', '省额度', '省 token', 'use low effort'),
+        'medium': ('用中挡', '用中档', '使用 medium 挡', 'use medium effort'),
+        'high': ('用高挡', '用高档', '使用 high 挡', 'use high effort'),
+    }
+    for level, cues in prose_requests.items():
+        if _has_positive_cue(sample, cues):
+            return level, 'user_description_' + level
+    if kind in ('math', 'direction'):
+        return 'max', f'task_specialty_{kind}_max'
+    if kind == 'polish' and not _has_positive_cue(sample, ('证明', '推导', '根因', 'prove', 'derive')):
         if file_count <= 3 and estimated_tokens <= 4_000 and len(sample) <= 2_500:
             return 'medium', 'complexity_lightweight_polish'
         return 'high', 'complexity_long_polish'
-    if (kind in ('review', 'code', 'audit') and file_count <= 1 and estimated_tokens <= 2_000
-            and _has_positive_cue(sample, TRIVIAL_SURFACE_CUES)
-            and not _has_positive_cue(sample, ('证明', '推导', '根因', '死锁', '竞态', '守恒'))):
-        return 'low', 'complexity_trivial_surface_task'
-    if kind in ('math', 'direction'):
-        return 'max', f'task_specialty_{kind}_max'
-    if _has_positive_cue(sample, HIGH_COMPLEXITY_CUES) or file_count >= 8 or estimated_tokens >= 30_000:
+    if _has_positive_cue(sample, HIGH_COMPLEXITY_CUES):
         return 'max', 'complexity_high_domain_max'
+    if (kind in ('review', 'code', 'audit') and _has_positive_cue(sample, TRIVIAL_SURFACE_CUES)
+            and not _has_positive_cue(sample, ('兼容', '回归', '正确性', '安全', '功能', '全量审计', 'verify', 'regression'))):
+        return 'low', 'complexity_trivial_surface_task'
     env_tier = os.environ.get('CAE_DEFAULT_TIER', '').strip().lower()
     if env_tier in TIER_CHOICES and env_tier not in ('auto', 'ultra'):
         return env_tier, 'env_default_tier'
@@ -527,14 +571,14 @@ PHYSICS_MODEL_CONTEXT_RE = re.compile(
 
 
 def _extract_prompt_model_hint(prompt_text):
-    text = str(prompt_text or '').strip()
+    text = _semantic_text(prompt_text).strip()
     if not text:
         return ''
     stop_words = NON_AI_MODEL_STOPWORDS - ROUTER_MODEL_TAGS
     for pattern in PROMPT_MODEL_HINT_PATTERNS:
         for match in pattern.finditer(text):
-            prefix = text[max(0, match.start() - 4):match.start()].lower()
-            if any(neg in prefix for neg in NEGATION_PREFIXES):
+            prefix = _CUE_BOUNDARIES.split(text[:match.start()])[-1]
+            if _NEGATION.search(prefix):
                 continue
             cand = re.sub(r'\s+', ' ', match.group(1)).strip()
             if not cand:
@@ -547,7 +591,7 @@ def _extract_prompt_model_hint(prompt_text):
                 has_ai_qualifier = bool(re.search(r'(?:\bAI\b|\bagy\b|\bcodex\b|\bgemini\b|\borchestrator\b|[()（）])', match.group(0), re.IGNORECASE))
                 tail_ctx = text[match.end():min(len(text), match.end() + 24)]
                 head_ctx = text[max(0, match.start() - 16):match.start()]
-                if not has_ai_qualifier and cand.islower() and (
+                if not has_ai_qualifier and (
                     PHYSICS_MODEL_CONTEXT_RE.search(tail_ctx) or PHYSICS_MODEL_CONTEXT_RE.search(head_ctx)
                 ):
                     continue
@@ -560,210 +604,250 @@ def _tokens_lower(text):
     return set(re.split(r'[^a-z0-9]+', str(text or '').lower())) - {''}
 
 
+def _alias_tokens(text):
+    return set(re.findall(r'[a-z0-9]+(?:\.[a-z0-9]+)*', str(text or '').lower()))
+
+
+def _unique_model_matches(query, models):
+    by_slug = {item['slug']: item for item in models}
+    if len(by_slug) > 1:
+        choices = sorted(by_slug)
+        raise HarnessError(f'模型别名 {query!r} 不唯一，请指定精确 slug', model_alias=query, matching_models=choices)
+    return next(iter(by_slug.values()), {})
+
+
+def _exact_model_record(models, query):
+    value = query.lower()
+    return _unique_model_matches(query, [item for item in models if item['slug'].lower() == value]) or _unique_model_matches(
+        query, [item for item in models if str(item.get('display_name') or '').lower() == value])
+
+
 def _resolve_explicit_codex_record(models, explicit_model):
-    q = str(explicit_model or '').strip()
-    if not q:
+    query = str(explicit_model or '').strip()
+    if not query:
         return {}
-    ql = q.lower()
-    exact = next((item for item in models if str(item.get('slug') or '').lower() == ql), None)
+    exact = _exact_model_record(models, query)
     if exact:
         return exact
-    visible = [
-        item for item in models
-        if item.get('visibility') != 'hide' and 'auto-review' not in str(item.get('slug') or '').lower()
-    ] or list(models)
-    ordered = sorted(
-        visible,
-        key=lambda item: (
-            1 if str(item.get('description') or '').strip().lower().startswith('older ') else 0,
-            _positive_int(item.get('priority')) or 9999,
-            0,
-        ),
-    )
-    q_tokens = [tok for tok in re.findall(r'[a-z0-9.]+', ql) if tok]
-    if not q_tokens:
-        return {}
-    matched = [
-        item for item in ordered
-        if all(tok in f"{item.get('slug', '')} {item.get('display_name', '')}".lower() for tok in q_tokens)
-    ]
-    return matched[0] if matched else {}
+    terms = _alias_tokens(query)
+    return _unique_model_matches(query, [
+        item for item in models if terms and terms <= _alias_tokens(f"{item['slug']} {item.get('display_name', '')}")
+        and _model_category('codex', item) != 'hidden_or_internal'
+    ])
 
 
-def _resolve_explicit_agy_model(models, explicit_model, tier, strict_catalog=False):
-    q = str(explicit_model or '').strip()
-    ql = q.lower()
-    exact = next(
-        (
-            item['slug'] for item in models
-            if str(item.get('slug') or '').lower() == ql
-            or str(item.get('display_name') or '').lower() == ql
-        ),
-        '',
-    )
-    if exact:
-        _, slug_tier = _agy_slug_tier(exact)
-        cli_effort = None if slug_tier else (tier if tier in ('low', 'medium', 'high', 'xhigh', 'max') and tier != 'max' else None)
-        return {'spec': f'agy:{exact}', 'model': exact, 'reasoning_effort': slug_tier or cli_effort,
-                'cli_effort': cli_effort, 'tier': tier, 'profile_source': 'explicit_engine_model',
-                'effort_source': 'catalog_variant' if slug_tier else ('unverified_request' if cli_effort else 'unknown')}
-
-    # Fuzzy alias resolution (e.g. "carbon", "argon", "hydrogen", "orchestrator", "orchestrator-argon")
-    q_clean = re.sub(r'[（）()]', ' ', ql).strip()
-    q_tokens = [tok for tok in re.findall(r'[a-z0-9.]+', q_clean) if tok]
-    wants_router = bool(set(q_tokens) & ROUTER_MODEL_TAGS) or ('混动' in q)
+def _agy_families(models):
     families = {}
-    router_candidates = []
     for item in models:
-        slug = str(item.get('slug') or '')
-        label = str(item.get('display_name') or '')
-        fam, fam_tier = _agy_slug_tier(slug)
-        if fam and fam_tier and not (_tokens_lower(fam) & ROUTER_MODEL_TAGS):
-            families.setdefault(fam, {})[fam_tier] = slug
-        else:
-            router_candidates.append((slug, label))
+        if _model_category('agy', item) in ('fixed_composite', 'router_or_composite'):
+            continue
+        name, effort = _agy_slug_tier(item['slug'])
+        if name and effort:
+            family = families.setdefault(name, {})
+            family[effort] = _unique_model_matches(name, [x for x in (family.get(effort), item) if x])
+    return families
 
-    explicit_q_tiers = [tok for tok in q_tokens if tok in EFFORT_LADDER]
-    fam_q_tokens = [tok for tok in q_tokens if tok not in EFFORT_LADDER] or q_tokens
-    if not wants_router and fam_q_tokens:
-        fam_hits = [
-            fam for fam in families
-            if all(tok in fam.lower() for tok in fam_q_tokens)
-        ]
-        if fam_hits:
-            chosen_fam = fam_hits[0]
-            target_tier = explicit_q_tiers[-1] if explicit_q_tiers else tier
-            best_tier = _match_effort_level(list(families[chosen_fam]), target_tier)
-            slug = families[chosen_fam].get(best_tier)
-            return {'spec': f'agy:{slug or q}', 'model': slug, 'reasoning_effort': best_tier,
-                    'cli_effort': None, 'tier': target_tier, 'profile_source': 'explicit_fuzzy_model',
-                    'effort_source': 'catalog_variant' if best_tier else 'no_non_delegating_effort'}
 
-    if q_tokens or wants_router:
-        search_tokens = [tok for tok in q_tokens if tok not in ('orchestrator', 'router')] if wants_router else q_tokens
-        hits = []
-        for slug, label in router_candidates:
-            hay = f'{slug} {label}'.lower()
-            is_router_item = bool(_tokens_lower(hay) & ROUTER_MODEL_TAGS)
-            if wants_router and not is_router_item:
-                continue
-            if not search_tokens and wants_router and is_router_item:
-                hits.append(slug)
-            elif search_tokens and all(tok in hay for tok in search_tokens):
-                hits.append(slug)
-        if hits:
-            slug = hits[0]
-            return {'spec': f'agy:{slug}', 'model': slug, 'reasoning_effort': None,
-                    'cli_effort': None, 'tier': tier, 'profile_source': 'explicit_fuzzy_model', 'effort_source': 'unknown'}
+def _agy_family_order(name):
+    generation = re.search(r'^gemini-(\d+(?:\.\d+)*)-', name)
+    version = tuple(int(v) for v in generation.group(1).split('.')) if generation else ()
+    tags = _tokens_lower(name)
+    # Carbon is the published high-difficulty engineering / science model.
+    priority = next((n for n, tag in enumerate(('carbon', 'argon', 'pro')) if tag in tags), 9)
+    return tuple(-v for v in (version + (0, 0, 0))[:3]), priority, name
 
-    if strict_catalog:
-        return None
 
-    _, slug_tier = _agy_slug_tier(q)
-    cli_effort = None if slug_tier else (tier if tier in ('low', 'medium', 'high', 'xhigh', 'max') and tier != 'max' else None)
-    return {'spec': f'agy:{q}', 'model': q, 'reasoning_effort': slug_tier or cli_effort,
-            'cli_effort': cli_effort, 'tier': tier, 'profile_source': 'explicit_engine_model',
-            'effort_source': 'unverified_request' if slug_tier or cli_effort else 'unknown'}
+def _match_agy_family(family, tier):
+    return family.get(_match_effort_level(family, tier), {})
+
+
+def _resolve_explicit_agy_record(models, query, tier):
+    exact = _exact_model_record(models, query)
+    if exact:
+        return exact, 'explicit_engine_model'
+    terms = _alias_tokens(query)
+    variant_terms = terms & set(EFFORT_LADDER)
+    family_terms = terms - variant_terms
+    wants_composite = bool(terms & ROUTER_MODEL_TAGS or '混动' in query)
+    candidates = []
+    if family_terms and not wants_composite:
+        for family, variants in _agy_families(models).items():
+            if family_terms <= _alias_tokens(family):
+                if variant_terms:
+                    candidates.extend(record for level, record in variants.items() if level in variant_terms)
+                else:
+                    record = _match_agy_family(variants, tier)
+                    if record:
+                        candidates.append(record)
+                    elif variants:
+                        # Expose a named ultra-only family as blocked, not unknown.
+                        candidates.extend(variants.values())
+    for item in models:
+        composite = _model_category('agy', item) in ('fixed_composite', 'router_or_composite')
+        if composite != wants_composite:
+            continue
+        if not composite and _agy_slug_tier(item['slug'])[1]:
+            continue
+        if (terms and terms <= _alias_tokens(f"{item['slug']} {item.get('display_name', '')}")) or (
+                wants_composite and not terms and composite):
+            candidates.append(item)
+    return _unique_model_matches(query, candidates), 'explicit_fuzzy_model'
+
+
+def _execution_budget(prefix, info, record):
+    default = _positive_int(record.get('context_window'))
+    maximum = _positive_int(record.get('max_context_window'))
+    configured = _positive_int(info.get('configured_window_tokens'))
+    compact = _positive_int(info.get('effective_compaction_tokens'))
+    window = maximum or default
+    percent = _positive_int(record.get('effective_context_window_percent'))
+    if percent is not None and percent > 100:
+        percent = None
+    effective_window = window * percent // 100 if window is not None and percent is not None else None
+    model_limit = effective_window if effective_window is not None else window
+    requested = _positive_int(info.get('requested_input_budget_tokens'))
+    policy_cap = 120_000
+    cap = min((v for v in (model_limit, compact) if v is not None), default=None)
+    if cap is None:
+        budget = requested or policy_cap
+        source = 'explicit_unverified_planning_budget' if requested else 'conservative_estimate_without_model_window'
+    elif requested:
+        budget, source = min(requested, cap), 'explicit_planning_budget_capped'
+    else:
+        budget = min(cap, max(1, cap * 9 // 10))
+        if not window:
+            budget = min(budget, policy_cap)
+        source = ('policy_estimate_90pct_of_planning_cap' if window else
+                  'conservative_estimate_capped_by_configured_compaction')
+    return {
+        'model_default_window_tokens': default, 'model_declared_max_window_tokens': maximum,
+        'frontend_configured_window_tokens': configured, 'configured_compaction_tokens': compact,
+        'selected_window_tokens': window, 'cli_context_window_tokens': window if prefix == 'codex' else None,
+        'window_source': ('model_declared_max' if maximum else 'model_declared_default' if default else 'unknown'),
+        'declared_effective_context_percent': percent,
+        'catalog_effective_window_tokens': effective_window,
+        'effective_window_source': 'catalog_percent_of_selected_window' if effective_window is not None else None,
+        'planning_cap_tokens': cap, 'requested_input_budget_tokens': requested,
+        'input_budget_tokens': budget, 'policy_reserve_tokens': cap - budget if cap is not None else None,
+        'budget_source': source,
+        'capacity_verified': False,
+    }
+
+
+def _execution_side(info):
+    return info.get('execution_side') or (
+        'windows' if info.get('windows_interop') or not _is_posix() else 'posix')
+
+
+def _execution_environment(info):
+    return {'side': _execution_side(info), 'windows_interop': bool(info.get('windows_interop')),
+            'binary': info.get('binary'), 'config_home': info.get('config_home'),
+            'authentication_status': info.get('authentication_status', 'not_checked'),
+            'fallback_from': info.get('fallback_from')}
+
+
+def _profile(prefix, info, spec, slug, record, tier, source, effort=None, cli_effort=None,
+             effort_source='unknown', error=None):
+    catalog = info.get('model_catalog') or {}
+    capacity = _execution_budget(prefix, info, record)
+    if prefix == 'codex' and not capacity['selected_window_tokens'] and capacity['frontend_configured_window_tokens']:
+        error = error or ('该子模型的默认及最大窗口均无目录声明，无法排除宿主全局窗口覆盖；'
+                          '请刷新目录或选择有窗口声明的模型。')
+    declared = effort if effort_source in ('catalog_declared', 'catalog_variant') else None
+    if effort_source == 'fixed_configuration':
+        adjustment = 'fixed_configuration_ignores_requested_tier'
+    elif declared is None:
+        adjustment = 'unsupported_tier_not_verified' if cli_effort == tier else 'requested_tier_not_verified'
+    elif effort != tier:
+        direction = 'lower' if EFFORT_LADDER.index(effort) < EFFORT_LADDER.index(tier) else 'higher'
+        adjustment = f'{direction}_catalog_effort_or_model_variant'
+    else:
+        adjustment = None
+    return {
+        'spec': f'{prefix}:{slug}' if slug else f'{prefix}:default',
+        'requested_engine': spec, 'requested_model': _engine_parts(spec)[1] or None,
+        'model': slug or None, 'model_category': _model_category(prefix, record) if record else 'unknown',
+        'reasoning_effort': effort, 'cli_effort': cli_effort, 'declared_effort': declared,
+        'effective_effort': None, 'effort_verified': False,
+        'tier': tier, 'selected_tier': tier, 'profile_source': source, 'effort_source': effort_source,
+        'tier_adjustment': adjustment, 'execution_blocked_reason': error,
+        'capacity': capacity, 'model_catalog': catalog,
+        'model_listing': info.get('model_listing'),
+        'catalog_usage': ('listing_declared' if catalog.get('source') == 'agy_models_cli' else
+                          'unverified_client_cache' if catalog.get('model_count') else 'unverified_or_missing'),
+        'execution_environment': _execution_environment(info),
+    }
+
+
+def _codex_profile(info, spec, record, slug, tier, source):
+    effort = _match_effort_level(record.get('supported_efforts', []), tier, record.get('delegating_efforts'))
+    if _only_delegating_efforts(record, tier):
+        return _profile('codex', info, spec, slug, record, tier, source, effort_source='no_non_delegating_effort',
+                        error='目录未声明可用的非委派挡位，请指定其他模型或显式选择 --tier ultra。')
+    if effort:
+        return _profile('codex', info, spec, slug, record, tier, source, effort, effort, 'catalog_declared')
+    # Never inherit an interactive delegated setting. An unlisted named model
+    # may receive a requested tier but the receipt cannot claim it is supported.
+    effort = tier if tier != 'max' else 'high'
+    return _profile('codex', info, spec, slug, record, tier, source, effort, effort, 'unverified_request')
+
+
+def _agy_profile(info, spec, record, slug, tier, source):
+    if _is_agy_orchestrator(record or {'slug': slug}):
+        profile = _profile('agy', info, spec, slug, record, tier, source, effort_source='fixed_configuration')
+        profile.update(model_category='fixed_composite',
+                       fixed_configuration='same_agent_planning_review_and_execution',
+                       effort_option_supported=False)
+        return profile
+    _, variant = _agy_slug_tier(slug)
+    error = '模型变体会启用自动委派；请显式选择 --tier ultra 或其他模型。' if variant == 'ultra' and tier != 'ultra' else None
+    return _profile('agy', info, spec, slug, record, tier, source, variant or None, None,
+                    'catalog_variant' if record and variant else 'unverified_request' if variant else 'unknown', error)
 
 
 def resolve_execution_profile(backends, spec, tier='high', prompt_text='', kind='review', estimated_tokens=0):
     prefix, explicit_model = _engine_parts(spec)
     info = backends.get(prefix, {})
     models = info.get('models', [])
+    hint = _extract_prompt_model_hint(prompt_text) if not explicit_model and models else ''
     if prefix == 'codex':
-        requested_effort = tier if tier not in ('max', 'ultra') else None
-        cfg_effort = info.get('reasoning_effort')
-        if cfg_effort == 'ultra' and tier != 'ultra':
-            requested_effort = requested_effort or 'max'
-        if explicit_model:
-            record = _resolve_explicit_codex_record(models, explicit_model)
-            resolved_slug = record.get('slug') or explicit_model
-            source = 'explicit_engine_model' if resolved_slug == explicit_model else 'explicit_fuzzy_model'
-            return _codex_profile(record, resolved_slug, tier, source, requested_effort, 'unverified_request')
-        if models and prompt_text:
-            hint = _extract_prompt_model_hint(prompt_text)
-            if hint:
-                hint_rec = _resolve_explicit_codex_record(models, hint)
-                if hint_rec and hint_rec.get('slug'):
-                    return _codex_profile(hint_rec, hint_rec['slug'], tier, 'prompt_fuzzy_model',
-                                          requested_effort, 'unverified_request')
-        record, cat_source = _select_codex_specialty_record(models, info.get('model'), kind, tier, prompt_text, estimated_tokens)
-        slug = record.get('slug') or info.get('model') or ''
-        source = cat_source if record.get('slug') else ('local_config' if slug else 'cli_default')
-        fallback = requested_effort if slug or cfg_effort else None
-        fallback_source = 'unverified_request'
-        if not fallback and cfg_effort and cfg_effort in EFFORT_LADDER:
-            fallback = cfg_effort
-            fallback_source = 'local_config'
-        return _codex_profile(record, slug, tier, source, fallback, fallback_source)
-    if explicit_model:
-        return _resolve_explicit_agy_model(models, explicit_model, tier)
-    if models and prompt_text:
-        hint = _extract_prompt_model_hint(prompt_text)
-        if hint:
-            hint_prof = _resolve_explicit_agy_model(models, hint, tier, strict_catalog=True)
-            if hint_prof is not None:
-                hint_prof['profile_source'] = 'prompt_fuzzy_model'
-                return hint_prof
-    families = {}
-    for item in models:
-        fam, fam_tier = _agy_slug_tier(item.get('slug', ''))
-        if fam and fam_tier and not (_tokens_lower(fam) & ROUTER_MODEL_TAGS):
-            families.setdefault(fam, {})[fam_tier] = item['slug']
-    if families:
-        ordered_names = list(families)
-        primary_vendor = ordered_names[0].split('-', 1)[0]
-        native_families = [name for name in ordered_names if name.split('-', 1)[0] == primary_vendor]
-        native_families = [name for name in native_families if _match_effort_level(families[name], tier)]
-        if not native_families:
-            return {'spec': 'agy:default', 'model': None, 'reasoning_effort': None,
-                    'cli_effort': None, 'tier': tier, 'profile_source': 'frontier_catalog',
-                    'effort_source': 'no_non_delegating_effort'}
-        is_fast_family = lambda name: bool(_tokens_lower(name) & FAST_MODEL_TAGS)
-        non_fast = [name for name in native_families if not is_fast_family(name)] or native_families
-        chosen_family = non_fast[0]
-        profile_source = 'frontier_catalog'
-        fast_negated = _has_negated_cue(prompt_text or '', ('轻量', '极速', 'lite', 'mini', 'fast', 'flash', 'hydrogen', '氢'))
-        if tier == 'low' and not fast_negated:
-            fast_family = next((name for name in native_families if is_fast_family(name)), '')
-            if fast_family:
-                chosen_family = fast_family
-                profile_source = 'specialty_fast_lightweight'
-        elif kind in ('math', 'direction') or tier == 'xhigh' or (
-            kind == 'review'
-            and tier in ('max', 'xhigh', 'ultra')
-            and _has_positive_cue(prompt_text or '', ('证明', '定理', '引理', '推导', '守恒', '熵', '收敛阶', '稳定性'))
-        ):
-            deep_family = max(
-                non_fast,
-                key=lambda name: EFFORT_LADDER.index(_match_effort_level(families[name], 'ultra' if tier == 'ultra' else 'max')),
-            )
-            chosen_family = deep_family
-            profile_source = 'specialty_deep_reasoning'
-        best_tier = _match_effort_level(list(families[chosen_family]), tier)
-        slug = families[chosen_family][best_tier]
-        return {'spec': f'agy:{slug}', 'model': slug, 'reasoning_effort': best_tier,
-                'cli_effort': None, 'tier': tier, 'profile_source': profile_source, 'effort_source': 'catalog_variant'}
-    cfg_model = str(info.get('model') or '').strip()
-    fam, cfg_tier = _agy_slug_tier(cfg_model)
-    if not fam:
-        fam, cfg_tier = _agy_display_tier(cfg_model)
-    if fam and cfg_tier:
-        if cfg_tier == 'ultra' and tier != 'ultra':
-            return {'spec': 'agy:default', 'model': None, 'reasoning_effort': None,
-                    'cli_effort': None, 'tier': tier, 'profile_source': 'local_settings',
-                    'effort_source': 'no_non_delegating_effort'}
-        if tier in ('max', 'ultra'):
-            best_tier = cfg_tier if EFFORT_LADDER.index(cfg_tier) >= EFFORT_LADDER.index('high') else 'high'
-        else:
-            best_tier = _match_effort_level(['low', 'medium', 'high', cfg_tier], tier)
-        slug = f'{fam}-{best_tier}'
-        return {'spec': f'agy:{slug}', 'model': slug, 'reasoning_effort': best_tier,
-                'cli_effort': None, 'tier': tier, 'profile_source': 'local_settings',
-                'effort_source': 'local_settings' if best_tier == cfg_tier else 'unverified_inference'}
-    return {'spec': f'agy:{cfg_model}' if cfg_model else 'agy:default', 'model': cfg_model or None,
-            'reasoning_effort': None, 'cli_effort': None, 'tier': tier,
-            'profile_source': 'local_settings' if cfg_model else 'cli_default', 'effort_source': 'unknown'}
+        if explicit_model or hint:
+            record = _resolve_explicit_codex_record(models, explicit_model or hint)
+            if record or explicit_model:
+                slug = record.get('slug') or explicit_model
+                source = ('prompt_fuzzy_model' if hint else 'explicit_engine_model' if slug.lower() == explicit_model.lower()
+                          else 'explicit_fuzzy_model')
+                return _codex_profile(info, spec, record, slug, tier, source)
+        record, source = _select_codex_specialty_record(info, kind, tier, prompt_text, estimated_tokens)
+        if record:
+            return _codex_profile(info, spec, record, record['slug'], tier, source)
+    else:
+        if explicit_model or hint:
+            record, source = _resolve_explicit_agy_record(models, explicit_model or hint, tier)
+            if record or explicit_model:
+                return _agy_profile(info, spec, record, record.get('slug') or explicit_model, tier,
+                                    'prompt_fuzzy_model' if hint else source if record else 'explicit_engine_model')
+        native = [item for item in models if _model_category('agy', item) == 'native']
+        families = _agy_families(native)
+        eligible = sorted((name for name in families if _match_agy_family(families[name], tier)), key=_agy_family_order)
+        if eligible:
+            is_fast = lambda name: bool(_tokens_lower(name) & FAST_MODEL_TAGS)
+            normal = [name for name in eligible if not is_fast(name)] or eligible
+            chosen, source = normal[0], 'frontier_catalog'
+            if tier == 'low' and not _has_negated_cue(prompt_text, ('轻量', '极速', 'lite', 'mini', 'fast', 'flash', 'hydrogen', '氢')):
+                fast = [name for name in eligible if is_fast(name)]
+                if fast:
+                    chosen, source = fast[0], 'specialty_fast_lightweight'
+            elif kind in ('math', 'direction') or (kind == 'review' and tier in ('xhigh', 'max', 'ultra')
+                                                  and _has_positive_cue(prompt_text, HIGH_COMPLEXITY_CUES)):
+                chosen = max(normal, key=lambda name: EFFORT_LADDER.index(
+                    _agy_slug_tier(_match_agy_family(families[name], tier)['slug'])[1]))
+                source = 'specialty_deep_reasoning'
+            record = _match_agy_family(families[chosen], tier)
+            return _agy_profile(info, spec, record, record['slug'], tier, source)
+        source = 'no_non_delegating_effort' if families else 'no_native_catalog_candidate'
+    return _profile(prefix, info, spec, None, {}, tier, source, effort_source=source,
+                    error='未找到符合自动选路规则的原生目录模型，请刷新目录或显式指定后端模型。')
 
 
 def _catalog_metadata(path, data, models, source, now):
@@ -795,6 +879,62 @@ def _catalog_metadata(path, data, models, source, now):
             'model_count': len(models)}
 
 
+def _read_codex_catalog(home, now):
+    path = Path(home) / 'models_cache.json'
+    cache = _read_json(path)
+    models = _model_records(cache)
+    catalog = _catalog_metadata(path, cache, models, 'codex_client_cache', now)
+    cache_version = cache.get('client_version') if isinstance(cache, dict) else None
+    if isinstance(cache_version, str):
+        catalog['client_version_at_collection'] = cache_version
+    return models, catalog
+
+
+def _refresh_codex_listing(info, batch):
+    _enforce_preflight_quota({'codex': info}, ('codex:default',), batch=batch)
+    try:
+        listing = _query_codex_listing(info)
+    except HarnessError as exc:
+        detail = str(exc.details.get('stderr') or exc)
+        if _is_quota_exhausted(detail):
+            cooldown = _record_quota_exhausted('codex', info, detail, batch=batch)
+            raise HarnessError('Codex 模型目录查询遇到额度限制，停止派工', 'quota_exhausted',
+                               preflight_blocked=False, execution_environment=_execution_environment(info),
+                               **_quota_user_choices('codex', cooldown)) from exc
+        raise
+    fetched = datetime.datetime.now(datetime.timezone.utc)
+    models, catalog = _read_codex_catalog(info['config_home'], fetched)
+    if catalog['freshness'] != 'within_assessment_window':
+        raise HarnessError('Codex 模型列表已返回，但同侧客户端缓存缺少有效的采集时间或模型记录，停止派工。',
+                           model_catalog=catalog, execution_environment=_execution_environment(info))
+    cached_by_slug = {record['slug']: record for record in models}
+    listed_models = []
+    for slug, row in listing.items():
+        cached = cached_by_slug.get(slug, {})
+        # The app-server list does not expose context windows. Join these
+        # fields only from the same-side cache and on the exact model slug.
+        available = {'slug': slug, 'visibility': 'list'}
+        for upstream, field in (('displayName', 'display_name'), ('description', 'description'),
+                                ('defaultReasoningEffort', 'default_reasoning_level'),
+                                ('supportedReasoningEfforts', 'supported_reasoning_levels'),
+                                ('modelSpecialty', 'model_specialty')):
+            if row.get(upstream) is not None:
+                available[field] = row[upstream]
+        normalized = _model_records({'models': [available]})[0]
+        listed_models.append({**cached, **normalized, 'context_cache_slug_matched': bool(cached)})
+    info.update(models=listed_models, model_catalog=catalog,
+                model_listing={'source': 'codex_app_server_model_list', 'fetched_at': fetched.isoformat(),
+                               'model_count': len(listed_models),
+                               'context_fields': 'codex_client_cache_exact_slug_only'},
+                verified_status='model_listing_only', capability_source='model_list_and_same_side_cache')
+
+
+def _current_catalog(info):
+    catalog = info.get('model_catalog') or {}
+    return bool(info.get('models') and catalog.get('model_count') and catalog.get('fetched_at')
+                and catalog.get('freshness') == 'within_assessment_window')
+
+
 def _agy_config(root):
     cli_path = root / 'antigravity-cli' / 'settings.json'
     app_path = root / 'config' / 'config.json'
@@ -810,7 +950,110 @@ def _agy_config(root):
 
 def _agy_cached_records(data):
     models = data.get('models') if isinstance(data, dict) else None
-    return [item for item in models if isinstance(item, dict) and item.get('slug')] if isinstance(models, list) else []
+    return [item for item in models if isinstance(item, dict) and isinstance(item.get('slug'), str)
+            and item['slug'].strip()] if isinstance(models, list) else []
+
+
+def _agy_info(binary, requested, now=None):
+    root, interop = _agy_home(binary)
+    cache_file = root / 'antigravity-cli' / 'cache' / 'cae_models_cache.json'
+    data = _read_json(cache_file)
+    models = _agy_cached_records(data)
+    return {'available': bool(binary), 'detected': bool(binary), 'binary': binary, 'family': 'antigravity',
+            **_agy_config(root), 'models': models, 'windows_interop': interop,
+            'verified_status': 'unverified', 'authentication_status': 'not_checked',
+            'model_catalog': _catalog_metadata(cache_file, data, models, 'agy_harness_cache',
+                                               now or datetime.datetime.now(datetime.timezone.utc)),
+            'execution_config_supported': not os.environ.get('CAE_AGY_HOME'),
+            'configured_window_tokens': None, 'effective_compaction_tokens': None,
+            'requested_input_budget_tokens': requested, 'safe_input_budget_tokens': requested or 120_000,
+            'budget_source': 'explicit_planning_budget' if requested else 'policy_estimate_120000',
+            'capability_source': 'local_settings_and_cache' if models else 'local_settings',
+            'capacity_notice': '宿主压缩阈值未核实，规划预算不表示无压缩容量。'}
+
+
+_AGY_AUTH_REQUIRED = re.compile(
+    r'\b(?:please (?:sign in|log in|login)|not (?:signed|logged) in|authentication required|'
+    r'login required|sign-in required|unauthenticated)\b', re.I)
+
+
+def _can_fallback_agy(info):
+    return _is_posix() and not info.get('windows_interop') and not os.environ.get('CAE_AGY_BINARY')
+
+
+def _fallback_agy_info(info):
+    if not _can_fallback_agy(info):
+        return None
+    binary = _find_windows_agy_in_wsl()
+    if not binary or binary == info.get('binary'):
+        return None
+    fallback = _agy_info(binary, info.get('requested_input_budget_tokens'))
+    fallback['fallback_from'] = _execution_environment(info)
+    fallback['fallback_reason'] = 'native_authentication_required'
+    return fallback
+
+
+def _run_agy_listing(info):
+    binary = info['binary']
+    command = [binary, 'models']
+    if not info.get('windows_interop'):
+        return run_process(command, Path.cwd(), timeout_sec=30)
+    if not shutil.which('powershell.exe') or not shutil.which('taskkill.exe'):
+        raise HarnessError('WSL 跨端查询需要 powershell.exe 与 taskkill.exe 进行进程监督')
+    windows_temp = _wsl_path(Path(_windows_env('TEMP')), windows=False)
+    with tempfile.TemporaryDirectory(prefix='cae-harness-', dir=windows_temp) as temp:
+        path = Path(temp)
+        command, pid_file = _interop_command(command, path, path, '', None)
+        return run_process(command, path, timeout_sec=30, native_pid_file=pid_file)
+
+
+def _refresh_agy_listing(info, batch, *, refresh_model_cache, record_quota=True):
+    if not info.get('execution_config_supported', True):
+        raise HarnessError('CAE_AGY_HOME 仅用于离线配置探测，执行查询请使用当前 CLI 的真实用户配置')
+    if not info.get('binary'):
+        raise HarnessError('未发现 agy，无法查询模型')
+    first = info
+    while True:
+        _enforce_preflight_quota({'agy': info}, ('agy:default',), batch=batch)
+        result = _run_agy_listing(info)
+        detail = ((result.stderr or '') + '\n' + (result.stdout or '')).strip()
+        models = _parse_agy_models(result.stdout) if result.returncode == 0 else []
+        if not models and _is_quota_exhausted(detail):
+            if record_quota:
+                cooldown = _record_quota_exhausted('agy', info, detail, batch=batch)
+            else:
+                cooldown = {'backend': 'agy', 'execution_side': _execution_side(info), 'exhausted': True,
+                            **_parse_quota_reset(detail)}
+            raise HarnessError('agy models 查询遇到额度限制，停止派工', 'quota_exhausted',
+                               preflight_blocked=False, execution_environment=_execution_environment(info),
+                               **_quota_user_choices('agy', cooldown))
+        if result.returncode == 0:
+            if not models:
+                raise HarnessError('agy models 未返回可解析的目录，停止派工',
+                                   execution_environment=_execution_environment(info))
+            break
+        if _AGY_AUTH_REQUIRED.search(detail):
+            info['authentication_status'] = 'unauthenticated'
+            alternate = _fallback_agy_info(info) if info is first else None
+            if alternate:
+                info = alternate
+                continue
+        raise HarnessError('agy models 查询失败，停止派工', returncode=result.returncode, stderr=detail[-1000:],
+                           execution_environment=_execution_environment(info))
+    fetched_at = datetime.datetime.now(datetime.timezone.utc)
+    snapshot = {'source': 'agy_models_cli', 'fetched_at': fetched_at.isoformat(), 'models': models}
+    if refresh_model_cache:
+        cache_file = Path(info['config_home']) / 'antigravity-cli' / 'cache' / 'cae_models_cache.json'
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        except OSError as exc:
+            info['model_cache_write_error'] = str(exc)
+    info.update(models=models, authentication_status='authenticated', model_discovery_source='agy_models_cli',
+                model_list_parsed=True, verified_status='model_listing_only', cached_model_catalog=info.get('model_catalog'),
+                capability_source='agy_models_cli',
+                model_catalog=_catalog_metadata(None, snapshot, models, 'agy_models_cli', fetched_at))
+    return info
 
 
 def probe_backends(codex_input_budget=None, agy_input_budget=None, discover_models=False, *, refresh_model_cache=True):
@@ -819,12 +1062,10 @@ def probe_backends(codex_input_budget=None, agy_input_budget=None, discover_mode
     binary = _find_binary('codex')
     home, interop = _codex_home(binary)
     config_file = home / 'config.toml'
-    cache_file = home / 'models_cache.json'
     config = _top_level_toml(config_file)
-    cache = _read_json(cache_file)
-    models = _model_records(cache)
-    frontier = _select_codex_frontier_record(models, config.get('model'))
-    selected = next((item for item in models if item['slug'] == config.get('model')), {}) if config.get('model') else frontier
+    models, catalog = _read_codex_catalog(home, now)
+    interactive_model = config.get('model')
+    selected = next((item for item in models if item['slug'] == interactive_model), {}) if interactive_model else _select_codex_frontier_record(models)
     configured = _positive_int(config.get('model_context_window'))
     cached_default = _positive_int(selected.get('context_window'))
     cached_max = _positive_int(selected.get('max_context_window'))
@@ -833,114 +1074,43 @@ def probe_backends(codex_input_budget=None, agy_input_budget=None, discover_mode
         inferred = min(inferred, cached_max)
     compact = _positive_int(config.get('model_auto_compact_token_limit'))
     requested = codex_input_budget or _positive_int(os.environ.get('CAE_CODEX_INPUT_BUDGET'))
-    cap = inferred
-    if compact:
-        cap = min(cap, compact) if cap else compact
-    budget = requested or (max(1, int(cap * 0.90)) if cap else 120_000)
-    if cap:
-        budget = min(budget, cap)
-    budget_source = 'explicit_planning_budget' if requested else ('policy_estimate_90pct' if cap else 'policy_estimate_120000')
-    common = {'verified_status': 'unverified', 'authentication_status': 'not_checked', 'auto_selectable': True}
-    codex = {**common, 'available': bool(binary), 'detected': bool(binary), 'binary': binary,
-        'family': 'codex', 'model': config.get('model'), 'reasoning_effort': config.get('model_reasoning_effort'),
+    codex = {'verified_status': 'unverified', 'authentication_status': 'not_checked',
+        'available': bool(binary), 'detected': bool(binary), 'binary': binary,
+        'family': 'codex', 'model': interactive_model, 'reasoning_effort': config.get('model_reasoning_effort'),
         'models': models, 'config_home': str(home),
         'config_files': {'cli': {'path': str(config_file), 'exists': config_file.is_file()}},
-        'configured_model_source': str(config_file) if config.get('model') else None,
-        'model_catalog': _catalog_metadata(cache_file, cache, models, 'codex_client_cache', now),
+        'configured_model_source': str(config_file) if interactive_model else None, 'model_catalog': catalog,
         'windows_interop': interop, 'configured_window_tokens': configured, 'cached_default_window_tokens': cached_default,
         'cached_max_window_tokens': cached_max, 'inferred_window_tokens': inferred, 'effective_compaction_tokens': compact,
         'context_metadata_model': selected.get('slug'),
         'cached_effective_context_percent': selected.get('effective_context_window_percent'),
-        'requested_input_budget_tokens': requested, 'safe_input_budget_tokens': budget, 'budget_source': budget_source,
-        'capability_source': 'local_config_and_cache',
+        'requested_input_budget_tokens': requested, 'capability_source': 'local_config_and_cache',
         'capacity_notice': '配置和缓存供预算估算，实际模型权限、压缩阈值及完整读取仍需执行验证。'}
-    agy_binary = _find_binary('agy')
-    root, agy_interop = _agy_home(agy_binary)
-    agy_cache_file = root / 'antigravity-cli' / 'cache' / 'cae_models_cache.json'
-    source = 'agy_harness_cache'
-    cached_agy = _read_json(agy_cache_file)
-    cached_agy_models = _agy_cached_records(cached_agy)
-    if (not cached_agy_models and not os.environ.get('CAE_AGY_HOME') and _is_posix()
-            and (not agy_binary or (Path(str(agy_binary)).is_absolute() and Path(str(agy_binary)).is_file()))):
-        win_agy = _find_windows_agy_in_wsl()
-        if win_agy:
-            win_root, _ = _agy_home(win_agy)
-            win_cache_file = win_root / 'antigravity-cli' / 'cache' / 'cae_models_cache.json'
-            win_cached = _read_json(win_cache_file)
-            win_models = _agy_cached_records(win_cached)
-            if win_models:
-                agy_cache_file, cached_agy, cached_agy_models = win_cache_file, win_cached, win_models
-                source = 'agy_windows_harness_cache'
     requested = agy_input_budget or _positive_int(os.environ.get('CAE_AGY_INPUT_BUDGET'))
-    agy = {**common, 'available': bool(agy_binary), 'detected': bool(agy_binary), 'binary': agy_binary,
-        'family': 'antigravity', **_agy_config(root), 'models': cached_agy_models, 'windows_interop': agy_interop,
-        'model_catalog': _catalog_metadata(agy_cache_file, cached_agy, cached_agy_models, source, now),
-        'execution_config_supported': not os.environ.get('CAE_AGY_HOME'),
-        'configured_window_tokens': None, 'effective_compaction_tokens': None, 'safe_input_budget_tokens': requested or 120_000,
-        'budget_source': 'explicit_planning_budget' if requested else 'policy_estimate_120000',
-        'capability_source': 'local_settings_and_cache' if cached_agy_models else 'local_settings',
-        'capacity_notice': '宿主压缩阈值未核实，规划预算不表示无压缩容量。'}
+    agy = _agy_info(_find_binary('agy'), requested, now)
     if discover_models:
-        if not agy['execution_config_supported']:
-            raise HarnessError('CAE_AGY_HOME 仅用于离线配置探测，执行查询请使用当前 CLI 的真实用户配置')
-        if not agy_binary:
-            raise HarnessError('未发现 agy，无法查询模型', backends={'codex': codex, 'agy': agy})
-
-        def _query_agy_models(bin_path, use_interop):
-            if use_interop and shutil.which('powershell.exe'):
-                cmd = ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
-                       f'& {_ps_literal(_wsl_path(Path(bin_path)))} models']
-                return run_process(cmd, Path.cwd(), timeout_sec=30)
-            return run_process([bin_path, 'models'], Path.cwd(), timeout_sec=30)
-
-        result = _query_agy_models(agy_binary, agy_interop)
-        if result.returncode and not agy_interop and not os.environ.get('CAE_AGY_BINARY'):
-            detail0 = (result.stderr or result.stdout)[-1000:]
-            if 'sign in' in detail0.lower() or 'login' in detail0.lower():
-                win_agy = _find_windows_agy_in_wsl()
-                if win_agy and win_agy != agy_binary:
-                    alt_res = _query_agy_models(win_agy, True)
-                    if alt_res.returncode == 0:
-                        result = alt_res
-                        agy_binary = win_agy
-                        agy_interop = True
-                        root, _ = _agy_home(win_agy)
-                        agy.update(_agy_config(root), binary=win_agy, windows_interop=True)
-        if result.returncode:
-            detail = (result.stderr or result.stdout)[-1000:]
-            if 'sign in' in detail.lower() or 'login' in detail.lower():
-                agy['authentication_status'] = 'unauthenticated'
-            agy['verified_status'] = 'discovery_failed'
-            raise HarnessError('agy models 查询失败', stderr=detail, backends={'codex': codex, 'agy': agy})
-        parsed_models = _parse_agy_models(result.stdout)
-        fetched_at = datetime.datetime.now(datetime.timezone.utc)
-        snapshot = {'fetched_at': fetched_at.isoformat(), 'models': parsed_models}
-        if parsed_models and refresh_model_cache:
-            agy_cache_file = root / 'antigravity-cli' / 'cache' / 'cae_models_cache.json'
-            try:
-                agy_cache_file.parent.mkdir(parents=True, exist_ok=True)
-                agy_cache_file.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-            except OSError:
-                pass
-        agy.update(models=parsed_models, authentication_status='authenticated', model_discovery_output=result.stdout.strip(),
-                   model_discovery_source='agy_models_cli', model_list_parsed=bool(parsed_models), verified_status='model_listing_only',
-                   cached_model_catalog=agy['model_catalog'], capability_source='agy_models_cli',
-                   model_catalog=_catalog_metadata(None, snapshot, parsed_models, 'agy_models_cli', fetched_at))
+        agy = _refresh_agy_listing(agy, _QuotaBatch(), refresh_model_cache=refresh_model_cache,
+                                   record_quota=refresh_model_cache)
     result_map = {'codex': codex, 'agy': agy}
-    for name in ('codex', 'agy'):
+    for name, info in result_map.items():
+        info['execution_side'] = _execution_side(info)
         prof = resolve_execution_profile(result_map, name + ':default', 'max', kind='code')
         deep_prof = resolve_execution_profile(result_map, name + ':default', 'max', kind='math')
         fast_prof = resolve_execution_profile(result_map, name + ':default', 'low', kind='review')
-        result_map[name]['frontier_model'] = prof['model']
-        result_map[name]['max_reasoning_effort'] = prof['reasoning_effort']
-        result_map[name]['specialty_routing'] = {
+        info['frontier_model'] = prof['model']
+        info['max_reasoning_effort'] = prof['reasoning_effort']
+        info['auto_selectable'] = bool(info['detected'] and not prof['execution_blocked_reason'])
+        info['specialty_routing'] = {
             'engineering_workhorse': {'model': prof['model'], 'reasoning_effort': prof['reasoning_effort']},
             'deep_reasoning': {'model': deep_prof['model'], 'reasoning_effort': deep_prof['reasoning_effort']},
             'fast_lightweight': {'model': fast_prof['model'], 'reasoning_effort': fast_prof['reasoning_effort']},
         }
-        cooldown = _load_active_quota_cooldown(name, result_map[name], cleanup_expired=False)
-        result_map[name]['quota_status'] = 'exhausted_cached' if cooldown else 'unknown_until_called'
-        result_map[name]['quota_cooldown'] = cooldown
+        info['budget_model'] = prof['model']
+        info['safe_input_budget_tokens'] = prof['capacity']['input_budget_tokens']
+        info['budget_source'] = prof['capacity']['budget_source']
+        cooldown = _load_active_quota_cooldown(name, info, cleanup_expired=False)
+        info['quota_status'] = 'exhausted_cached' if cooldown else 'unknown_until_called'
+        info['quota_cooldown'] = cooldown
     return result_map
 
 
@@ -980,78 +1150,182 @@ def _parse_quota_reset(text, now=None):
     return {'reset_hint': hint or None, 'cooldown_until_epoch': round(until, 3), 'cooldown_source': source}
 
 
-def _quota_state_path(prefix, info):
-    cfg_home = info.get('config_home') if isinstance(info, dict) else None
+class _QuotaBatch:
+    def __init__(self, retry=False):
+        self.retry = retry
+        self.initial_cooldown = {}
+        self.blocked = {}
+
+
+def _quota_scope(prefix, info):
+    home = info.get('config_home')
+    side = _execution_side(info)
+    scope = str(Path(home).resolve()) if home else str(info.get('binary') or '')
+    return prefix, side, scope.casefold() if side == 'windows' else scope
+
+
+def _quota_state_path(prefix, info, *, legacy=False):
+    cfg_home = info.get('config_home')
     if not cfg_home:
         return None
-    base = Path(str(cfg_home))
-    return (base / 'cache' / 'cae_quota_state.json') if prefix == 'codex' else (base / 'antigravity-cli' / 'cache' / 'cae_quota_state.json')
+    base = Path(cfg_home)
+    if prefix == 'agy':
+        base /= 'antigravity-cli'
+    filename = 'cae_quota_state.json' if legacy else f'cae_quota_state_{_execution_side(info)}.json'
+    return base / 'cache' / filename
+
+
+_QUOTA_EVENT_NAME = re.compile(r'^[0-9a-f]{32}\.json$')
+
+
+def _quota_events_dir(state_path):
+    return state_path.with_suffix('.events')
+
+
+def _quota_ack_name(record):
+    return hashlib.sha256(json.dumps(record, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest() + '.json'
+
+
+def _read_quota_cooldowns(prefix, info, now=None, *, cleanup_expired=False):
+    now_ts = time.time() if now is None else float(now)
+    state_path = _quota_state_path(prefix, info)
+    if state_path is None:
+        return []
+    found = []
+    events = _quota_events_dir(state_path)
+    try:
+        entries = list(events.iterdir())
+    except OSError:
+        entries = []
+    for path in entries + [state_path, _quota_state_path(prefix, info, legacy=True)]:
+        immutable = path.parent == events
+        if immutable and not _QUOTA_EVENT_NAME.fullmatch(path.name):
+            continue
+        data = _read_json(path)
+        if not isinstance(data, dict) or not data.get('exhausted') or data.get('backend', prefix) != prefix:
+            continue
+        if data.get('execution_side', _execution_side(info)) != _execution_side(info):
+            continue
+        until = data.get('cooldown_until_epoch')
+        if type(until) not in (int, float) or not now_ts < until:
+            if cleanup_expired and immutable:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            continue
+        # Older versions replace a fixed path. Acknowledging its exact value
+        # avoids a check-then-unlink race with those writers.
+        if not immutable and (events / 'acknowledged' / _quota_ack_name(data)).is_file():
+            continue
+        found.append((path, data))
+    if cleanup_expired:
+        try:
+            for ack in (events / 'acknowledged').iterdir():
+                acknowledged = _read_json(ack)
+                until = acknowledged.get('cooldown_until_epoch') if isinstance(acknowledged, dict) else None
+                if type(until) in (int, float) and now_ts >= until:
+                    ack.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return found
 
 
 def _load_active_quota_cooldown(prefix, info, now=None, *, cleanup_expired=True):
-    path = _quota_state_path(prefix, info)
-    if not path or not path.is_file():
-        return None
-    data = _read_json(path)
-    if not isinstance(data, dict) or not data.get('exhausted'):
-        return None
-    now_ts = time.time() if now is None else float(now)
-    until = data.get('cooldown_until_epoch')
-    if not isinstance(until, (int, float)) or now_ts >= float(until):
-        if cleanup_expired:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        return None
-    return data
+    with QUOTA_LOCK:
+        found = _read_quota_cooldowns(prefix, info, now, cleanup_expired=cleanup_expired)
+        return max((data for _path, data in found), key=lambda data: data['cooldown_until_epoch'], default=None)
 
 
-def _record_quota_exhausted(prefix, info, detail, now=None):
+def _active_quota_record(prefix, info, files=None):
+    key = _quota_scope(prefix, info)
+    in_session = _SESSION_QUOTA_BLOCKED.get(key)
+    if in_session and time.time() >= in_session['cooldown_until_epoch']:
+        _SESSION_QUOTA_BLOCKED.pop(key, None)
+        in_session = None
+    if files is None:
+        files = _read_quota_cooldowns(prefix, info)
+    records = [record for _path, record in files]
+    if in_session:
+        records.append(in_session)
+    return max(records, key=lambda record: record['cooldown_until_epoch'], default=None)
+
+
+def _record_quota_exhausted(prefix, info, detail, now=None, *, batch=None):
     now_ts = time.time() if now is None else float(now)
     clean_detail = re.sub(r'<Objs\b[\s\S]*', '', detail or '').strip()
-    record = {
-        'backend': prefix,
-        'exhausted': True,
-        'detected_at_epoch': round(now_ts, 3),
-        **_parse_quota_reset(clean_detail, now_ts),
-        'detail': clean_detail[-600:],
-    }
-    path = _quota_state_path(prefix, info)
-    if path:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-        except OSError:
-            pass
-    with _EVENT_LOCK:
-        _SESSION_QUOTA_BLOCKED[prefix] = record
-    if isinstance(info, dict):
-        info['quota_status'] = 'exhausted_cached'
-        info['quota_cooldown'] = record
+    key = _quota_scope(prefix, info)
+    record = {'backend': prefix, 'execution_side': key[1], 'exhausted': True,
+              'event_id': uuid.uuid4().hex, 'detected_at_epoch': round(now_ts, 3),
+              **_parse_quota_reset(clean_detail, now_ts), 'detail': clean_detail[-600:]}
+    state_path = _quota_state_path(prefix, info)
+    with QUOTA_LOCK:
+        _SESSION_QUOTA_BLOCKED[key] = record
+        if batch is not None:
+            batch.blocked[key] = record
+        info.update(quota_status='exhausted_cached', quota_cooldown=record)
+        if state_path:
+            path = _quota_events_dir(state_path) / (record['event_id'] + '.json')
+            try:
+                _publish_quota_record(path, record)
+            except OSError:
+                info['quota_cache_write_failed'] = True
     return record
 
 
-def _clear_quota_cooldown(prefix, info):
-    with _EVENT_LOCK:
-        _SESSION_QUOTA_BLOCKED.pop(prefix, None)
-    path = _quota_state_path(prefix, info)
-    if path and path.is_file():
-        try:
-            path.unlink()
-        except OSError:
-            pass
-    if isinstance(info, dict):
-        info['quota_status'] = 'unknown_until_called'
-        info['quota_cooldown'] = None
+def _publish_quota_record(path, record):
+    # Each failure owns a unique path. Publish it atomically so a reader
+    # cannot mistake partially written JSON for an absent cooldown.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_name('.' + uuid.uuid4().hex + '.pending')
+    try:
+        pending.write_text(json.dumps(record, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        os.replace(pending, path)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def _quota_identity(record):
+    if not record:
+        return None
+    return _quota_ack_name(record)
+
+
+def _mark_quota_success(prefix, info, batch):
+    # A successful request already in flight cannot undo a failure that
+    # happened in this batch, or a newer persisted failure from another batch.
+    if not batch.retry:
+        return
+    key = _quota_scope(prefix, info)
+    with QUOTA_LOCK:
+        initial = batch.initial_cooldown.get(key, set())
+        in_session = _SESSION_QUOTA_BLOCKED.get(key)
+        if key in batch.blocked or (in_session and _quota_identity(in_session) not in initial):
+            return
+        files = _read_quota_cooldowns(prefix, info, cleanup_expired=True)
+        if any(_quota_identity(record) not in initial for _path, record in files):
+            return
+        _SESSION_QUOTA_BLOCKED.pop(key, None)
+        state_path = _quota_state_path(prefix, info)
+        for path, record in files:
+            events = _quota_events_dir(state_path)
+            try:
+                if path.parent == events:
+                    path.unlink(missing_ok=True)
+                else:
+                    _publish_quota_record(events / 'acknowledged' / _quota_ack_name(record),
+                                          {'cooldown_until_epoch': record['cooldown_until_epoch']})
+            except OSError:
+                pass
+        remaining = _active_quota_record(prefix, info)
+        info.update(quota_status='exhausted_cached' if remaining else 'unknown_until_called', quota_cooldown=remaining)
 
 
 def _quota_user_choices(prefix, cooldown):
     hint = cooldown.get('reset_hint') or '待冷却结束或补充额度后'
     return {
-        'quota_backend': prefix,
-        'quota_cooldown': cooldown,
-        'user_confirmation_required': True,
+        'quota_backend': prefix, 'quota_execution_side': cooldown.get('execution_side'),
+        'quota_cooldown': cooldown, 'quota_fuse_triggered': True, 'user_confirmation_required': True,
         'user_choices': [
             f'1. 先不发起跨端调用：改由当前总控在本侧直接完成（{prefix} 预计恢复参考: {hint}）',
             f'2. 已充值或额度已恢复：经用户确认后附带 --retry-quota 重新发起跨端调用',
@@ -1059,23 +1333,33 @@ def _quota_user_choices(prefix, cooldown):
     }
 
 
-def _enforce_preflight_quota(backends, specs, retry_quota=False):
+def _enforce_preflight_quota(backends, specs, retry_quota=False, *, batch=None):
+    batch = batch or _QuotaBatch(retry_quota)
     for spec in specs:
         if not spec:
             continue
         prefix, _ = _engine_parts(spec)
         info = backends.get(prefix, {})
-        with _EVENT_LOCK:
-            in_session = _SESSION_QUOTA_BLOCKED.get(prefix)
-        cooldown = in_session or (None if retry_quota else _load_active_quota_cooldown(prefix, info))
+        key = _quota_scope(prefix, info)
+        with QUOTA_LOCK:
+            files = _read_quota_cooldowns(prefix, info, cleanup_expired=True)
+            active = _active_quota_record(prefix, info, files)
+            if batch.retry and key not in batch.initial_cooldown:
+                persisted = {_quota_identity(record) for _path, record in files}
+                batch.initial_cooldown[key] = persisted | ({_quota_identity(active)} if active else set())
+            allowed = batch.initial_cooldown.get(key, set())
+            unacknowledged = [record for _path, record in files if _quota_identity(record) not in allowed]
+            if active and _quota_identity(active) not in allowed:
+                unacknowledged.append(active)
+            cooldown = batch.blocked.get(key) or max(unacknowledged, key=lambda record: record['cooldown_until_epoch'], default=None)
+            if cooldown:
+                info.update(quota_status='exhausted_cached', quota_cooldown=cooldown)
         if cooldown:
             hint = cooldown.get('reset_hint') or '待额度恢复'
-            raise HarnessError(
-                f'检测到对侧后端 {prefix} 处于已知额度冷却期（预计恢复: {hint}），已在发起前自动拦截；请提示用户选择先不发起（由本侧直接完成）或充值后加 --retry-quota 重试',
-                'quota_exhausted',
-                preflight_blocked=True,
-                **_quota_user_choices(prefix, cooldown),
-            )
+            raise HarnessError(f'{prefix} 处于已知额度冷却期（预计恢复: {hint}），已在发起前拦截',
+                               'quota_exhausted', preflight_blocked=True,
+                               execution_environment=_execution_environment(info),
+                               **_quota_user_choices(prefix, cooldown))
 
 
 def resolve_caller(value):
@@ -1151,54 +1435,53 @@ def collect_target_files(target, skipped_files=None):
     return records
 
 
-def build_shards(file_records, max_shard_tokens):
+def _audit_estimate(files, file_tokens, focus, interop=False):
+    prompt = _build_audit_prompt({'files': files}, focus)
+    schema_bytes = len(json.dumps(AUDIT_JSON_SCHEMA, ensure_ascii=False).encode('utf-8'))
+    interop_bytes = len(STAGED_PROMPT_SUFFIX.encode('utf-8')) if interop else 0
+    overhead = estimate_tokens_from_bytes(len(prompt.encode('utf-8')) + schema_bytes + interop_bytes)
+    return {'estimated_file_tokens': file_tokens, 'estimated_prompt_tokens': overhead,
+            'estimated_tokens': file_tokens + overhead}
+
+
+def build_shards(file_records, max_shard_tokens, *, input_budget=None, focus='', interop=False):
     if max_shard_tokens <= 0:
         raise HarnessError('分片预算必须为正数')
-    shards, files, tokens = [], [], 0
+    budget = input_budget if input_budget is not None else max_shard_tokens
+    soft = min(max_shard_tokens, budget)
+    shards, files, file_tokens = [], [], 0
+    base_bytes = len(_build_audit_prompt({'files': []}, focus).encode('utf-8'))
+    base_bytes += len(json.dumps(AUDIT_JSON_SCHEMA, ensure_ascii=False).encode('utf-8'))
+    if interop:
+        base_bytes += len(STAGED_PROMPT_SUFFIX.encode('utf-8'))
+    path_bytes = 0
     for record in file_records:
-        if record['tokens'] > max_shard_tokens:
-            raise HarnessError(f"单文件超出分片预算: {record['rel_path']}")
-        if files and tokens + record['tokens'] > max_shard_tokens:
-            shards.append({'shard_id': len(shards) + 1, 'files': files, 'estimated_tokens': tokens})
-            files, tokens = [], 0
-        files.append(record['rel_path'])
-        tokens += record['tokens']
+        name = record['rel_path']
+        size = len(('- ' + name).encode('utf-8'))
+        if record['tokens'] + estimate_tokens_from_bytes(base_bytes + size) > budget:
+            raise HarnessError(f'单文件与审查提示词超出输入预算: {name}')
+        combined = file_tokens + record['tokens'] + estimate_tokens_from_bytes(base_bytes + path_bytes + size + bool(files))
+        if files and combined > soft:
+            shards.append({'shard_id': len(shards) + 1, 'files': files, **_audit_estimate(files, file_tokens, focus, interop)})
+            files, file_tokens, path_bytes = [], 0, 0
+        path_bytes += size + bool(files)
+        files.append(name)
+        file_tokens += record['tokens']
     if files:
-        shards.append({'shard_id': len(shards) + 1, 'files': files, 'estimated_tokens': tokens})
+        shards.append({'shard_id': len(shards) + 1, 'files': files, **_audit_estimate(files, file_tokens, focus, interop)})
     return shards
 
 
 def _budget_for_spec(backends, spec):
-    name, model = _engine_parts(spec)
-    info = backends[name]
-    if not model or name != 'codex':
-        return info['safe_input_budget_tokens']
-    record = _resolve_explicit_codex_record(info.get('models', []), model)
-    cap = info.get('configured_window_tokens') or _positive_int(record.get('context_window'))
-    maximum = _positive_int(record.get('max_context_window'))
-    if cap and maximum:
-        cap = min(cap, maximum)
-    compact = info.get('effective_compaction_tokens')
-    if compact:
-        cap = min(cap, compact) if cap else compact
-    requested = info.get('requested_input_budget_tokens')
-    budget = requested or (max(1, int(cap * 0.90)) if cap else 120_000)
-    return min(budget, cap) if cap else budget
+    return resolve_execution_profile(backends, spec, kind='audit')['capacity']['input_budget_tokens']
 
 
-def select_audit_plan(total_tokens, file_records, backends, strategy='auto', dual_blind=True,
-                      left_override='', right_override='', shard_tokens=120_000, allow_unconfigured=False, caller='caller'):
-    requested_strategy = strategy
-    if strategy == 'whole-1m':
-        strategy = 'single-pass'
+def _audit_engines(backends, dual_blind, left_override, right_override, allow_unconfigured, caller):
     if not left_override and caller == 'caller':
         available = [name for name in ('codex', 'agy') if backends.get(name, {}).get('available')]
         if not available:
             if allow_unconfigured:
-                return {'mode': 'unconfigured', 'caller': caller, 'handoff_to_caller': True,
-                        'total_files': len(file_records), 'total_estimated_tokens': total_tokens,
-                        'left_engine': None, 'right_engine': None, 'left_units': [], 'right_units': [],
-                        'skipped_files': [], 'notice': '未发现 agy 或 codex，当前只提供未就绪计划。'}
+                return None, None
             raise HarnessError('未发现 agy 或 codex 后端')
         left_override = available[0] + ':default'
     left = choose_engine(backends, caller, left_override)
@@ -1209,34 +1492,68 @@ def select_audit_plan(total_tokens, file_records, backends, strategy='auto', dua
         choose_engine(backends, caller, right)
         if left == right:
             raise HarnessError('双路审查需要两个不同引擎或显式模型')
+    return left, right
+
+
+def select_audit_plan(total_tokens, file_records, backends, strategy='auto', dual_blind=True,
+                      left_override='', right_override='', shard_tokens=120_000, allow_unconfigured=False, caller='caller',
+                      *, focus='', profiles=None, engines=None):
+    requested_strategy = strategy
+    if strategy == 'whole-1m':
+        strategy = 'single-pass'
+    left, right = engines if engines is not None else _audit_engines(
+        backends, dual_blind, left_override, right_override, allow_unconfigured, caller)
+    if not left:
+        return {'mode': 'unconfigured', 'caller': caller, 'handoff_to_caller': True,
+                'total_files': len(file_records), 'total_estimated_tokens': total_tokens,
+                'left_engine': None, 'right_engine': None, 'left_units': [], 'right_units': [],
+                'skipped_files': [], 'execution_profiles': {}, 'notice': '未发现 agy 或 codex，当前只提供未就绪计划。'}
+    if profiles is None:
+        tier, _ = select_task_tier(kind='audit', text=focus)
+        profiles = {side: resolve_execution_profile(backends, spec, tier, focus, 'audit',
+                                                     _audit_estimate([record['rel_path'] for record in file_records],
+                                                                     total_tokens, focus)['estimated_tokens'])
+                    for side, spec in (('left', left), ('right', right)) if spec}
+    if right and profiles['left']['model'] and profiles['left']['spec'] == profiles['right']['spec']:
+        raise HarnessError('双路选路最终指向同一个模型；请为其中一路指定其他模型。')
     plan = {'mode': strategy, 'requested_strategy': requested_strategy, 'caller': caller, 'handoff_to_caller': True,
             'total_files': len(file_records), 'total_estimated_tokens': total_tokens,
             'dual_blind': bool(right), 'left_engine': left, 'right_engine': right, 'skipped_files': [],
+            'execution_profiles': profiles, 'soft_shard_target_tokens': shard_tokens,
             'coverage_notice': '清单是计划覆盖范围，实际读取完整性仍由回执与证据核实。',
+            'budget_notice': '按每 3 字节约 1 token 估算文件、审查提示词、清单与 JSON Schema，另保留策略余量；不表示分词器实测容量。',
             'independence_notice': '不同进程独立审查，模型家族及错误独立性尚未验证。'}
+    all_files = [record['rel_path'] for record in file_records]
+    whole = strategy != 'sharded'
     for side, spec in (('left', left), ('right', right)):
+        units_key = side + '_units'
+        plan[units_key] = []
         if not spec:
-            plan[side + '_units'] = []
             continue
-        cap = _budget_for_spec(backends, spec)
-        unit_cap = cap if strategy != 'sharded' and total_tokens <= cap else min(cap, shard_tokens)
+        profile = profiles[side]
+        cap = profile['capacity']['input_budget_tokens']
+        interop = profile['execution_environment']['windows_interop']
+        all_estimate = _audit_estimate(all_files, total_tokens, focus, interop)
+        if strategy != 'sharded' and all_estimate['estimated_tokens'] <= cap:
+            plan[units_key] = [{'shard_id': 1, 'files': all_files, **all_estimate, 'single_pass_planned': True}]
+            continue
+        whole = False
+        if strategy == 'single-pass':
+            raise HarnessError(f'{spec} 文件与提示词超出单次预算，请选择 sharded 或调整有依据的预算。',
+                               execution_profile=profile, **all_estimate)
         usable = []
         for record in file_records:
-            if record['tokens'] > unit_cap:
-                plan['skipped_files'].append({'file': record['rel_path'], 'engine': spec, 'reason': 'over_input_budget',
-                                             'estimated_tokens': record['tokens'], 'budget_tokens': unit_cap})
+            estimate = _audit_estimate([record['rel_path']], record['tokens'], focus, interop)
+            if estimate['estimated_tokens'] > cap:
+                plan['skipped_files'].append({'file': record['rel_path'], 'engine': spec, 'side': side,
+                                             'reason': 'over_input_budget', **estimate, 'budget_tokens': cap})
             else:
                 usable.append(record)
-        if strategy == 'single-pass' and (total_tokens > cap or len(usable) != len(file_records)):
-            raise HarnessError(f'{spec} 输入计划超出单次预算，请选择 sharded 或调整有依据的预算')
-        whole = strategy != 'sharded' and total_tokens <= cap
-        units = build_shards(usable, unit_cap)
-        for unit in units:
-            unit['single_pass_planned'] = whole
-        plan[side + '_units'] = units
-    whole = all(len(plan[side + '_units']) <= 1 and all(u['single_pass_planned'] for u in plan[side + '_units']) for side in ('left', 'right'))
+        plan[units_key] = [{**unit, 'single_pass_planned': False,
+                            'exceeds_soft_shard_target': unit['estimated_tokens'] > shard_tokens}
+                           for unit in build_shards(usable, shard_tokens, input_budget=cap, focus=focus, interop=interop)]
     plan['mode'] = 'single-pass' if whole else 'sharded'
-    if plan['mode'] == 'sharded':
+    if not whole:
         plan['coverage_notice'] += ' 跨分片依赖未在同一个上下文内联合核查。'
     if requested_strategy == 'whole-1m':
         plan['deprecation_notice'] = 'whole-1m 兼容映射至 single-pass，不表示百万 token 或无压缩能力。'
@@ -1391,8 +1708,10 @@ def run_process(command, cwd, input_text=None, timeout_sec=600, env=None, shell=
         return subprocess.CompletedProcess(command, proc.returncode, out, err)
     except BaseException as exc:
         cleanup_errors = _terminate_tree(proc, native_pid_file)
-        if isinstance(exc, HarnessError) and cleanup_errors:
-            exc.details['cleanup_errors'] = cleanup_errors
+        if isinstance(exc, HarnessError):
+            exc.details['process_started'] = True
+            if cleanup_errors:
+                exc.details['cleanup_errors'] = cleanup_errors
         try:
             proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
@@ -1409,6 +1728,7 @@ def _ps_literal(text):
 
 
 MAX_INTEROP_STAGE_BYTES = 64 * 1024 * 1024
+STAGED_PROMPT_SUFFIX = '\n[跨端只读工作区说明] 当前目录已按原相对路径只读镜像目标文件，请直接在当前目录下按相对路径读取。'
 
 
 def _stage_wsl_readonly_workspace(target_dir, stage_root, rel_files=None):
@@ -1459,9 +1779,25 @@ def _rewrite_staged_paths(parsed, stage_dir):
 
 def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None):
     """监督进程写入本次真实 Windows PID，供 WSL 定向清理进程树。"""
-    prompt_file = temp_dir / 'input.txt'
     pid_file = temp_dir / 'native.pid'
-    prompt_file.write_text(input_text, encoding='utf-8')
+    if input_text is None:
+        pipes = [
+            '$output = $p.StandardOutput.BaseStream.CopyToAsync([Console]::OpenStandardOutput())',
+            '$errors = $p.StandardError.BaseStream.CopyToAsync([Console]::OpenStandardError())',
+            'while ($null -ne ($line = [Console]::ReadLine())) {',
+            '$p.StandardInput.WriteLine($line)', '$p.StandardInput.Flush()', '}',
+            '$p.StandardInput.Close()', '$p.WaitForExit()', '$output.Wait()', '$errors.Wait()',
+        ]
+    else:
+        prompt_file = temp_dir / 'input.txt'
+        prompt_file.write_text(input_text, encoding='utf-8')
+        pipes = [
+            '$output = $p.StandardOutput.ReadToEndAsync()', '$errors = $p.StandardError.ReadToEndAsync()',
+            '$inputBytes = [IO.File]::ReadAllBytes(' + _ps_literal(_wsl_path(prompt_file)) + ')',
+            '$p.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)', '$p.StandardInput.BaseStream.Flush()',
+            '$p.StandardInput.Close()', '$p.WaitForExit()',
+            '[Console]::Out.Write($output.Result)', '[Console]::Error.Write($errors.Result)',
+        ]
     args = subprocess.list2cmdline(command[1:])
     env_lines = ["$info.EnvironmentVariables['CAE_HARNESS_DEPTH'] = '1'"]
     if codex_home:
@@ -1484,11 +1820,7 @@ def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None):
         '$p = New-Object System.Diagnostics.Process', '$p.StartInfo = $info',
         '$started = $false', '$completed = $false', '$exitCode = 1', 'try {',
         '[void]$p.Start()', '$started = $true',
-        '$output = $p.StandardOutput.ReadToEndAsync()', '$errors = $p.StandardError.ReadToEndAsync()',
-        '$inputBytes = [IO.File]::ReadAllBytes(' + _ps_literal(_wsl_path(prompt_file)) + ')',
-        '$p.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)', '$p.StandardInput.BaseStream.Flush()',
-        '$p.StandardInput.Close()', '$p.WaitForExit()',
-        '[Console]::Out.Write($output.Result)', '[Console]::Error.Write($errors.Result)',
+        *pipes,
         '$exitCode = $p.ExitCode', '$completed = $true', '} finally {',
         'if ($started -and -not $completed) { & taskkill.exe /T /F /PID $p.Id | Out-Null }',
         '$p.Dispose()', '}', 'exit $exitCode',
@@ -1497,35 +1829,178 @@ def _interop_command(command, work_dir, temp_dir, input_text, codex_home=None):
     return ['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], pid_file
 
 
+def _read_rpc_lines(stream, inbox):
+    try:
+        for line in stream:
+            inbox.put(line)
+    except (OSError, ValueError):
+        pass
+    finally:
+        inbox.put(None)
+
+
+def _query_codex_listing(info, timeout_sec=30):
+    if _CANCELLED.is_set():
+        raise HarnessError('任务已取消', 'cancelled')
+    home = info.get('config_home')
+    binary = info.get('binary')
+    if not home or not binary:
+        raise HarnessError('未发现 Codex 或其配置目录，无法刷新模型列表')
+    command = [binary, 'app-server', '--stdio']
+    if info.get('windows_interop'):
+        if not shutil.which('powershell.exe') or not shutil.which('taskkill.exe'):
+            raise HarnessError('WSL 跨端查询需要 powershell.exe 与 taskkill.exe 进行进程监督')
+        windows_temp = _wsl_path(Path(_windows_env('TEMP')), windows=False)
+        with tempfile.TemporaryDirectory(prefix='cae-harness-', dir=windows_temp) as temp:
+            cwd = Path(temp)
+            command, pid_file = _interop_command(command, cwd, cwd, None, home)
+            return _query_codex_stdio(command, cwd, None, pid_file, timeout_sec)
+    env = os.environ.copy()
+    env.update(CODEX_HOME=home, CAE_HARNESS_DEPTH='1')
+    return _query_codex_stdio(command, None, env, None, timeout_sec)
+
+
+def _query_codex_stdio(command, cwd, env, native_pid_file, timeout_sec):
+    options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
+    deadline = time.monotonic() + timeout_sec
+    try:
+        proc = subprocess.Popen(command, cwd=cwd, env=env, **options,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding='utf-8', errors='replace')
+    except OSError as exc:
+        raise HarnessError('无法启动 Codex 模型目录查询', stderr=str(exc)) from exc
+    inbox = queue.Queue()
+    errors = collections.deque(maxlen=8)
+    stdout_reader = threading.Thread(target=_read_rpc_lines, args=(proc.stdout, inbox), daemon=True)
+
+    def drain_stderr():
+        try:
+            for line in proc.stderr:
+                errors.append(line[-2000:])
+        except (OSError, ValueError):
+            pass
+
+    stderr_reader = threading.Thread(target=drain_stderr, daemon=True)
+    stdout_reader.start()
+    stderr_reader.start()
+    failure = None
+
+    def send(message):
+        proc.stdin.write(json.dumps(message) + '\n')
+        proc.stdin.flush()
+
+    def rpc(number, method, params):
+        send({'id': number, 'method': method, 'params': params})
+        while True:
+            if _CANCELLED.is_set():
+                raise HarnessError('任务已取消', 'cancelled')
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HarnessError('Codex 模型目录查询超时', 'timeout')
+            try:
+                line = inbox.get(timeout=min(remaining, 0.25))
+            except queue.Empty:
+                continue
+            if line is None:
+                raise HarnessError('Codex app-server 在返回模型目录前退出')
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict) or event.get('id') != number or 'method' in event:
+                continue
+            if event.get('error'):
+                raise HarnessError(f'Codex {method} 返回错误', stderr=str(event['error'])[-2000:])
+            if not isinstance(event.get('result'), dict):
+                raise HarnessError(f'Codex {method} 回执结构无效')
+            return event['result']
+
+    try:
+        rpc(1, 'initialize', {'clientInfo': {'name': 'cae_harness', 'version': '1.0'},
+                              'capabilities': {'experimentalApi': True}})
+        send({'method': 'initialized'})
+        listing = {}
+        params = {'includeHidden': False, 'limit': 100}
+        cursors = set()
+        for number in range(2, 12):
+            response = rpc(number, 'model/list', params)
+            data = response.get('data')
+            if not isinstance(data, list):
+                raise HarnessError('Codex 模型列表结构无效')
+            for model in data:
+                slug = model.get('model') if isinstance(model, dict) else None
+                if isinstance(slug, str) and slug and not model.get('hidden'):
+                    listing[slug] = model
+            cursor = response.get('nextCursor')
+            if cursor is None:
+                break
+            if not isinstance(cursor, str) or not cursor or cursor in cursors:
+                raise HarnessError('Codex 模型列表分页游标无效')
+            cursors.add(cursor)
+            params['cursor'] = cursor
+        else:
+            raise HarnessError('Codex 模型目录超出查询页数上限')
+        if not listing:
+            raise HarnessError('Codex 模型目录为空，停止派工')
+        return listing
+    except HarnessError as exc:
+        failure = exc
+        raise
+    except OSError as exc:
+        failure = HarnessError('Codex 模型目录通信失败', stderr=str(exc))
+        raise failure from exc
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            cleanup_errors = _terminate_tree(proc, native_pid_file)
+            if cleanup_errors and failure:
+                failure.details['cleanup_errors'] = cleanup_errors
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        stdout_reader.join(timeout=1)
+        stderr_reader.join(timeout=1)
+        if not stdout_reader.is_alive():
+            proc.stdout.close()
+        if not stderr_reader.is_alive():
+            proc.stderr.close()
+        if failure and errors:
+            failure.details['stderr'] = (str(failure.details.get('stderr') or '') + '\n' + ''.join(errors))[-3000:]
+
+
 def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, timeout_sec=600,
-                  agent='readonly-collaborator', stage_files=None, effort=None, retry_quota=False):
-    prefix, model = _engine_parts(spec)
+                  agent='readonly-collaborator', stage_files=None, effort=None, retry_quota=False,
+                  *, profile=None, batch=None, receipt=None):
+    batch = batch or _QuotaBatch(retry_quota)
+    prefix, _ = _engine_parts(spec)
     info = backends.get(prefix, {})
     if not info.get('available'):
         raise HarnessError(f'未发现所选后端 {prefix}')
-    _enforce_preflight_quota(backends, (spec,), retry_quota)
+    if profile is None:
+        _prepare_execution(backends, (spec,), batch)
+        info = backends[prefix]
+        profile = resolve_execution_profile(backends, spec, effort or 'high')
+    _require_execution_profile(profile)
+    _, model = _engine_parts(profile['spec'])
+    effort = profile['cli_effort']
+    if receipt is None:
+        receipt = {}
+    receipt.update(requested_engine=profile['requested_engine'], execution_environment=_execution_environment(info),
+                   model_requested_to_cli=model or None, actual_model=None, effective_effort=None,
+                   declared_effort=profile['declared_effort'], launch_attempted=False, invocation_started=False)
+    _enforce_preflight_quota(backends, (spec,), batch=batch)
     binary = info['binary']
     if prefix == 'agy' and not info.get('execution_config_supported', True):
         raise HarnessError('CAE_AGY_HOME 仅用于离线配置探测，执行请使用当前 CLI 的真实用户配置')
     if Path(binary).suffix.lower() in ('.cmd', '.bat'):
         raise HarnessError('请通过 CAE_CODEX_BINARY / CAE_AGY_BINARY 指定原生可执行文件')
     interop = info.get('windows_interop', False)
-    if (prefix == 'agy' and not interop and _is_posix() and not os.environ.get('CAE_AGY_BINARY')
-            and info.get('authentication_status') not in ('authenticated', 'interop_fallback')
-            and Path(str(binary)).is_absolute() and Path(str(binary)).is_file()):
-        auth_probe = run_process([binary, 'models'], Path.cwd(), timeout_sec=15)
-        probe_err = ((auth_probe.stderr or '') + '\n' + (auth_probe.stdout or '')).lower()
-        if auth_probe.returncode == 0:
-            with _EVENT_LOCK:
-                info['authentication_status'] = 'authenticated'
-        elif any(cue in probe_err for cue in ('sign in', 'login', 'authentication required')):
-            win_agy = _find_windows_agy_in_wsl()
-            if win_agy and win_agy != binary:
-                win_root, _ = _agy_home(win_agy)
-                with _EVENT_LOCK:
-                    info.update(binary=win_agy, windows_interop=True, config_home=str(win_root), authentication_status='interop_fallback')
-                binary = win_agy
-                interop = True
     temp_parent = None
     if interop:
         if not shutil.which('powershell.exe') or not shutil.which('taskkill.exe'):
@@ -1555,7 +2030,7 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
             stage_dir = _stage_wsl_readonly_workspace(target_dir, temp_path, stage_files)
             exec_dir = stage_dir
             win_target = translate(stage_dir)
-            exec_prompt = prompt + '\n[跨端只读工作区说明] 当前目录已按原相对路径只读镜像目标文件，请直接在当前目录下按相对路径读取。'
+            exec_prompt = prompt + STAGED_PROMPT_SUFFIX
         if prefix == 'codex':
             command = [binary, 'exec', '-s', 'read-only' if readonly else 'workspace-write',
                        '-c', 'approval_policy="never"', '--ephemeral',
@@ -1564,97 +2039,131 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 command.extend(['-m', model])
             if effort:
                 command.extend(['-c', f'model_reasoning_effort="{effort}"'])
+            context_window = profile['capacity']['cli_context_window_tokens']
+            if context_window:
+                command.extend(['-c', f'model_context_window={context_window}'])
             command.append('-')
             input_text = exec_prompt
-            if interop:
-                command, native_pid_file = _interop_command(command, exec_dir, temp_path, exec_prompt, info['config_home'])
-                input_text = None
         else:
             command = [binary, '--input-format', 'stream-json', '--output-format', 'stream-json',
                        '--print-timeout', f'{timeout_sec}s', '--json-schema', translate(schema_file),
                        '--disable-slash-commands', '--sandbox']
             if model:
                 command.extend(['--model', model])
-            if effort and not _agy_slug_tier(model)[1]:
+            if effort and profile.get('effort_option_supported') is not False and not _agy_slug_tier(model)[1]:
                 command.extend(['--effort', effort])
             if readonly:
                 command.extend(['--agent', agent])
             else:
                 command.extend(['--mode', 'accept-edits', '--dangerously-skip-permissions'])
             input_text = json.dumps({'event': 'user', 'message': {'content': exec_prompt}}, ensure_ascii=False) + '\n'
-            if interop:
-                command, native_pid_file = _interop_command(command, exec_dir, temp_path, input_text, None)
-                input_text = None
-        result = run_process(command, exec_dir, input_text, timeout_sec, env=env, native_pid_file=native_pid_file)
+        receipt.update(argv=list(command), work_dir=str(exec_dir), staged_readonly_workspace=stage_dir is not None,
+                       command_transport='windows_interop' if interop else 'native')
+        if interop:
+            command, native_pid_file = _interop_command(command, exec_dir, temp_path, input_text,
+                                                        info.get('config_home') if prefix == 'codex' else None)
+            input_text = None
+        # Queued units must recheck after staging. A success already in flight
+        # cannot clear a failure recorded by another unit in this same batch.
+        _enforce_preflight_quota(backends, (spec,), batch=batch)
+        receipt['launch_attempted'] = True
+        try:
+            result = run_process(command, exec_dir, input_text, timeout_sec, env=env, native_pid_file=native_pid_file)
+        except HarnessError as exc:
+            receipt['invocation_started'] = bool(exc.details.get('process_started'))
+            raise
+        receipt['invocation_started'] = True
+        receipt['returncode'] = result.returncode
         if result.returncode:
-            combined_err = ((result.stderr or '') + '\n' + (result.stdout or '')).strip()
-            if (prefix == 'agy' and not interop and _is_posix() and not os.environ.get('CAE_AGY_BINARY')
-                    and any(cue in combined_err.lower() for cue in ('sign in', 'please login', 'authentication required'))):
-                win_agy = _find_windows_agy_in_wsl()
-                if win_agy and win_agy != binary:
-                    win_root, _ = _agy_home(win_agy)
-                    with _EVENT_LOCK:
-                        info.update(binary=win_agy, windows_interop=True, config_home=str(win_root), authentication_status='interop_fallback')
-                    return invoke_engine(spec, target_dir, prompt, backends, schema, readonly,
-                                         timeout_sec, agent, stage_files, effort, retry_quota)
-            if _is_quota_exhausted(combined_err):
-                cooldown = _record_quota_exhausted(prefix, info, combined_err)
-                raise HarnessError(
-                    f'{prefix} 额度不足或已达用量上限，已终止调用并记录冷却状态；请提示用户选择先不发起（由本侧直接完成）或充值后加 --retry-quota 重试',
-                    'quota_exhausted', preflight_blocked=False, returncode=result.returncode,
-                    stderr=result.stderr[-2000:], **_quota_user_choices(prefix, cooldown),
-                )
-            raise HarnessError(f'{prefix} 执行失败，退出码 {result.returncode}', returncode=result.returncode, stderr=result.stderr[-2000:])
+            detail = ((result.stderr or '') + '\n' + (result.stdout or '')).strip()
+            if _is_quota_exhausted(detail):
+                cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
+                raise HarnessError(f'{prefix} 额度不足或已达用量上限，已停止并记录冷却状态',
+                                   'quota_exhausted', preflight_blocked=False, returncode=result.returncode,
+                                   stderr=(result.stderr or '')[-2000:], **_quota_user_choices(prefix, cooldown))
+            # A worker may already have written files. Authentication fallback
+            # is allowed only in model listing before planning and execution.
+            raise HarnessError(f'{prefix} 执行失败，退出码 {result.returncode}', returncode=result.returncode,
+                               stderr=(result.stderr or '')[-2000:])
         raw = output_file.read_text(encoding='utf-8-sig') if prefix == 'codex' and output_file.exists() else result.stdout
         try:
             parsed = _extract_json_object(raw, schema)
         except HarnessError as exc:
             if exc.status == 'quota_exhausted':
                 detail = str(exc.details.get('error') or raw)[-1000:]
-                cooldown = _record_quota_exhausted(prefix, info, detail)
-                raise HarnessError(
-                    f'{prefix} 额度不足或已达用量上限，已终止调用并记录冷却状态；请提示用户选择先不发起（由本侧直接完成）或充值后加 --retry-quota 重试',
-                    'quota_exhausted', preflight_blocked=False, **_quota_user_choices(prefix, cooldown),
-                ) from exc
+                cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
+                raise HarnessError(f'{prefix} 额度不足或已达用量上限，已停止并记录冷却状态',
+                                   'quota_exhausted', preflight_blocked=False,
+                                   **_quota_user_choices(prefix, cooldown)) from exc
             raise
-        _clear_quota_cooldown(prefix, info)
+        _mark_quota_success(prefix, info, batch)
+        if prefix == 'agy':
+            for line in (result.stdout or '').splitlines():
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                init = event.get('init') if isinstance(event, dict) and event.get('event') == 'init' else None
+                if isinstance(init, dict) and isinstance(init.get('model'), str):
+                    receipt['actual_model'] = init['model']
+                    receipt['actual_model_source'] = 'agy_init_event'
+                    break
         return _rewrite_staged_paths(parsed, stage_dir) if stage_dir is not None else parsed
 
 
-def invoke_readonly_engine(spec, target_dir, prompt, backends, timeout_sec=600, stage_files=None, effort=None, retry_quota=False):
-    return invoke_engine(spec, target_dir, prompt, backends, AUDIT_JSON_SCHEMA, True, timeout_sec, 'readonly-auditor', stage_files, effort, retry_quota)
+def invoke_readonly_engine(spec, target_dir, prompt, backends, timeout_sec=600, stage_files=None, effort=None, retry_quota=False,
+                           *, profile=None, batch=None, receipt=None):
+    return invoke_engine(spec, target_dir, prompt, backends, AUDIT_JSON_SCHEMA, True, timeout_sec,
+                         'readonly-auditor', stage_files, effort, retry_quota, profile=profile, batch=batch, receipt=receipt)
 
 
-def invoke_edit_worker(spec, target_dir, prompt, backends, timeout_sec=600, effort=None, retry_quota=False):
-    return json.dumps(invoke_engine(spec, target_dir, prompt, backends, TASK_JSON_SCHEMA, False, timeout_sec, 'readonly-collaborator', None, effort, retry_quota), ensure_ascii=False)
+def invoke_edit_worker(spec, target_dir, prompt, backends, timeout_sec=600, effort=None, retry_quota=False,
+                       *, profile=None, batch=None, receipt=None):
+    result = invoke_engine(spec, target_dir, prompt, backends, TASK_JSON_SCHEMA, False, timeout_sec,
+                           'readonly-collaborator', None, effort, retry_quota, profile=profile, batch=batch, receipt=receipt)
+    return json.dumps(result, ensure_ascii=False)
 
 
 def snapshot_files(root):
     """对独立任务目录作事后核对，排除 Git 元数据，不撤销文件。"""
+    root = Path(root)
+
+    def traversal_failed(exc):
+        directory = Path(exc.filename) if exc.filename else root
+        try:
+            location = directory.relative_to(root).as_posix()
+        except ValueError:
+            location = str(directory)
+        raise HarnessError(f'无法遍历目录 {location}: {exc}', snapshot_path=location) from exc
+
     result = {}
-    for directory, dirs, files in os.walk(root, followlinks=False):
+    for directory, dirs, files in os.walk(root, followlinks=False, onerror=traversal_failed):
         dirs[:] = sorted(d for d in dirs if d != '.git')
         for name in list(dirs):
             link = Path(directory) / name
-            if _is_link(link):
-                result[link.relative_to(root).as_posix()] = 'symlink:' + os.readlink(link)
-                dirs.remove(name)
+            rel = link.relative_to(root).as_posix()
+            try:
+                if _is_link(link):
+                    result[rel] = 'symlink:' + os.readlink(link)
+                    dirs.remove(name)
+            except OSError as exc:
+                raise HarnessError(f'无法核对目录 {rel}: {exc}', snapshot_path=rel) from exc
         for name in files:
             path = Path(directory) / name
             if path == root / '.git':
                 continue
             rel = path.relative_to(root).as_posix()
-            if _is_link(path):
-                result[rel] = 'symlink:' + os.readlink(path)
-            else:
-                try:
+            try:
+                if _is_link(path):
+                    result[rel] = 'symlink:' + os.readlink(path)
+                else:
                     digest = hashlib.sha256()
                     with path.open('rb') as stream:
                         for block in iter(lambda: stream.read(1024 * 1024), b''):
                             digest.update(block)
                     result[rel] = digest.hexdigest()
-                except OSError as exc:
-                    raise HarnessError(f'无法核对文件: {rel}: {exc}') from exc
+            except OSError as exc:
+                raise HarnessError(f'无法核对文件 {rel}: {exc}', snapshot_path=rel) from exc
     return result
 
 
@@ -1738,21 +2247,38 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
 
     verifier = verify_fn or default_verify
     scopes = _scope_patterns(write_scope or [])
-    initial = snapshot_files(target_dir)
     worker_changes = set()
     verification_changes = set()
     violations = set()
     history = []
     status = 'verification_failed'
     last_error = ''
-    for number in range(1, max_rounds + 1):
+    scope_failure = {}
+
+    def checked_snapshot(phase, round_number=None):
+        try:
+            return snapshot_files(target_dir)
+        except (HarnessError, OSError) as exc:
+            scope_failure.update(scope_error_phase=phase, scope_error=str(exc))
+            if round_number is not None:
+                scope_failure['scope_error_round'] = round_number
+            path = getattr(exc, 'details', {}).get('snapshot_path') or getattr(exc, 'filename', None)
+            if path is not None:
+                scope_failure['scope_error_path'] = str(path)
+            return None
+
+    initial = checked_snapshot('preflight')
+    rounds = range(1, max_rounds + 1) if initial is not None else ()
+    for number in rounds:
+        before_worker = initial if number == 1 else checked_snapshot('pre_worker', number)
+        if before_worker is None:
+            break
         prompt = (f"按授权任务修改当前目录，允许写入范围为 {scopes or '调用方授权的目标工作目录'}。"
                   f'严禁在目标工作目录外创建、修改或删除任何文件或目录（含严禁向目录外执行 git worktree add）。\n'
                   f'{task_desc}\n验收命令为 {verify_cmd}。不得通过放宽验收要求取得通过。'
                   f'Git 提交与推送由当前总控负责。不要调用本编排器或改变其他会话。\n上一轮反馈:\n{last_error[-3500:]}')
         entry = {'round': number, 'passed': False, 'verify_exit_code': None}
         emit_event('gate_round_started', round=number, caller=caller)
-        before_worker = snapshot_files(target_dir)
         worker_ok = False
         try:
             entry['worker_summary'] = worker_fn(prompt, number)
@@ -1765,7 +2291,11 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
             status = 'failed'
             entry.update(error=str(exc), status='failed')
             last_error = str(exc)
-        after_worker = snapshot_files(target_dir)
+        after_worker = checked_snapshot('post_worker', number)
+        if after_worker is None:
+            entry.update(scope_verified=False, scope_status='failed', **scope_failure)
+            history.append(entry)
+            break
         round_changes = changed_files(before_worker, after_worker)
         worker_changes.update(round_changes)
         round_violations = [path for path in round_changes if scopes and
@@ -1790,22 +2320,33 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
                 status = 'failed'
                 entry.update(error=str(exc), status='failed')
                 last_error = str(exc)
-            verify_changes = changed_files(after_worker, snapshot_files(target_dir))
+            after_verify = checked_snapshot('post_verify', number)
+            if after_verify is None:
+                entry.update(passed=False, scope_verified=False, scope_status='failed', **scope_failure)
+                history.append(entry)
+                break
+            verify_changes = changed_files(after_worker, after_verify)
             verification_changes.update(verify_changes)
             entry['verification_changed_files'] = verify_changes
         history.append(entry)
         if status in ('ok', 'cancelled', 'timeout', 'scope_violation', 'invalid_output', 'quota_exhausted'):
             break
-    changes = changed_files(initial, snapshot_files(target_dir))
-    extra_quota = {k: history[-1][k] for k in ('preflight_blocked', 'quota_backend', 'quota_cooldown', 'user_confirmation_required', 'user_choices')
+    final = checked_snapshot('final') if not scope_failure else None
+    changes = changed_files(initial, final) if final is not None else None
+    extra_quota = {k: history[-1][k] for k in ('preflight_blocked', 'quota_backend', 'quota_execution_side', 'quota_cooldown',
+                                             'quota_fuse_triggered', 'user_confirmation_required', 'user_choices')
                    if history and k in history[-1]} if status == 'quota_exhausted' else {}
+    scope_error = {'error': scope_failure['scope_error'], **scope_failure} if scope_failure else {}
+    if scope_failure and status not in ('quota_exhausted', 'cancelled', 'timeout', 'scope_violation'):
+        status = 'failed'
     return {'status': status, 'gate_passed': status == 'ok', 'circuit_breaker_triggered': status != 'ok',
             'rounds_used': len(history), 'verify_cmd': verify_cmd, 'history': history,
             'caller': caller, 'handoff_to_caller': True, 'changed_files': changes,
             'worker_changed_files': sorted(worker_changes), 'verification_changed_files': sorted(verification_changes),
-            'scope_violations': sorted(violations), 'scope_check': 'post_worker_snapshot',
+            'scope_violations': sorted(violations), 'scope_check': 'unverified' if scope_failure else 'post_worker_snapshot',
+            'scope_verified': not scope_failure,
             'scope_notice': '需使用独立任务目录，快照无法区分并发写入来源。验收命令产物单独记录，检查不自动回滚。',
-            **extra_quota}
+            **extra_quota, **scope_error}
 
 
 def _args_backends(args):
@@ -1836,6 +2377,37 @@ def cmd_probe(args):
     return _print({'status': 'ok', 'caller': resolve_caller(args.caller), 'backends': _args_backends(args)})
 
 
+def _capability_matrix(prefix, info):
+    models = info['models']
+    families = _agy_families(models) if prefix == 'agy' else {}
+    rows = []
+    for record in sorted(models, key=_catalog_order):
+        slug = record['slug']
+        category = _model_category(prefix, record)
+        if prefix == 'agy':
+            family, variant = _agy_slug_tier(slug)
+            efforts = sorted(families.get(family, {}), key=EFFORT_LADDER.index) if family else []
+        else:
+            family, variant = None, None
+            efforts = list(record.get('supported_efforts') or [])
+        rows.append({
+            'model': slug, 'display_name': record.get('display_name'), 'category': category,
+            'auto_candidate': category == 'native',
+            'family': family or None, 'variant_effort': variant or None,
+            'declared_efforts': efforts, 'declared_default_effort': record.get('default_reasoning_level'),
+            'effort_source': ('fixed_configuration' if category == 'fixed_composite' else
+                              'agy_catalog_slug_suffix' if variant else
+                              'codex_client_cache_reasoning_levels' if efforts else 'unknown'),
+            'fixed_configuration': 'same_agent_planning_review_and_execution' if category == 'fixed_composite' else None,
+            'capacity': _execution_budget(prefix, info, record),
+            'catalog_source': info['model_catalog'].get('source'),
+            'catalog_fetched_at': info['model_catalog'].get('fetched_at'),
+            'catalog_freshness': info['model_catalog'].get('freshness'),
+            'runtime_verified': False,
+        })
+    return rows
+
+
 def cmd_assess(args):
     backends = probe_backends(args.codex_input_budget, args.agy_input_budget, args.discover_models,
                               refresh_model_cache=False)
@@ -1847,6 +2419,8 @@ def cmd_assess(args):
     for name, info in backends.items():
         info['caller_relation'] = ('local' if name == local_backend else 'counterpart') if local_backend else 'unspecified'
         info['program_origin'] = ('windows_interop' if info['windows_interop'] else 'native') if info['detected'] else None
+        info['execution_environment'] = _execution_environment(info)
+        info['capability_matrix'] = _capability_matrix(name, info)
         info['model_metadata_sources'] = {
             'context': 'codex_client_cache_context_fields' if name == 'codex' and any(
                 model.get('context_window') or model.get('max_context_window') for model in info['models']) else None,
@@ -1860,29 +2434,54 @@ def cmd_assess(args):
         for scenario, (kind, prompt) in scenarios.items():
             tier, reason = select_task_tier(kind=kind, text=prompt)
             profile = resolve_execution_profile(backends, name + ':default', tier, prompt, kind=kind)
-            recommendations[name][scenario] = {**profile, 'tier_reason': reason,
+            recommendations[name][scenario] = {**profile, 'requested_tier': 'auto', 'tier_reason': reason,
                                                 'backend_detected': info['detected']}
     return _print({'status': 'ok', 'caller': caller, 'backends': backends,
                    'recommendations': recommendations,
                    'catalog_discovery_requested': args.discover_models,
                    'runtime_verified': False, 'controls_native_spawn_agent': False,
-                   'notice': '推荐使用常规或短任务示例。目录时间用于评估采集时效，配置与目录声明仅供选路参考。'
-                             '实际可用性、有效上下文、压缩与委派行为仍需执行验证。'})
+                   'notice': '能力矩阵和选路基于目录及策略。实际可用性、性能、有效上下文、压缩和委派行为仍需执行验证。'})
 
 
-def _ensure_live_agy_catalog(args, backends, specs):
-    if getattr(args, 'dry_run', False):
+def _prepare_execution(backends, specs, batch, *, dry_run=False):
+    if dry_run:
         return
-    needs_agy = any(spec and _engine_parts(spec)[0] == 'agy' for spec in specs)
-    agy_info = backends.get('agy', {})
-    binary = agy_info.get('binary')
-    if (needs_agy and not agy_info.get('models') and agy_info.get('execution_config_supported', True)
-            and binary and Path(str(binary)).is_file()):
+    # Check all selected sides before sending even a model-listing request.
+    _enforce_preflight_quota(backends, specs, batch=batch)
+    codex_spec = next((spec for spec in specs if spec and _engine_parts(spec)[0] == 'codex'), None)
+    if codex_spec and not _current_catalog(backends['codex']):
         try:
-            refreshed = probe_backends(args.codex_input_budget, args.agy_input_budget, discover_models=True)
-            backends['agy'] = refreshed['agy']
-        except HarnessError:
-            pass
+            _refresh_codex_listing(backends['codex'], batch)
+        except HarnessError as exc:
+            exc.details.setdefault('requested_engine', codex_spec)
+            exc.details.setdefault('execution_environment', _execution_environment(backends['codex']))
+            raise
+    agy_spec = next((spec for spec in specs if spec and _engine_parts(spec)[0] == 'agy'), None)
+    if not agy_spec:
+        return
+    info = backends.get('agy', {})
+    if not info.get('execution_config_supported', True):
+        raise HarnessError('CAE_AGY_HOME 仅用于离线配置探测，执行请使用当前 CLI 的真实用户配置')
+    authenticated = info.get('authentication_status') == 'authenticated'
+    needs_side_check = _can_fallback_agy(info) and not authenticated and bool(_find_windows_agy_in_wsl())
+    if needs_side_check or not _current_catalog(info):
+        try:
+            backends['agy'] = _refresh_agy_listing(info, batch, refresh_model_cache=True)
+        except HarnessError as exc:
+            exc.details.setdefault('requested_engine', agy_spec)
+            raise
+    _enforce_preflight_quota(backends, specs, batch=batch)
+
+
+def _planned_profile(args, backends, engine, tier, reason, text, kind, estimated_tokens):
+    profile = resolve_execution_profile(backends, engine, tier, text, kind, estimated_tokens)
+    prefix, _ = _engine_parts(engine)
+    profile.update(requested_tier=args.tier, tier_reason=reason,
+                   quota_status=backends.get(prefix, {}).get('quota_status', 'unknown_until_called'))
+    if (args.tier != 'auto' and prefix == 'agy' and profile['effort_source'] != 'fixed_configuration'
+            and profile['declared_effort'] is None and profile['cli_effort'] is None):
+        profile['tier_adjustment'] = 'requested_tier_not_applied_no_catalog_declaration'
+    return profile
 
 
 def _target_metrics(requested_target, text):
@@ -1906,40 +2505,51 @@ def cmd_audit(args):
     if not records:
         raise HarnessError('目标范围没有可审查文件', skipped_files=skipped)
     total_tokens = sum(item['tokens'] for item in records)
-    plan = select_audit_plan(total_tokens, records, backends, args.strategy,
-                             not args.single, args.left, args.right, args.shard_tokens, args.dry_run, caller)
-    plan['skipped_files'].extend(skipped)
+    engines = _audit_engines(backends, not args.single, args.left, args.right, args.dry_run, caller)
     tier, tier_reason = select_task_tier(args.tier, 'audit', args.focus, len(records), total_tokens)
-    _ensure_live_agy_catalog(args, backends, (plan.get('left_engine'), plan.get('right_engine')))
-    profiles = {side: resolve_execution_profile(backends, plan[side + '_engine'], tier, args.focus, kind='audit', estimated_tokens=total_tokens)
-                for side in ('left', 'right') if plan.get(side + '_engine')}
-    plan['selected_tier'] = tier
-    plan['tier_reason'] = tier_reason
-    plan['execution_profiles'] = {side: {'model': prof['model'], 'reasoning_effort': prof['reasoning_effort'],
-                                         'profile_source': prof['profile_source'],
-                                         'effort_source': prof['effort_source'],
-                                         'quota_status': backends.get(_engine_parts(plan[side + '_engine'])[0], {}).get('quota_status', 'unknown_until_called')}
-                                  for side, prof in profiles.items()}
+    meta = {'caller': caller, 'handoff_to_caller': True, 'requested_tier': args.tier,
+            'selected_tier': tier, 'tier_reason': tier_reason, 'target': str(root)}
+    batch = _QuotaBatch(args.retry_quota)
+    try:
+        _prepare_execution(backends, engines, batch, dry_run=args.dry_run)
+    except HarnessError as exc:
+        return _print({'status': exc.status, **meta, 'error': str(exc), 'requested_engines': list(engines), **exc.details})
+    profiles = {}
+    for side, engine in zip(('left', 'right'), engines):
+        if engine:
+            prefix, _ = _engine_parts(engine)
+            estimate = _audit_estimate([record['rel_path'] for record in records], total_tokens, args.focus,
+                                       backends[prefix].get('windows_interop', False))
+            profiles[side] = _planned_profile(args, backends, engine, tier, tier_reason, args.focus, 'audit', estimate['estimated_tokens'])
+    plan = select_audit_plan(total_tokens, records, backends, args.strategy, not args.single, args.left, args.right,
+                             args.shard_tokens, args.dry_run, caller, focus=args.focus, profiles=profiles, engines=engines)
+    plan['skipped_files'].extend(skipped)
+    plan.update(requested_tier=args.tier, selected_tier=tier, tier_reason=tier_reason)
     if args.dry_run:
         return _print({'status': 'ok', 'dry_run': True, 'plan': plan})
     for profile in profiles.values():
         _require_execution_profile(profile)
-    try:
-        _enforce_preflight_quota(backends, (plan.get('left_engine'), plan.get('right_engine')), args.retry_quota)
-    except HarnessError as exc:
-        return _print({'status': exc.status, 'caller': caller, 'handoff_to_caller': True, 'selected_tier': tier,
-                       'tier_reason': tier_reason, 'plan': plan, 'target': str(root), 'error': str(exc), **exc.details})
     base = _git_head(root)
     before = snapshot_files(root)
-    tasks = [(side, plan[side + '_engine'], unit) for side in ('left', 'right') for unit in plan[side + '_units']]
+    tasks = [(side, unit) for side in ('left', 'right') for unit in plan[side + '_units']]
     findings = {'left': [], 'right': []}
     errors, completed = [], []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, max(1, len(tasks)))) as pool:
-        futures = {pool.submit(invoke_readonly_engine, profiles[side]['spec'], root, _build_audit_prompt(unit, args.focus),
-                               backends, args.timeout, unit['files'], profiles[side]['cli_effort'], args.retry_quota):
-                   (side, engine, unit) for side, engine, unit in tasks}
+        futures = {}
+        for side, unit in tasks:
+            profile = profiles[side]
+            receipt = {}
+            future = pool.submit(invoke_readonly_engine, profile['spec'], root, _build_audit_prompt(unit, args.focus),
+                                 backends, args.timeout, unit['files'], profile['cli_effort'], args.retry_quota,
+                                 profile=profile, batch=batch, receipt=receipt)
+            futures[future] = side, unit, receipt
         for future in concurrent.futures.as_completed(futures):
-            side, engine, unit = futures[future]
+            side, unit, receipt = futures[future]
+            profile = profiles[side]
+            engine = plan[side + '_engine']
+            common = {'side': side, 'engine': engine, 'model': profile['model'],
+                      'reasoning_effort': profile['reasoning_effort'], 'shard_id': unit['shard_id'],
+                      'planned_files': unit['files'], 'invocation': receipt}
             try:
                 result = future.result()
                 _validate_schema(result, AUDIT_JSON_SCHEMA)
@@ -1949,17 +2559,22 @@ def cmd_audit(args):
                 unread_paths = {item['file'] for item in unread}
                 if (set(read) | unread_paths) - planned or set(read) & unread_paths:
                     raise OutputParseError('读取覆盖回执与本分片文件范围不一致')
+                if len(set(read)) != len(read) or len(unread_paths) != len(unread):
+                    raise OutputParseError('读取覆盖回执包含重复路径')
+                normalized = [{**item, 'file': _normalize_rel_file(item['file'], root)} for item in result['findings']]
+                if {item['file'] for item in normalized} - planned:
+                    raise OutputParseError('发现项引用了分片清单之外的文件')
+                if any(item['file'] not in set(read) for item in normalized):
+                    raise OutputParseError('发现项没有相应的自报已读文件')
                 for missing in sorted(planned - set(read) - unread_paths):
                     unread.append({'file': missing, 'reason': 'backend_did_not_report_reading'})
-                findings[side].extend(result['findings'])
-                completed.append({'engine': engine, 'model': profiles[side]['model'],
-                                  'reasoning_effort': profiles[side]['reasoning_effort'], 'shard_id': unit['shard_id'],
-                                  'planned_files': unit['files'], 'read_files': read, 'unread_files': unread,
+                findings[side].extend(normalized)
+                completed.append({**common, 'read_files': read, 'unread_files': unread,
                                   'status': 'partial' if unread else 'ok',
                                   'reading_coverage_verified': False, 'summary': result['summary']})
                 emit_event('audit_unit_completed', engine=engine, shard_id=unit['shard_id'])
             except Exception as exc:
-                errors.append({'engine': engine, 'shard_id': unit['shard_id'], 'status': getattr(exc, 'status', 'failed'),
+                errors.append({**common, 'status': getattr(exc, 'status', 'failed'),
                                'error': str(exc), **getattr(exc, 'details', {})})
     scope = _changes_report(before, root, [], True)
     quota_err = next((err for err in errors if err.get('status') == 'quota_exhausted'), None)
@@ -1967,18 +2582,23 @@ def cmd_audit(args):
         status = 'scope_violation'
     elif _CANCELLED.is_set():
         status = 'cancelled'
+    elif not tasks:
+        status = 'partial'
     elif not completed:
         statuses = {error['status'] for error in errors}
         status = 'quota_exhausted' if 'quota_exhausted' in statuses else (next(iter(statuses)) if len(statuses) == 1 else 'failed')
     else:
         status = 'partial' if errors or plan['skipped_files'] or any(unit['unread_files'] for unit in completed) else 'ok'
-    quota_meta = {k: quota_err[k] for k in ('quota_backend', 'quota_cooldown', 'user_confirmation_required', 'user_choices')
+    quota_meta = {k: quota_err[k] for k in ('quota_backend', 'quota_execution_side', 'quota_cooldown',
+                                          'quota_fuse_triggered', 'user_confirmation_required', 'user_choices')
                   if quota_err and k in quota_err}
+    completed.sort(key=lambda unit: (unit['side'], unit['shard_id']))
+    errors.sort(key=lambda unit: (unit['side'], unit['shard_id']))
     merged = merge_blind_findings(findings['left'], findings['right'], plan['left_engine'], plan['right_engine'], root)
-    return _print({'status': status, 'caller': caller, 'handoff_to_caller': True, 'selected_tier': tier,
-                   'tier_reason': tier_reason, 'plan': plan, 'target': str(root), 'base_commit': base,
+    return _print({'status': status, **meta, 'plan': plan, 'base_commit': base,
                    'completed_units': completed, 'completed_count': sum(unit['status'] == 'ok' for unit in completed),
                    'received_count': len(completed), 'total_units': len(tasks), 'errors': errors,
+                   'reading_coverage_verified': False,
                    'consensus_count': len(merged['consensus_findings']), 'single_source_count': len(merged['single_source_findings']),
                    **merged, **scope, **quota_meta, 'verification_notice': '当前总控需核实原始文件与证据后采纳发现。'})
 
@@ -1990,6 +2610,50 @@ def _task_text(args):
     return text
 
 
+def _profile_payload(profile):
+    return {key: profile[key] for key in ('requested_engine', 'requested_tier', 'model', 'reasoning_effort',
+                                          'declared_effort', 'effective_effort', 'selected_tier', 'tier_reason',
+                                          'profile_source', 'effort_source', 'quota_status')} | {'execution_profile': profile}
+
+
+def _run_cli_gate(args, root, requested_target, text, caller, engine, backends, scopes, profile, kind, estimated_tokens, batch):
+    receipts = []
+    current = profile
+    prefix, _ = _engine_parts(engine)
+    retry_on_failure = (args.tier == 'auto' and profile['tier'] not in ('max', 'ultra')
+                        and not profile['tier_reason'].startswith('user_description_'))
+
+    def variant_key(selected):
+        return (selected['spec'], selected['cli_effort'], selected['capacity']['cli_context_window_tokens'])
+
+    def worker(prompt, number):
+        nonlocal current
+        previous = current
+        if number == 2 and retry_on_failure:
+            candidate = _planned_profile(args, backends, engine, 'max', 'gate_retry_escalated_max', text, kind, estimated_tokens)
+            old = previous.get('declared_effort')
+            new = candidate.get('declared_effort')
+            if (not candidate.get('execution_blocked_reason') and variant_key(candidate) != variant_key(previous)
+                    and new in EFFORT_LADDER and (old is None or EFFORT_LADDER.index(new) > EFFORT_LADDER.index(old))):
+                current = candidate
+        invocation = {}
+        entry = {'execution_profile': current, 'invocation': invocation, 'variant_changed': variant_key(current) != variant_key(previous)}
+        receipts.append(entry)
+        return invoke_edit_worker(current['spec'], root, prompt, backends, args.timeout, current['cli_effort'], args.retry_quota,
+                                  profile=current, batch=batch, receipt=invocation)
+
+    result = run_physics_gate_loop(root, f'任务目标 {requested_target}。\n' + text, args.verify_cmd, worker,
+                                   max_rounds=args.max_rounds, caller=caller, timeout_sec=args.timeout, write_scope=scopes)
+    for entry, receipt in zip(result['history'], receipts):
+        entry.update(receipt)
+        entry['escalated'] = receipt['variant_changed'] and bool(receipt['invocation'].get('invocation_started'))
+    last = next((entry['execution_profile'] for entry in reversed(result['history'])
+                 if entry.get('invocation', {}).get('invocation_started')), profile)
+    result.update(_profile_payload(last))
+    result['quota_status'] = backends.get(prefix, {}).get('quota_status', last['quota_status'])
+    return result
+
+
 def cmd_gate(args):
     requested_target, root = _target(args)
     text = _task_text(args)
@@ -1999,43 +2663,24 @@ def cmd_gate(args):
     scopes = _scope_patterns(args.write_scope)
     file_count, est_tokens = _target_metrics(requested_target, text)
     tier, tier_reason = select_task_tier(args.tier, 'gate', text, file_count, est_tokens)
-    _ensure_live_agy_catalog(args, backends, (engine,))
-    profile = resolve_execution_profile(backends, engine, tier, text, kind='gate', estimated_tokens=est_tokens)
-    retry_profile = (resolve_execution_profile(backends, engine, 'max', text, kind='gate', estimated_tokens=est_tokens)
-                     if args.tier == 'auto' and tier not in ('max', 'ultra') else profile)
+    batch = _QuotaBatch(args.retry_quota)
+    meta = {'caller': caller, 'handoff_to_caller': True, 'engine': engine, 'worker_engine': engine,
+            'requested_tier': args.tier, 'selected_tier': tier, 'tier_reason': tier_reason,
+            'target': str(root), 'requested_target': str(requested_target)}
+    try:
+        _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
+    except HarnessError as exc:
+        return _print({'status': exc.status, **meta, 'error': str(exc), **exc.details})
+    profile = _planned_profile(args, backends, engine, tier, tier_reason, text, 'gate', est_tokens)
     if args.dry_run:
         prefix, _ = _engine_parts(engine)
-        return _print({'status': 'ok', 'dry_run': True, 'caller': caller, 'handoff_to_caller': True,
-                       'worker_engine': engine, 'model': profile['model'], 'reasoning_effort': profile['reasoning_effort'],
-                       'selected_tier': tier, 'tier_reason': tier_reason, 'profile_source': profile['profile_source'],
-                       'effort_source': profile['effort_source'],
-                       'quota_status': backends.get(prefix, {}).get('quota_status', 'unknown_until_called'),
+        return _print({'status': 'ok', 'dry_run': True, **meta, **_profile_payload(profile),
                        'quota_cooldown': backends.get(prefix, {}).get('quota_cooldown'),
                        'work_dir': str(root), 'verify_cmd': args.verify_cmd, 'write_scope': scopes, 'max_rounds': args.max_rounds})
     _require_execution_profile(profile)
-    try:
-        _enforce_preflight_quota(backends, (engine,), args.retry_quota)
-    except HarnessError as exc:
-        return _print({'status': exc.status, 'caller': caller, 'handoff_to_caller': True, 'engine': engine,
-                       'model': profile['model'], 'reasoning_effort': profile['reasoning_effort'],
-                       'selected_tier': tier, 'tier_reason': tier_reason, 'target': str(root),
-                       'requested_target': str(requested_target), 'error': str(exc), **exc.details})
     base = _git_head(root)
-
-    def _gate_worker(prompt, number):
-        active = retry_profile if number >= 2 else profile
-        _require_execution_profile(active)
-        return invoke_edit_worker(active['spec'], root, prompt, backends, args.timeout, active['cli_effort'], args.retry_quota)
-
-    result = run_physics_gate_loop(root, f'任务目标 {requested_target}。\n' + text, args.verify_cmd,
-                                   _gate_worker,
-                                   max_rounds=args.max_rounds, caller=caller, timeout_sec=args.timeout, write_scope=scopes)
-    final_prof = retry_profile if result.get('rounds_used', 1) >= 2 else profile
-    result.update(engine=engine, model=final_prof['model'], reasoning_effort=final_prof['reasoning_effort'],
-                  selected_tier=final_prof['tier'], tier_reason=('gate_retry_escalated_max' if final_prof is not profile else tier_reason),
-                  profile_source=final_prof['profile_source'], effort_source=final_prof['effort_source'], target=str(root),
-                  requested_target=str(requested_target), base_commit=base)
-    return _print(result)
+    result = _run_cli_gate(args, root, requested_target, text, caller, engine, backends, scopes, profile, 'gate', est_tokens, batch)
+    return _print({**meta, **result, 'base_commit': base})
 
 
 def cmd_task(args):
@@ -2055,48 +2700,25 @@ def cmd_task(args):
             raise HarnessError('当前 HEAD 与 --base-commit 不一致')
     file_count, est_tokens = _target_metrics(requested_target, text)
     tier, tier_reason = select_task_tier(args.tier, args.kind, text, file_count, est_tokens)
-    _ensure_live_agy_catalog(args, backends, (engine,))
-    profile = resolve_execution_profile(backends, engine, tier, text, kind=args.kind, estimated_tokens=est_tokens)
-    prefix, _ = _engine_parts(engine)
+    batch = _QuotaBatch(args.retry_quota)
     payload = {'kind': args.kind, 'caller': caller, 'handoff_to_caller': True, 'engine': engine,
-               'model': profile['model'], 'reasoning_effort': profile['reasoning_effort'],
-               'selected_tier': tier, 'tier_reason': tier_reason, 'profile_source': profile['profile_source'],
-               'effort_source': profile['effort_source'],
-               'quota_status': backends.get(prefix, {}).get('quota_status', 'unknown_until_called'),
+               'requested_tier': args.tier, 'selected_tier': tier, 'tier_reason': tier_reason,
                'target': str(root), 'requested_target': str(requested_target), 'base_commit': base,
                'readonly': readonly, 'write_scope': scopes}
-    if args.dry_run:
-        return _print({'status': 'ok', 'dry_run': True, 'quota_cooldown': backends.get(prefix, {}).get('quota_cooldown'), **payload})
-    _require_execution_profile(profile)
     try:
-        _enforce_preflight_quota(backends, (engine,), args.retry_quota)
+        _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
     except HarnessError as exc:
         return _print({'status': exc.status, **payload, 'result': {}, 'changed_files': [], 'scope_violations': [],
                        'error': str(exc), **exc.details})
+    profile = _planned_profile(args, backends, engine, tier, tier_reason, text, args.kind, est_tokens)
+    prefix, _ = _engine_parts(engine)
+    payload.update(_profile_payload(profile))
+    if args.dry_run:
+        return _print({'status': 'ok', 'dry_run': True, 'quota_cooldown': backends.get(prefix, {}).get('quota_cooldown'), **payload})
+    _require_execution_profile(profile)
     if args.kind == 'code' and args.verify_cmd:
-        retry_profile = (resolve_execution_profile(backends, engine, 'max', text, kind='code', estimated_tokens=est_tokens)
-                         if args.tier == 'auto' and tier not in ('max', 'ultra') else profile)
-
-        def _task_worker(prompt, number):
-            active = retry_profile if number >= 2 else profile
-            _require_execution_profile(active)
-            return invoke_edit_worker(active['spec'], root, prompt, backends, args.timeout,
-                                      active['cli_effort'], args.retry_quota)
-
-        result = run_physics_gate_loop(
-            root, f'任务目标 {requested_target}。\n' + text, args.verify_cmd,
-            _task_worker,
-            max_rounds=args.max_rounds, caller=caller, timeout_sec=args.timeout, write_scope=scopes,
-        )
-        final_prof = retry_profile if result.get('rounds_used', 1) >= 2 else profile
-        payload.update(
-            model=final_prof['model'], reasoning_effort=final_prof['reasoning_effort'],
-            selected_tier=final_prof['tier'],
-            tier_reason=('gate_retry_escalated_max' if final_prof is not profile else tier_reason),
-            profile_source=final_prof['profile_source'],
-            effort_source=final_prof['effort_source'],
-            quota_status=backends.get(prefix, {}).get('quota_status', payload['quota_status']),
-        )
+        result = _run_cli_gate(args, root, requested_target, text, caller, engine, backends, scopes,
+                               profile, args.kind, est_tokens, batch)
         return _print({**payload, **result})
     before = snapshot_files(root)
     rel_hint = f'（相对路径: {requested_target.relative_to(root).as_posix()}）' if requested_target != root else ''
@@ -2105,10 +2727,11 @@ def cmd_task(args):
               + '严禁在目标工作目录外创建、修改或删除任何文件或目录（含严禁向目录外执行 git worktree add）。'
               + '不要调用本编排器，不要修改其他会话或全局配置。\n' + text
               + '\n按给定 JSON Schema 返回正文、证据及未验证事项。')
-    result, error, status = {}, {}, 'ok'
+    result, error, status, invocation = {}, {}, 'ok', {}
     try:
         result = invoke_engine(profile['spec'], root, prompt, backends, TASK_JSON_SCHEMA,
-                               readonly, args.timeout, 'readonly-collaborator', None, profile['cli_effort'], args.retry_quota)
+                               readonly, args.timeout, 'readonly-collaborator', None, profile['cli_effort'], args.retry_quota,
+                               profile=profile, batch=batch, receipt=invocation)
     except Exception as exc:
         status = getattr(exc, 'status', 'failed')
         error = {'error': str(exc), **getattr(exc, 'details', {})}
@@ -2117,7 +2740,7 @@ def cmd_task(args):
     payload['quota_status'] = backends.get(prefix, {}).get('quota_status', payload['quota_status'])
     if scope['scope_violations']:
         status = 'scope_violation'
-    return _print({'status': status, **payload, 'result': result, **error, **scope})
+    return _print({'status': status, **payload, 'invocation': invocation, 'result': result, **error, **scope})
 
 
 def _positive_arg(raw):

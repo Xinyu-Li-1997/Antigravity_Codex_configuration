@@ -22,6 +22,7 @@ import os
 import posixpath
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -336,10 +337,13 @@ def _load_guard_state(state_file: Path, conversation_id: str) -> Dict[str, Any]:
     if state_file.exists():
         try:
             data = json.loads(state_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
+            if (isinstance(data, dict) and data.get("version") == 2
+                    and data.get("conversationId") == conversation_id and isinstance(data.get("records"), dict)):
                 return data
-        except Exception:
-            pass
+            raise ValueError("轮询状态格式或会话身份错误")
+        except (ValueError, OSError) as exc:
+            log_event("PreToolUse:poll_state_error", conversation_id, f"轮询状态读取失败（{exc}），保留原文件")
+            raise
     return {"version": 2, "conversationId": conversation_id, "records": {}}
 
 
@@ -383,18 +387,6 @@ _INSTALLER_INVOKE_RE = re.compile(
     r"(?:(?:wsl(?:\.exe)?|bash|sh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?|"
     r"python[0-9.]*(?:\.exe)?|py(?:\.exe)?\s+-3)\b[^\r\n;|&]*?[\s\"'\\/]+|(?:\.[\\/]))"
     r"(?<![A-Za-z0-9_.-])install\.(?:py|ps1|sh)\b\"?'?([^\r\n;|&]*)",
-    re.IGNORECASE,
-)
-
-# 宿主对话记忆、子代理轨迹、制品草稿与标准工具缓存区（非用户项目盘垃圾，亦非全局核心配置文件）
-_HOST_MEMORY_OR_CACHE_RE = re.compile(
-    r"^/(?:mnt/[a-z]/)?(?:home|users)/[^/]+/(?:"
-    r"\.gemini/antigravity/(?:brain|plugin_data|conversations|annotations|knowledge|scratch|sidecar_data|cache|log)|"
-    r"\.gemini/(?:logs|sandbox)|"
-    r"\.gemini/antigravity-cli/(?:cache|logs)|"
-    r"\.codex/(?:memories|sessions|cache|tmp|\.tmp|sqlite|attachments|visualizations)|"
-    r"\.cache"
-    r")(?:/|$)",
     re.IGNORECASE,
 )
 
@@ -526,20 +518,78 @@ def _is_under_norm_key(target_key: str, root_key: str) -> bool:
 
 
 def _is_standard_os_temp_key(norm_key: str) -> bool:
-    low = norm_key.lower()
-    if low in ("/tmp", "/var/tmp", "/private/tmp") or low.startswith(("/tmp/", "/var/tmp/", "/private/tmp/")):
-        return True
-    if "/appdata/local/temp" in low:
-        idx = low.find("/appdata/local/temp")
-        tail = low[idx + len("/appdata/local/temp") :]
-        if not tail or tail.startswith("/"):
+    root = _normalize_cross_env_lexical(tempfile.gettempdir())
+    return _is_under_norm_key(norm_key, root)
+
+
+WSL_TEMP_CHECK = """
+import json, os, sys, tempfile
+from pathlib import Path
+
+targets = json.load(sys.stdin)
+runtime_root = tempfile.gettempdir()
+allowed = []
+if runtime_root == "/tmp" and Path(runtime_root).resolve() == Path(runtime_root):
+    for raw in targets:
+        normalized = os.path.normpath(raw)
+        resolved = Path(raw).resolve()
+        if (normalized.startswith("/tmp/") and resolved != Path(runtime_root)
+                and resolved.is_relative_to(runtime_root)):
+            allowed.append(raw)
+print(json.dumps(allowed))
+"""
+
+
+def _is_wsl_standard_temp_path(target: str, distribution: str) -> bool:
+    """在选定的本机 WSL 发行版核对标准 /tmp 的物理位置。"""
+    if (os.name != "nt" or not target.startswith("/tmp/")
+            or not re.fullmatch(r"/tmp/[A-Za-z0-9_./ +@=-]+", target)):
+        return False
+    # 固定入口与代码，待检查路径仅以 stdin 数据传递。Windows 宿主命令不会经此路径执行。
+    executable = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "wsl.exe"
+    selector = ["-d", distribution] if distribution else []
+    try:
+        result = subprocess.run(
+            [str(executable), *selector, "--exec", "/usr/bin/python3", "-B", "-I", "-c", WSL_TEMP_CHECK],
+            input=json.dumps([target]).encode("utf-8"), capture_output=True, timeout=2,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return result.returncode == 0 and json.loads(result.stdout) == [target]
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return False
+
+
+def _wsl_command_prefix(command: str) -> Optional[Tuple[str, str]]:
+    """只识别明确的本机 WSL 前缀，保留发行版与内层原文。"""
+    prefix = re.match(
+        r"""^\s*(?:wsl(?:\.exe)?)\s+"""
+        r"""(?:(?:-d|--distribution)\s+(?:"([A-Za-z0-9][A-Za-z0-9_.-]{0,63})"|"""
+        r"""([A-Za-z0-9][A-Za-z0-9_.-]{0,63}))\s+)?"""
+        r"""(?:(?:--exec|-e|--)\s+)?(?=\S)(?!-)""",
+        command, re.IGNORECASE,
+    )
+    if not prefix:
+        return None
+    return prefix[1] or prefix[2] or "", command[prefix.end():]
+
+
+def _outer_shell_operators(command: str) -> bool:
+    """检测由 Windows 外层 shell 消费的控制或重定向符号。"""
+    quote = ""
+    escaped = False
+    for char in command:
+        if escaped:
+            escaped = False
+        elif char == chr(96) or (quote and char == "\\"):
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char in ";|&><\r\n()":
             return True
-    return False
-
-
-def _is_ephemeral_memory_or_cache_key(norm_key: str) -> bool:
-    """判定路径是否属于宿主对话记忆、子代理制品草稿或标准缓存目录（允许写入，不属于在项目外乱生垃圾文件）"""
-    return bool(_HOST_MEMORY_OR_CACHE_RE.match(norm_key))
+    return bool(quote or escaped)
 
 
 def _resolve_nearest_existing(raw_str: str, base_dir: Optional[str]) -> Optional[Path]:
@@ -567,7 +617,7 @@ def _resolve_nearest_existing(raw_str: str, base_dir: Optional[str]) -> Optional
 
     try:
         return p.resolve()
-    except OSError:
+    except (OSError, RuntimeError):
         return None
 
 
@@ -590,32 +640,32 @@ def _collect_boundary_context(
     if not raw_projects:
         return [], [], [], "", cwd_raw or None
 
-    base_cwd = cwd_raw or raw_projects[0]
+    tool_call = payload.get("toolCall")
+    args = tool_call.get("args") if isinstance(tool_call, dict) else None
+    command_cwd = args.get("Cwd") if isinstance(args, dict) and tool_call.get("name") == "run_command" else None
+    base_cwd = str(command_cwd or cwd_raw or raw_projects[0])
     project_norm_keys = [k for k in (_normalize_cross_env_lexical(p) for p in raw_projects) if k]
     workspace_in_os_temp = any(_is_standard_os_temp_key(pk) for pk in project_norm_keys)
 
     home_p = Path.home()
+    codex_home = Path(os.environ.get("CODEX_HOME") or home_p / ".codex").expanduser()
+    gemini_home = home_p / ".gemini"
     internal_raw: List[str] = [
-        str(state_dir.parent),
-        str(logs_dir.parent),
-        str(home_p / ".gemini" / "antigravity" / "brain"),
-        str(home_p / ".gemini" / "antigravity" / "plugin_data"),
-        str(home_p / ".gemini" / "antigravity" / "conversations"),
-        str(home_p / ".gemini" / "antigravity" / "scratch"),
-        str(home_p / ".gemini" / "antigravity-cli" / "cache"),
-        str(home_p / ".codex" / "memories"),
-        str(home_p / ".codex" / "sessions"),
-        str(home_p / ".codex" / "cache"),
-        str(home_p / ".codex" / "tmp"),
-        str(home_p / ".codex" / ".tmp"),
+        str(state_dir),
+        str(logs_dir),
         str(home_p / ".cache"),
     ]
+    internal_raw.extend(str(codex_home / name) for name in (
+        "memories", "sessions", "cache", "tmp", ".tmp", "sqlite", "attachments", "visualizations",
+    ))
+    for host in ("antigravity", "antigravity-cli", "antigravity-ide"):
+        internal_raw.extend(str(gemini_home / host / name) for name in (
+            "brain", "plugin_data", "conversations", "annotations", "knowledge", "scratch",
+            "sidecar_data", "cache", "log", "logs",
+        ))
+    internal_raw.extend(str(gemini_home / name) for name in ("logs", "sandbox"))
     if not workspace_in_os_temp:
         internal_raw.append(tempfile.gettempdir())
-        for env_k in ("TEMP", "TMP", "TMPDIR"):
-            env_v = os.environ.get(env_k, "").strip()
-            if env_v:
-                internal_raw.append(env_v)
 
     art_dir = str(payload.get("artifactDirectoryPath") or "").strip()
     if art_dir:
@@ -629,19 +679,24 @@ def _collect_boundary_context(
         if idx > 0:
             internal_raw.append(tp_raw[:idx])
 
-    all_raw = raw_projects + internal_raw
     allowed_norm_keys: List[str] = []
     allowed_resolved_keys: List[str] = []
 
-    for item in all_raw:
+    for item in raw_projects + internal_raw:
         nk = _normalize_cross_env_lexical(item)
+        rp = _resolve_nearest_existing(item, None)
+        rk = _normalize_cross_env_lexical(str(rp)) if rp is not None else ""
+        if item in raw_projects:
+            if rk:
+                allowed_resolved_keys.append(rk)
+        elif rk and (rk == nk or (os.name != "nt" and nk == "/tmp" and rk == "/private/tmp")):
+            # macOS 的标准 /tmp 是 /private/tmp 的系统别名。
+            allowed_resolved_keys.append(rk)
+        else:
+            # 缓存、轨迹等目录只有物理位置与登记的标准目录一致时才适用例外。
+            continue
         if nk and nk not in allowed_norm_keys:
             allowed_norm_keys.append(nk)
-        rp = _resolve_nearest_existing(item, None)
-        if rp is not None:
-            rk = _normalize_cross_env_lexical(str(rp))
-            if rk and rk not in allowed_resolved_keys:
-                allowed_resolved_keys.append(rk)
 
     project_display = ", ".join(raw_projects)
     return project_norm_keys, allowed_norm_keys, allowed_resolved_keys, project_display, base_cwd
@@ -653,30 +708,31 @@ def _is_write_target_allowed(
     allowed_norm_keys: List[str],
     allowed_resolved_keys: List[str],
     allow_os_temp: bool = True,
+    wsl_distribution: Optional[str] = None,
 ) -> bool:
     cleaned = raw_target.strip().strip("\"'`;,)")
     if not cleaned or cleaned.lower() in _NULL_SINKS:
         return True
-    if _LOCAL_VAR_TOKEN_RE.search(cleaned):
+    if _LOCAL_VAR_TOKEN_RE.fullmatch(cleaned):
         return True
 
     lex_key = _normalize_cross_env_lexical(cleaned, base_cwd)
     if not lex_key:
         return True
-    if (allow_os_temp and _is_standard_os_temp_key(lex_key)) or _is_ephemeral_memory_or_cache_key(lex_key):
-        return True
     if not any(_is_under_norm_key(lex_key, rk) for rk in allowed_norm_keys):
-        return False
+        return (wsl_distribution is not None and allow_os_temp
+                and _is_wsl_standard_temp_path(cleaned, wsl_distribution))
 
     # 若本地文件系统可解析真实路径，校验是否存在软链接/目录联接逃逸到允许目录外
     resolved_p = _resolve_nearest_existing(cleaned, base_cwd)
+    if resolved_p is None:
+        # 仅保留当前进程无法物理访问的原生 POSIX 项目路径的跨端词法比较。
+        expanded = _expand_host_vars(cleaned)
+        if os.name != "nt" or not expanded.startswith("/") or re.match(r"^/mnt/[A-Za-z](?:/|$)", expanded):
+            return False
     if resolved_p is not None and allowed_resolved_keys:
         res_key = _normalize_cross_env_lexical(str(resolved_p))
-        if (
-            not (allow_os_temp and _is_standard_os_temp_key(res_key))
-            and not _is_ephemeral_memory_or_cache_key(res_key)
-            and not any(_is_under_norm_key(res_key, ark) for ark in allowed_resolved_keys)
-        ):
+        if not any(_is_under_norm_key(res_key, ark) for ark in allowed_resolved_keys):
             return False
     return True
 
@@ -844,6 +900,7 @@ def _scan_inline_python_code(
     allowed_resolved_keys: List[str],
     allow_os_temp: bool,
     depth: int = 0,
+    wsl_distribution: Optional[str] = None,
 ) -> Optional[Tuple[str, str, str]]:
     """使用 AST 精确识别内联 Python 脚本中真正发生写/删/改的外部路径（忽略一切只读 open 与数组 .copy()）"""
     candidates = [py_code]
@@ -863,7 +920,8 @@ def _scan_inline_python_code(
     def _bad(target: Optional[str]) -> bool:
         return bool(
             target
-            and not _is_write_target_allowed(target, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp)
+            and not _is_write_target_allowed(target, base_cwd, allowed_norm_keys, allowed_resolved_keys,
+                                             allow_os_temp, wsl_distribution)
         )
 
     if tree is not None:
@@ -975,7 +1033,8 @@ def _scan_inline_python_code(
                             sub_cmd = " ".join(f'"{t}"' if " " in t else t for t in toks)
                     if sub_cmd:
                         sub_hit = _detect_command_external_mutation(
-                            sub_cmd, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth + 1
+                            sub_cmd, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
+                            depth + 1, wsl_distribution,
                         )
                         if sub_hit:
                             return sub_hit
@@ -1092,6 +1151,7 @@ def _detect_command_external_mutation(
     allowed_resolved_keys: List[str],
     allow_os_temp: bool = True,
     depth: int = 0,
+    wsl_distribution: Optional[str] = None,
 ) -> Optional[Tuple[str, str, str]]:
     """
     精准检测命令行是否改动项目目录外的业务路径或全局配置。
@@ -1099,6 +1159,13 @@ def _detect_command_external_mutation(
     """
     if not command_line or not command_line.strip() or depth > 3:
         return None
+
+    wsl_prefix = _wsl_command_prefix(command_line) if os.name == "nt" else None
+    if wsl_prefix and not _outer_shell_operators(wsl_prefix[1]):
+        distribution, inner = wsl_prefix
+        return _detect_command_external_mutation(
+            inner, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth + 1, distribution,
+        )
 
     sanitized = _COMMIT_MSG_RE.sub(r'\1"__COMMIT_MSG__"', command_line)
 
@@ -1118,7 +1185,7 @@ def _detect_command_external_mutation(
             wt_path = tok
             break
         if wt_path and not _is_write_target_allowed(
-            wt_path, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp
+            wt_path, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
         ):
             return "创建项目外 Git 工作树 (git worktree add)", wt_path, _compact_snippet(m_wt.group(0))
 
@@ -1137,13 +1204,13 @@ def _detect_command_external_mutation(
         codex_home_val = _extract_flag_value(arg_tokens, "--codex-home")
         if (target_dir_val or codex_home_val) and "--no-zotero" in lower_tokens:
             td_ok = (not target_dir_val) or _is_write_target_allowed(
-                target_dir_val, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp
+                target_dir_val, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
             )
             sd_ok = (not skills_dir_val) or _is_write_target_allowed(
-                skills_dir_val, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp
+                skills_dir_val, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
             )
             ch_ok = (not codex_home_val) or _is_write_target_allowed(
-                codex_home_val, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp
+                codex_home_val, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
             )
             if td_ok and sd_ok and ch_ok:
                 continue
@@ -1153,18 +1220,19 @@ def _detect_command_external_mutation(
             _compact_snippet(m_inst.group(0)),
         )
 
-    # 3. 若整条命令被 wsl/bash/powershell -c 包装，先递归拆壳检查内层脚本
+    # 3. 若整条命令被 shell 包装，拆壳检查内层脚本，同时保留已确认的 WSL 作用域。
     unwrapped = _unwrap_shell_script_layer(sanitized)
     if unwrapped:
         return _detect_command_external_mutation(
-            unwrapped, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth + 1
+            unwrapped, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp,
+            depth + 1, wsl_distribution,
         )
 
     # 4. 提取并用 AST 精确扫描所有内联 Python 代码块（掩码替换后不再污染外层 Shell 扫描）
     py_blocks, shell_masked = _extract_and_mask_inline_python(sanitized)
     for block in py_blocks:
         py_hit = _scan_inline_python_code(
-            block, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth
+            block, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, depth, wsl_distribution
         )
         if py_hit:
             return py_hit
@@ -1180,7 +1248,7 @@ def _detect_command_external_mutation(
             check_list = parts[:2]
         for cand in check_list:
             if _looks_like_explicit_or_escaped_path(cand) and not _is_write_target_allowed(
-                cand, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp
+                cand, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
             ):
                 return f".NET 文件写删操作 ([IO.{cls_name}]::{method_name})", cand, _compact_snippet(m_net.group(0))
 
@@ -1188,7 +1256,7 @@ def _detect_command_external_mutation(
     for m_red in _SHELL_REDIRECT_RE.finditer(shell_masked):
         op, red_tok = m_red.group(1), m_red.group(2).strip().strip("\"'")
         if _looks_like_explicit_or_escaped_path(red_tok) and not _is_write_target_allowed(
-            red_tok, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp
+            red_tok, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
         ):
             return f"Shell 输出重定向写入 ({op})", red_tok, _compact_snippet(m_red.group(0))
 
@@ -1271,8 +1339,14 @@ def _detect_command_external_mutation(
             for cand in targets:
                 if not cand or cand.startswith("$") and not cand.lower().startswith(("$home", "${home}", "$env:")):
                     continue
+                command_distribution = wsl_distribution
+                if wsl_distribution is not None and any(
+                    Path(tok.replace("\\", "/")).name.casefold() in REMOTE_OR_SUBSYSTEM_WRAPPERS | {"chroot", "nsenter"}
+                    for tok in tokens[:idx + 1]
+                ):
+                    command_distribution = None
                 if not _is_write_target_allowed(
-                    cand, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp
+                    cand, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, command_distribution
                 ):
                     return action_label, cand, _compact_snippet(clause)
 
@@ -1318,17 +1392,18 @@ def _build_boundary_violation_response(
 def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
     """处理 PreToolUse 门禁请求"""
     conversation_id = str(payload.get("conversationId") or "unknown_session").strip()
-    cwd = payload.get("cwd")
     workspace_paths = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else []
     transcript_path_str = payload.get("transcriptPath")
 
     tool_call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
-    tool_name = str(tool_call.get("name") or tool_call.get("tool_name") or "").strip()
+    raw_tool_name = str(tool_call.get("name") or tool_call.get("tool_name") or "").strip()
+    tool_name = handoff_gate.AGY_TOOL_ALIASES.get(raw_tool_name, raw_tool_name)
     args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
 
+    cwd = (args.get("Cwd") if tool_name == "run_command" else None) or payload.get("cwd")
     state_dir, logs_dir = get_data_dirs()
-    state_file = state_dir / f"{conversation_id}_status_guard.json"
 
+    boundary: Optional[Dict[str, Any]] = None
     # 分支 0: 项目目录外文件改动硬边界门禁 (R4: write_file / edit_file / run_command)
     if tool_name in ("write_file", "edit_file", "run_command"):
         proj_keys, allowed_keys, allowed_res_keys, proj_display, base_cwd = _collect_boundary_context(
@@ -1353,7 +1428,7 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                         act = f"创建或覆写项目外文件 (write_file, {len(str(args.get('Content') or ''))} 字符)"
                     meta = args.get("ArtifactMetadata") if isinstance(args.get("ArtifactMetadata"), dict) else {}
                     summary_txt = str(meta.get("Summary") or "").splitlines()[0].strip() if meta.get("Summary") else ""
-                    return _build_boundary_violation_response(
+                    boundary = _build_boundary_violation_response(
                         tool_name, act, write_arg, proj_display, conversation_id, tool_summary=summary_txt
                     )
             else:
@@ -1364,7 +1439,7 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 if ext_hit:
                     act_desc, ext_target, clause_snip = ext_hit
-                    return _build_boundary_violation_response(
+                    boundary = _build_boundary_violation_response(
                         tool_name,
                         act_desc,
                         ext_target,
@@ -1374,10 +1449,30 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                         snippet=clause_snip,
                     )
 
-    # 分支 0.5: 反重力专有长会话“原子收口 + 交接停机”硬门禁
-    gate_resp = handoff_gate.check_pre_tool_use(payload, state_dir)
-    if gate_resp is not None:
-        return gate_resp
+    try:
+        with user_words.session_state_lock(state_dir, conversation_id):
+            gate_response = handoff_gate.check_pre_tool_use_locked(payload, state_dir, boundary_blocked=boundary is not None)
+            if gate_response is not None:
+                return gate_response
+            if boundary is not None:
+                return boundary
+            try:
+                return _check_polling_locked(tool_name, args, conversation_id, cwd, workspace_paths, transcript_path_str,
+                                             state_dir, logs_dir)
+            except (OSError, ValueError) as exc:
+                log_event("PreToolUse:poll_state_error", conversation_id, f"轮询状态未更新（{exc}）")
+                return {"decision": "allow"}
+    except (OSError, ValueError) as exc:
+        log_event("PreToolUse:state_error", conversation_id, f"工具门禁状态未更新（{exc}）")
+        if (state_dir / f"{conversation_id}_handoff_gate.json").exists():
+            return {"decision": "deny", "reason": "【user-guard】无法核实会话交接阶段。请重试该工具或直接收尾。"}
+        return boundary or {"decision": "allow"}
+
+
+def _check_polling_locked(tool_name: str, args: Dict[str, Any], conversation_id: str, cwd: Optional[str],
+                          workspace_paths: List[str], transcript_path_str: Optional[str], state_dir: Path,
+                          logs_dir: Path) -> Dict[str, Any]:
+    state_file = state_dir / f"{conversation_id}_status_guard.json"
 
     # 分支 1: read_file 或 run_command 访问证据文件
     if tool_name in ("read_file", "run_command"):
@@ -1386,7 +1481,7 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
         is_subsystem_cmd = False
 
         if tool_name == "read_file":
-            file_arg = str(args.get("Path") or args.get("path") or "").strip()
+            file_arg = str(args.get("AbsolutePath") or args.get("Path") or args.get("path") or "").strip()
             if not file_arg or not is_evidence_file(file_arg):
                 return {"decision": "allow"}
             raw_target = file_arg
