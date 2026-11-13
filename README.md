@@ -104,6 +104,8 @@ cd Antigravity_Codex_configuration
 
 ## 五、 沙箱验证与调试命令参考
 
+`v1.5.0` 的 Windows Codex 提醒、低阈值自动压缩事件链、跨进程续接及隔离严格模式已完成真实会话验收；适用范围与证据层级见[实机验收记录](docs/架构设计与生命周期钩子规范.md)。生产默认仍为 `advisory`。
+
 修改仓库源码后，须先在临时目录验证单端与双端沙箱安装及全量测试；向项目外全局生产目录部署前，须按 R4 列出拟写入路径并获用户批准（完整协作参数见[共享技能说明](template/user-guard/skills/cae-harness/SKILL.md)）：
 
 ```sh
