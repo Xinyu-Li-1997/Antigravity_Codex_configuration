@@ -123,13 +123,13 @@ def _read_json_object(path: Path, raw: Optional[bytes]) -> Dict[str, Any]:
 def _plan_user_zotero(config_root: Path, zotero_exe: Optional[str]) -> Optional[FileChange]:
     path = config_root / "mcp_config.json"
     _validate_path(path, directory=False)
+    if not zotero_exe:
+        return None
     raw = _read_optional_bytes(path)
     data = _read_json_object(path, raw)
     servers = data.setdefault("mcpServers", {})
     if not isinstance(servers, dict) or any(not isinstance(server, dict) for server in servers.values()):
         raise ValueError(f"{path} 的 mcpServers 及各服务器条目必须为对象，原文件已保留。")
-    if not zotero_exe:
-        return None
     if servers.get("zotero"):
         print("[*] 保留反重力已配置的 Zotero MCP。")
         return None
@@ -956,37 +956,39 @@ def _sync_codex_workspace_boundary(codex_root: Path, dry_run: bool = False) -> N
 
 
 def _sync_codex_global_rules(template_rules_path: Path, codex_root: Path, dry_run: bool = False) -> None:
-    """将模板 R0-R9 全局核心总纲无损同步至 <codex_root>/AGENTS.md，完整保留用户自定义的『## 工具与...』本机硬件与环境说明段。"""
+    """将模板 R0-R9 全局核心总纲同步至 <codex_root>/AGENTS.md；若用户自定义了『## 工具与本机』等非默认尾段则原样保留。"""
     if not template_rules_path.is_file():
         return
     try:
-        template_text = template_rules_path.read_text(encoding="utf-8")
+        template_text = template_rules_path.read_text(encoding="utf-8").replace("\r\n", "\n")
     except Exception:
         return
 
-    m_tpl_env = re.search(r"\n##\s+工具与[^\r\n]*[\s\S]*$", template_text)
+    env_sec_re = re.compile(r"(?:^|\n)(##\s+工具与([^\r\n]*)[\s\S]*)$")
+    m_tpl_env = env_sec_re.search(template_text)
     template_core = template_text[: m_tpl_env.start()].rstrip() if m_tpl_env else template_text.rstrip()
 
     codex_agents = codex_root / "AGENTS.md"
     original = _read_optional_bytes(codex_agents)
     existing = (original or b"").decode("utf-8").replace("\r\n", "\n")
 
-    m_usr_env = re.search(r"\n##\s+工具与[^\r\n]*[\s\S]*$", existing) if existing else None
-    if m_usr_env:
-        merged = template_core + "\n\n" + m_usr_env.group(0).strip() + "\n"
+    m_usr_env = env_sec_re.search(existing) if existing else None
+    has_custom_env = bool(m_usr_env and m_usr_env.group(2).strip() != "运行环境")
+    if has_custom_env and m_usr_env is not None:
+        merged = (template_core + "\n\n" + m_usr_env.group(1).strip() + "\n") if template_core else (m_usr_env.group(1).strip() + "\n")
     else:
         merged = template_text.rstrip() + "\n"
 
     if existing == merged:
-        print("[*] Codex 全局规则 AGENTS.md 已对齐最新总纲（保留本机环境段）。")
+        print("[*] Codex 全局规则 AGENTS.md 已是最新状态。")
         return
 
     if dry_run:
-        print(f"[Dry-Run] 将同步更新 {codex_agents} 全局核心总纲 R0-R9（保留本机环境段）")
+        print(f"[Dry-Run] 将同步更新 {codex_agents} 全局规则")
         return
 
     _atomic_write(FileChange(codex_agents, original, merged.encode("utf-8")))
-    print(f"[+] 已同步更新 Codex 全局规则 {codex_agents}（保留本机环境段）")
+    print(f"[+] 已同步更新 Codex 全局规则 {codex_agents}")
 
 
 def _sync_codex_agents(codex_template_dir: Path, codex_root: Path, dry_run: bool = False) -> None:
@@ -1422,20 +1424,26 @@ def mirror_sync_plugin(
     """
     files = _template_files(template_dir)
     expected_rel_files = {item.relative_to(template_dir) for item in files}
+    pending_updates: List[Tuple[Path, Path, Optional[bytes], bytes]] = []
+    for src in files:
+        rel = src.relative_to(template_dir)
+        dst = target_plugin_dir / rel
+        original = _read_optional_bytes(dst)
+        content = hooks_bytes if hooks_bytes is not None and rel == Path("hooks.json") else src.read_bytes()
+        if original != content:
+            pending_updates.append((src, rel, original, content))
 
     if dry_run:
-        print(f"[Dry-Run] 将同步 {len(expected_rel_files)} 个核心文件至: {target_plugin_dir}")
-        for rel in sorted(expected_rel_files):
-            print(f"  [SYNC] {rel}")
+        if pending_updates:
+            print(f"[Dry-Run] 将同步 {len(pending_updates)} 个变更文件至: {target_plugin_dir}")
+            for _src, rel, _orig, _content in pending_updates:
+                print(f"  [SYNC] {rel}")
+        else:
+            print(f"[*] 目录已是最新状态，无需写入: {target_plugin_dir}")
     else:
         target_plugin_dir.mkdir(parents=True, exist_ok=True)
-        for src in files:
-            rel = src.relative_to(template_dir)
+        for src, rel, original, content in pending_updates:
             dst = target_plugin_dir / rel
-            original = _read_optional_bytes(dst)
-            content = hooks_bytes if hooks_bytes is not None and rel == Path("hooks.json") else src.read_bytes()
-            if original == content:
-                continue
             dst.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write(FileChange(dst, original, content))
             if original is None:
@@ -1581,8 +1589,9 @@ def validate_codex_home_target(codex_home: Path, repo_root: Path) -> Path:
 
     if resolved == user_root or resolved in user_root.parents:
         raise ValueError(f"Codex 目标目录不能是用户主目录或上级系统目录: {resolved}")
-    if resolved in {user_root / ".gemini", user_root / ".gemini" / "config"}:
-        raise ValueError(f"Codex 目标目录不能与反重力插件宿主目录混用: {resolved}")
+    gemini_root = user_root / ".gemini"
+    if resolved == gemini_root or gemini_root in resolved.parents:
+        raise ValueError(f"Codex 目标目录不能与反重力配置目录混用: {resolved}")
     if resolved == repo_resolved or resolved in repo_resolved.parents or repo_resolved in resolved.parents:
         raise ValueError(f"Codex 目标目录与源码仓库重叠: {resolved}")
     return resolved
@@ -1760,6 +1769,8 @@ def main() -> None:
         parser.error("--app codex 模式下不应指定反重力 --target-dir")
     if args.app == "antigravity" and (args.codex_home or args.codex_skills_dir):
         parser.error("--app antigravity 模式下不应指定 --codex-home 或 --codex-skills-dir")
+    if args.app == "both" and bool(args.target_dir) != bool(args.codex_home or args.codex_skills_dir):
+        parser.error("--app both 指定自定义目标目录时，须同时提供反重力 --target-dir 与 Codex 目录参数，避免误改另一端真实主目录")
 
     repo_root = Path(__file__).resolve().parent
     template_dir = repo_root / "template" / "user-guard"
@@ -1830,6 +1841,9 @@ def main() -> None:
         agy_config_root = None
         if target_plugin_dir is not None:
             target_plugin_dir = validate_install_target(target_plugin_dir, repo_root)
+            for forbidden_codex in {default_codex_root.resolve(), (Path.home().resolve() / ".codex")}:
+                if target_plugin_dir == forbidden_codex or forbidden_codex in target_plugin_dir.parents:
+                    raise ValueError(f"反重力插件目标目录不能位于 Codex 配置目录内: {target_plugin_dir}")
             _validate_mirror(template_dir, target_plugin_dir)
             standard_layout = target_plugin_dir == target_plugin_dir.parent.parent / "plugins" / "user-guard"
             if zotero_exe and not standard_layout:

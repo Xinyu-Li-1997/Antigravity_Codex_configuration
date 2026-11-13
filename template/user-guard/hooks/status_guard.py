@@ -862,7 +862,7 @@ def _eval_ast_path_expr(node: ast.AST, bindings: Dict[str, str]) -> Optional[str
             return right
         if left and right:
             return left.rstrip("/\\") + "/" + right.lstrip("/\\")
-        return left or right
+        return left
     if isinstance(node, ast.Call):
         fn = node.func
         fn_name = ""
@@ -870,6 +870,8 @@ def _eval_ast_path_expr(node: ast.AST, bindings: Dict[str, str]) -> Optional[str
             fn_name = fn.id
         elif isinstance(fn, ast.Attribute):
             fn_name = fn.attr
+        if fn_name == "home" and isinstance(fn, ast.Attribute) and not node.args:
+            return "~"
         if fn_name in ("Path", "PurePath", "WindowsPath", "PosixPath", "expanduser", "abspath", "realpath") and node.args:
             subs = [_eval_ast_path_expr(a, bindings) for a in node.args]
             return _join_ast_path_parts([s for s in subs if s])
@@ -1102,11 +1104,21 @@ def _extract_clause_path_targets(tokens: List[str], copy_dest_only: bool = False
 
     positional: List[str] = []
     explicit_paths: List[str] = []
+    has_explicit_script = False
     idx = 1
     n = len(tokens)
     while idx < n:
         tok = tokens[idx]
         low = tok.lower()
+        if head_low in ("sed", "perl"):
+            if low in ("-e", "--expression", "-f", "--file"):
+                has_explicit_script = True
+                idx += 2
+                continue
+            if tok.startswith(("-e", "-f")) and not tok.startswith("--") and len(tok) > 2:
+                has_explicit_script = True
+                idx += 1
+                continue
         if low in _PS_NON_PATH_VALUE_FLAGS:
             idx += 2
             continue
@@ -1122,6 +1134,9 @@ def _extract_clause_path_targets(tokens: List[str], copy_dest_only: bool = False
             continue
         positional.append(tok)
         idx += 1
+
+    if head_low in ("sed", "perl") and not has_explicit_script and positional:
+        positional = positional[1:]
 
     all_paths = explicit_paths + positional
     if not copy_dest_only:
@@ -1142,6 +1157,24 @@ def _looks_like_explicit_or_escaped_path(tok: str) -> bool:
     if s.startswith("/") and not re.fullmatch(r"/[A-Za-z0-9?]", s):
         return True
     return False
+
+
+def _pos_inside_quotes(text: str, target_pos: int) -> bool:
+    in_single = False
+    in_double = False
+    idx = 0
+    limit = min(target_pos, len(text))
+    while idx < limit:
+        ch = text[idx]
+        if ch == "\\" and in_double and idx + 1 < limit:
+            idx += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        idx += 1
+    return in_single or in_double
 
 
 def _detect_command_external_mutation(
@@ -1252,8 +1285,10 @@ def _detect_command_external_mutation(
             ):
                 return f".NET 文件写删操作 ([IO.{cls_name}]::{method_name})", cand, _compact_snippet(m_net.group(0))
 
-    # 6. 检查外层 Shell 重定向 (> / >>) 的直接输出目标
+    # 6. 检查外层 Shell 重定向 (> / >>) 的直接输出目标（忽略位于引号字面量内的符号）
     for m_red in _SHELL_REDIRECT_RE.finditer(shell_masked):
+        if _pos_inside_quotes(shell_masked, m_red.start()):
+            continue
         op, red_tok = m_red.group(1), m_red.group(2).strip().strip("\"'")
         if _looks_like_explicit_or_escaped_path(red_tok) and not _is_write_target_allowed(
             red_tok, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution

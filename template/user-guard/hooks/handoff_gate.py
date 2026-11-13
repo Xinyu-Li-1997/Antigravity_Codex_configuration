@@ -1375,13 +1375,22 @@ def _reply_has_handoff_prompt(reply_text: str) -> bool:
     plain_lines = list(user_words.markdown_unquoted_lines(reply_text.strip()))
     for idx, line in enumerate(plain_lines):
         heading, *body = re.split(r"[:：]", line, maxsplit=1)
-        if not PROMPT_MARKER_RE.fullmatch(heading.strip("#*【】[] ")):
+        cleaned_heading = heading.strip("#*【】[] \t")
+        cleaned_heading = re.sub(
+            r"^(?:[-*+]\s+|\(?[0-9一二三四五六七八九十]+[.)、．]\s*)",
+            "",
+            cleaned_heading,
+        ).strip("#*【】[] \t")
+        if not PROMPT_MARKER_RE.fullmatch(cleaned_heading):
             continue
         if body and len(body[0].strip()) >= 15:
             return True
+        non_empty_seen = 0
         for pos in range(idx + 1, len(lines)):
             if not lines[pos].strip():
                 continue
+            if lines[pos].lstrip().startswith("#"):
+                break
             fence = user_words.MARKDOWN_FENCE_RE.match(lines[pos])
             if fence:
                 content = []
@@ -1391,7 +1400,13 @@ def _reply_has_handoff_prompt(reply_text: str) -> bool:
                         return len("\n".join(content).strip()) >= 15
                     content.append(body_line)
                 return False
-            return len(plain_lines[pos]) >= 15 and not lines[pos].lstrip().startswith(("#", ">"))
+            non_empty_seen += 1
+            candidate = plain_lines[pos].strip()
+            if len(candidate) >= 15 and not lines[pos].lstrip().startswith(">") and not candidate.endswith((":", "：")):
+                return True
+            if non_empty_seen <= 2 and candidate.endswith((":", "：")):
+                continue
+            break
     return False
 
 

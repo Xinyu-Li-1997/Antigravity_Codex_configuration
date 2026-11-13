@@ -1077,6 +1077,56 @@ class TestGuardsOffline(unittest.TestCase):
         self.assertEqual(call("finish", {})["decision"], "allow")
         self.assertEqual(call("write_to_file", {"TargetFile": str(outside.with_name("handoff.md"))})["decision"], "force_ask")
 
+    def test_14_sed_script_quoted_redirect_ast_home_handoff_heading_and_missing_full_tp(self) -> None:
+        import handoff_gate
+
+        project = self.tmp_root / "proj14"
+        project.mkdir()
+        (project / "local.txt").write_text("foo\nbar\n", encoding="utf-8")
+        base_payload = {"conversationId": "guard-14", "cwd": str(project), "workspacePaths": [str(project)]}
+
+        def run_cmd(cmd: str) -> str:
+            return status_guard.handle_pre_tool_use(
+                {**base_payload, "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}}}
+            )["decision"]
+
+        self.assertEqual(run_cmd("sed -i '/^foo/d' local.txt"), "allow")
+        self.assertEqual(run_cmd('rg "cmd > /var/log/a.log" local.txt'), "allow")
+        self.assertEqual(
+            run_cmd('python -c "from pathlib import Path; (Path.home() / \'.codex/config.toml\').write_text(\'x\')"'),
+            "force_ask",
+        )
+        self.assertIsNone(
+            status_guard._eval_ast_path_expr(
+                status_guard.ast.parse("unknown_base / '.codex'", mode="eval").body, {}
+            )
+        )
+
+        for valid_reply in (
+            "已验证：完成回归。\nGit 工作区：干净。\n未完成：待推送。\n### 4. 新对话提示词\n```text\n请读取当前仓库状态与测试记录，继续完成远端推送验收。\n```",
+            "已验证：完成回归。\nGit 工作区：干净。\n未完成：待推送。\n新对话提示词\n请复制以下内容到新会话：\n```markdown\n请读取当前仓库状态与测试记录，继续完成远端推送验收。\n```",
+        ):
+            self.assertTrue(handoff_gate._handoff_structure_present(valid_reply), valid_reply)
+
+        cid = "guard-missing-full"
+        tp = self.tmp_root / "missing_full" / "transcript.jsonl"
+        _append_jsonl(tp, {"type": "USER_INPUT", "step_index": 0, "content": "请整理交接并停机"})
+        import session_context_loader
+        session_context_loader.handle_pre_invocation({"conversationId": cid, "transcriptPath": str(tp)})
+        compact_handoff = (
+            "已验证：通过本地测试。\nGit 工作区：保留当前修改。\n未完成：跨端补测。\n"
+            "## 新对话提示词\n```text\n请读取当前仓库状态与测试记录，继续跨端补测并核对回执。\n```"
+        )
+        _append_jsonl(
+            tp,
+            {"type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": 1,
+             "content": compact_handoff, "truncated_fields": ["content"]},
+        )
+        res = reply_repeat_guard.handle_stop_repeat_guard(
+            {"conversationId": cid, "terminationReason": "NO_TOOL_CALL", "transcriptPath": str(tp)}
+        )
+        self.assertEqual(res["decision"], "allow")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

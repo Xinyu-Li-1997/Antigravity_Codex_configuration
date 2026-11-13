@@ -242,7 +242,7 @@ def _scan_transcript_incrementally(
             continue
 
         # 轻量预提取 step_index（跳过大行全文 json.loads）
-        m_step = STEP_INDEX_RE.search(line[:300])
+        m_step = STEP_INDEX_RE.search(line[:300]) or (STEP_INDEX_RE.search(line) if '"step_index"' in line else None)
         if m_step:
             s_num = int(m_step.group(1))
             if s_num > latest_step:
@@ -252,7 +252,7 @@ def _scan_transcript_incrementally(
         might_be_cp = '"CHECKPOINT"' in line
         might_be_user = '"USER_INPUT"' in line or '"USER_EXPLICIT"' in line
         might_be_media = '"media"' in line
-        might_be_read_img = '"read_file"' in line
+        might_be_read_img = '"read_file"' in line or '"view_file"' in line
         might_be_goal_cancel = "GOAL_CANCELLED" in line
         might_be_banner = "conversation grew too large" in line.lower()
         might_be_trunc_goal = '"PLANNER_RESPONSE"' in line and '"truncated_fields"' in line
@@ -565,13 +565,17 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
     # Antigravity 专属长会话“原子收口 + 交接停机”硬门禁评估（懒加载以保持 --client codex 零依赖隔离）
     import handoff_gate  # noqa: E402
 
-    gate_res = handoff_gate.evaluate_pre_invocation_locked(
-        conversation_id=conversation_id,
-        event_name=event_name,
-        state_dir=state_dir,
-        compaction_state=state,
-        transcript_path=transcript_path,
-    )
+    try:
+        gate_res = handoff_gate.evaluate_pre_invocation_locked(
+            conversation_id=conversation_id,
+            event_name=event_name,
+            state_dir=state_dir,
+            compaction_state=state,
+            transcript_path=transcript_path,
+        )
+    except (ValueError, TypeError, OSError) as exc:
+        log_event(f"{event_name}:handoff_gate_error", conversation_id, f"交接门禁状态异常，继续原话恢复（{exc}）")
+        gate_res = {"injectMessage": None, "phase": "normal", "stateChanged": False}
 
     trigger_reason: Optional[str] = None
     pending = state.get("pendingArchive")

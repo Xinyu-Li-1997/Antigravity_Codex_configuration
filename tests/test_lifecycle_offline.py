@@ -1379,6 +1379,21 @@ class TestCodexHandoffAdapter(unittest.TestCase):
         self.assertIn("来源未知", context["hookSpecificOutput"]["additionalContext"])
         self.assertFalse((self.root / "user-words").exists())
 
+    def test_corrupted_agy_handoff_gate_json_does_not_abort_compaction_recovery(self):
+        plugin_data = self.root / "agy-plugin-data"
+        state_dir = plugin_data / "state"
+        state_dir.mkdir(parents=True)
+        cid = "agy-corrupt-gate"
+        (state_dir / f"{cid}_handoff_gate.json").write_text("{corrupted", encoding="utf-8")
+        tp = self.root / "agy-brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
+        _append_jsonl(tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>\n保留数值通量守恒\n</USER_REQUEST>"})
+        _append_jsonl(tp, {"step_index": 12, "source": "SYSTEM", "type": "CHECKPOINT"})
+        with unittest.mock.patch.dict(os.environ, {"PLUGIN_DATA": str(plugin_data)}):
+            out = session_context_loader.handle_pre_invocation({"conversationId": cid, "transcriptPath": str(tp)})
+        self.assertEqual(len(out["injectSteps"]), 1)
+        self.assertIn("保留数值通量守恒", out["injectSteps"][0]["systemMessage"]["systemMessage"])
+        self.assertTrue((state_dir / f"{cid}_user_words.md").is_file())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

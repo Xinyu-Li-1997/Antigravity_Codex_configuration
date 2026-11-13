@@ -349,7 +349,7 @@ def extract_current_turn_latest_reply(transcript_path_str: Optional[str]) -> Tup
             tp.parent / "transcript_full.jsonl",
             {latest_step_idx},
         )
-        latest_text = full_map.get(latest_step_idx, "")
+        latest_text = full_map.get(latest_step_idx) or latest_text
 
     return turn_key, latest_step_idx, latest_text
 

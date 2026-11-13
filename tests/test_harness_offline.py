@@ -1523,6 +1523,132 @@ else:
                                       verify_fn=lambda _c, _d: (0, 'ok'), max_rounds=1)
         self.assertIn('git worktree add', captured_prompts[0])
 
+    def test_codex_multigen_alias_agy_generation_priority_and_math_cues(self):
+        engines = backends()
+        engines['codex']['models'] = [
+            {'slug': 'gpt-6.1-sol', 'display_name': 'GPT-6.1-Sol', 'provider': 'openai', 'priority': 1,
+             'context_window': 500000, 'max_context_window': 872000, 'effective_context_window_percent': 95,
+             'supported_efforts': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']},
+            {'slug': 'gpt-6-astra', 'display_name': 'GPT-6-Astra', 'provider': 'openai', 'priority': 2,
+             'description': 'Frontier intelligence for the most demanding work.',
+             'context_window': 272000, 'max_context_window': 872000, 'effective_context_window_percent': 95,
+             'supported_efforts': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']},
+            {'slug': 'gpt-6-sol', 'display_name': 'GPT-6-Sol', 'provider': 'openai', 'priority': 5,
+             'context_window': 400000, 'max_context_window': 872000, 'supported_efforts': ['high', 'max']},
+            {'slug': 'gpt-5.6-sol', 'display_name': 'GPT-5.6-Sol', 'provider': 'openai', 'priority': 9,
+             'context_window': 272000, 'supported_efforts': ['high']},
+        ]
+        sol = harness.resolve_execution_profile(engines, 'codex:sol', 'max', '实现牛顿法线性化求解器', 'code')
+        self.assertEqual(sol['model'], 'gpt-6.1-sol')
+        self.assertEqual(sol['reasoning_effort'], 'max')
+        self.assertEqual(sol['capacity']['cli_context_window_tokens'], 872000)
+
+        tier, reason = harness.select_task_tier('auto', 'code', '请调用 Codex 模型核对偏微分方程数学公式与牛顿法通量离散')
+        self.assertEqual((tier, reason), ('max', 'complexity_high_domain_max'))
+        astra = harness.resolve_execution_profile(engines, 'codex:default', tier, '请调用 Codex 模型推导控制方程特征值', 'math')
+        self.assertEqual(astra['model'], 'gpt-6-astra')
+        self.assertEqual(astra['reasoning_effort'], 'max')
+        self.assertEqual(astra['capacity']['cli_context_window_tokens'], 872000)
+
+        engines['agy']['models'] = [
+            {'slug': 'gemini-4-carbon-high'},
+            {'slug': 'gemini-3-deep-xhigh'},
+        ]
+        agy_prof = harness.resolve_execution_profile(engines, 'agy:default', 'max', '推导守恒律', 'math')
+        self.assertEqual(agy_prof['model'], 'gemini-4-carbon-high')
+
+    def test_agy_stream_tool_output_quota_phrase_does_not_false_trip(self):
+        engines = backends()
+        engines['agy']['config_home'] = str(self.root / 'agy-home')
+        stream_out = '\n'.join([
+            json.dumps({'type': 'init', 'model': 'gemini-7-pro-high'}),
+            json.dumps({'type': 'tool_result', 'content': 'Read file says: usage limit reached in fixture doc'}),
+            json.dumps({'type': 'error', 'message': 'upstream connection reset'}),
+        ])
+        proc = subprocess.CompletedProcess(['agy'], 1, stream_out, 'upstream connection reset')
+        with patch.object(harness, 'run_process', return_value=proc), self.assertRaises(harness.HarnessError) as caught:
+            harness.invoke_engine('agy:default', self.root, '检查文档', engines, harness.TASK_JSON_SCHEMA)
+        self.assertEqual(caught.exception.status, 'failed')
+        self.assertIsNone(harness._load_active_quota_cooldown('agy', engines['agy']))
+
+    def test_fallback_on_quota_switches_to_local_matched_model_safely(self):
+        proj = self.root / 'proj'
+        proj.mkdir()
+        target = proj / 'solver.py'
+        target.write_text('x = 1\n', encoding='utf-8')
+        engines = backends()
+        engines['codex'].update(config_home=str(self.root / 'codex-home'), models=[
+            {'slug': 'gpt-6-astra', 'provider': 'openai', 'description': 'Frontier intelligence for the most demanding work.',
+             'context_window': 272000, 'max_context_window': 872000, 'supported_efforts': ['high', 'max']},
+        ])
+        engines['agy'].update(config_home=str(self.root / 'agy-home'), models=[{'slug': 'gemini-4-carbon-high'}])
+
+        def fake_invoke(spec_name, work_dir, prompt, bk, schema, readonly=True, *a, **kw):
+            prefix, _ = harness._engine_parts(spec_name)
+            if prefix == 'codex':
+                rec = harness._record_quota_exhausted('codex', bk['codex'], 'You have hit your usage limit', batch=kw.get('batch'))
+                raise harness.HarnessError('codex 触发额度上限', 'quota_exhausted', **harness._quota_user_choices('codex', rec))
+            kw.get('receipt', {})['invocation_started'] = True
+            return dict(TASK)
+
+        with patch.object(harness, '_args_backends', return_value=engines), patch.object(harness, 'invoke_engine', side_effect=fake_invoke):
+            code, out = self.capture(harness.cmd_task, self.args(
+                'task', '--caller', 'antigravity', '--engine', 'codex:default', '--kind', 'math',
+                '--target', str(target), '--task', '推导数学公式', '--fallback-on-quota'))
+        self.assertEqual(code, 0)
+        self.assertEqual(out['status'], 'ok')
+        self.assertEqual(out['engine'], 'agy:default')
+        self.assertEqual(out['model'], 'gemini-4-carbon-high')
+        self.assertEqual(out['quota_fallback']['from_engine'], 'codex:default')
+        self.assertEqual(out['quota_fallback']['to_engine'], 'agy:default')
+        self.assertFalse(out['quota_fallback']['preflight_blocked'])
+        self.assertIsNotNone(harness._load_active_quota_cooldown('codex', engines['codex']))
+
+        # Cooldown is now persisted: preflight fallback in gate and audit also switches cleanly to agy
+        def fake_edit_worker(spec_name, work_dir, *a, **kw):
+            self.assertTrue(spec_name.startswith('agy:'))
+            kw.get('receipt', {})['invocation_started'] = True
+            target.write_text('x = 2\n', encoding='utf-8')
+            return 'updated'
+
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, 'invoke_edit_worker', side_effect=fake_edit_worker):
+            g_code, g_out = self.capture(harness.cmd_gate, self.args(
+                'gate', '--caller', 'antigravity', '--worker', 'codex:default',
+                '--target', str(target), '--task', '更新公式实现', '--verify-cmd', f'"{sys.executable}" -c "import sys; sys.exit(0)"',
+                '--fallback-on-quota'))
+        self.assertEqual(g_code, 0)
+        self.assertEqual(g_out['engine'], 'agy:default')
+        self.assertTrue(g_out['quota_fallback']['preflight_blocked'])
+
+        with patch.object(harness, '_args_backends', return_value=engines), \
+             patch.object(harness, 'invoke_readonly_engine', return_value={'summary': 'ok', 'findings': [], 'read_files': ['solver.py'], 'unread_files': []}):
+            a_code, a_out = self.capture(harness.cmd_audit, self.args(
+                'audit', '--caller', 'antigravity', '--target', str(proj), '--fallback-on-quota'))
+        self.assertEqual(a_code, 0)
+        self.assertEqual(a_out['plan']['left_engine'], 'agy:default')
+        self.assertFalse(a_out['plan']['dual_blind'])
+        self.assertEqual(a_out['quota_fallback']['to_engine'], 'agy:default')
+
+        # If worker already modified workspace before hitting quota_exhausted, runtime fallback MUST NOT rerun writes
+        harness._SESSION_QUOTA_BLOCKED.clear()
+        engines2 = backends()
+        engines2['codex']['config_home'] = str(self.root / 'codex-home-2')
+        engines2['agy']['config_home'] = str(self.root / 'agy-home-2')
+
+        def dirty_codex(spec_name, work_dir, *a, **kw):
+            target.write_text('dirty = True\n', encoding='utf-8')
+            rec = harness._record_quota_exhausted('codex', engines2['codex'], 'usage limit', batch=kw.get('batch'))
+            raise harness.HarnessError('codex 触发额度上限', 'quota_exhausted', **harness._quota_user_choices('codex', rec))
+
+        with patch.object(harness, '_args_backends', return_value=engines2), patch.object(harness, 'invoke_engine', side_effect=dirty_codex):
+            d_code, d_out = self.capture(harness.cmd_task, self.args(
+                'task', '--caller', 'antigravity', '--engine', 'codex:default', '--kind', 'code',
+                '--target', str(target), '--task', '修改代码', '--fallback-on-quota'))
+        self.assertEqual(d_code, harness.EXIT_CODES['quota_exhausted'])
+        self.assertEqual(d_out['status'], 'quota_exhausted')
+        self.assertNotIn('quota_fallback', d_out)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

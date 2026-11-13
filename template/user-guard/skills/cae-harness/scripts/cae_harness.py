@@ -34,7 +34,8 @@ for _name in ('stdin', 'stdout', 'stderr'):
 
 SOURCE_EXTENSIONS = {'.f90', '.f95', '.f03', '.f08', '.f', '.for', '.c', '.cpp', '.cc', '.cxx', '.cu', '.cuh',
                      '.h', '.hpp', '.hh', '.py', '.jl', '.m', '.rs', '.go', '.ts', '.js', '.cmake', '.toml',
-                     '.yaml', '.yml', '.json', '.md', '.tex', '.bib', '.rst', '.txt', '.lean', '.inc'}
+                     '.yaml', '.yml', '.json', '.md', '.tex', '.bib', '.rst', '.txt', '.lean', '.inc',
+                     '.sh', '.bash', '.ps1', '.cfg', '.ini'}
 IGNORED_DIRS = {'.git', '.hg', '.svn', '__pycache__', '.pytest_cache', 'node_modules', '.venv', 'venv',
                 'env', 'build', 'dist', 'target', '.idea', '.vscode', '.gemini', '.antigravity-ide'}
 EXIT_CODES = {'ok': 0, 'failed': 1, 'scope_violation': 1, 'verification_failed': 2,
@@ -49,9 +50,10 @@ EFFORT_LADDER = ('minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
 TIER_CHOICES = ('auto', 'ultra', 'max', 'xhigh', 'high', 'medium', 'low')
 CATALOG_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 HIGH_COMPLEXITY_CUES = (
-    '守恒', 'conservation', '通量重构', '黎曼', 'riemann', '雅可比', 'jacobian',
+    '守恒', 'conservation', '通量', '通量重构', '黎曼', 'riemann', '雅可比', 'jacobian',
     '熵稳定', 'entropy stability', 'dgsem', 'weno', '高阶格式', '间断伽辽金',
-    '收敛阶', 'order of convergence', '数值稳定性', '边界条件', '特征分解',
+    '收敛阶', 'order of convergence', '数值稳定性', '边界条件', '特征分解', '特征值',
+    '数学公式', '公式推导', '控制方程', '偏微分方程', '本构', '线性化', '牛顿法', 'newton',
     '证明', 'prove', '定理', '引理', '推导', 'derive', '变分',
     '根因', 'root cause', '死锁', 'deadlock', '竞态', 'race condition', '并发', 'concurrency',
     '数值耗散', '激波',
@@ -543,6 +545,7 @@ NON_AI_MODEL_STOPWORDS = {
     'weno', 'cweno', 'eno', 'dg', 'dgsem', 'fvm', 'fem', 'fdm', 'cfd', 'cae', 'eos',
     'riemann', 'roe', 'hll', 'hllc', 'hlle', 'ausm', 'rusanov', 'rk', 'bdf', 'cfl',
     'model', 'models', 'default', 'auto', 'cli', 'lite', 'lightweight',
+    'codex', 'antigravity', 'agy', 'openai', 'google', 'gemini', 'gpt',
 }
 PROMPT_MODEL_HINT_PATTERNS = (
     re.compile(
@@ -622,6 +625,13 @@ def _exact_model_record(models, query):
         query, [item for item in models if str(item.get('display_name') or '').lower() == value])
 
 
+def _codex_versioned_line(slug):
+    match = re.match(r'^gpt-(\d+(?:\.\d+)*)-([a-z][a-z0-9-]*)$', str(slug or '').strip().lower())
+    if not match:
+        return None, None
+    return tuple(int(part) for part in match.group(1).split('.')), match.group(2)
+
+
 def _resolve_explicit_codex_record(models, explicit_model):
     query = str(explicit_model or '').strip()
     if not query:
@@ -630,10 +640,16 @@ def _resolve_explicit_codex_record(models, explicit_model):
     if exact:
         return exact
     terms = _alias_tokens(query)
-    return _unique_model_matches(query, [
+    matches = [
         item for item in models if terms and terms <= _alias_tokens(f"{item['slug']} {item.get('display_name', '')}")
         and _model_category('codex', item) != 'hidden_or_internal'
-    ])
+    ]
+    if len({item['slug'] for item in matches}) > 1 and not any(re.search(r'\d', tok) for tok in terms):
+        parsed = [(item, *_codex_versioned_line(item['slug'])) for item in matches]
+        lines = {line for _item, ver, line in parsed if ver is not None and line is not None}
+        if len(lines) == 1 and all(ver is not None for _item, ver, _line in parsed):
+            return max(parsed, key=lambda row: (row[1], -_catalog_order(row[0])[1]))[0]
+    return _unique_model_matches(query, matches)
 
 
 def _agy_families(models):
@@ -812,7 +828,12 @@ def resolve_execution_profile(backends, spec, tier='high', prompt_text='', kind=
     hint = _extract_prompt_model_hint(prompt_text) if not explicit_model and models else ''
     if prefix == 'codex':
         if explicit_model or hint:
-            record = _resolve_explicit_codex_record(models, explicit_model or hint)
+            try:
+                record = _resolve_explicit_codex_record(models, explicit_model or hint)
+            except HarnessError:
+                if explicit_model:
+                    raise
+                record, hint = {}, ''
             if record or explicit_model:
                 slug = record.get('slug') or explicit_model
                 source = ('prompt_fuzzy_model' if hint else 'explicit_engine_model' if slug.lower() == explicit_model.lower()
@@ -823,7 +844,12 @@ def resolve_execution_profile(backends, spec, tier='high', prompt_text='', kind=
             return _codex_profile(info, spec, record, record['slug'], tier, source)
     else:
         if explicit_model or hint:
-            record, source = _resolve_explicit_agy_record(models, explicit_model or hint, tier)
+            try:
+                record, source = _resolve_explicit_agy_record(models, explicit_model or hint, tier)
+            except HarnessError:
+                if explicit_model:
+                    raise
+                record, source, hint = {}, '', ''
             if record or explicit_model:
                 return _agy_profile(info, spec, record, record.get('slug') or explicit_model, tier,
                                     'prompt_fuzzy_model' if hint else source if record else 'explicit_engine_model')
@@ -840,7 +866,9 @@ def resolve_execution_profile(backends, spec, tier='high', prompt_text='', kind=
                     chosen, source = fast[0], 'specialty_fast_lightweight'
             elif kind in ('math', 'direction') or (kind == 'review' and tier in ('xhigh', 'max', 'ultra')
                                                   and _has_positive_cue(prompt_text, HIGH_COMPLEXITY_CUES)):
-                chosen = max(normal, key=lambda name: EFFORT_LADDER.index(
+                top_gen = _agy_family_order(normal[0])[0]
+                top_normal = [name for name in normal if _agy_family_order(name)[0] == top_gen]
+                chosen = max(top_normal, key=lambda name: EFFORT_LADDER.index(
                     _agy_slug_tier(_match_agy_family(families[name], tier)['slug'])[1]))
                 source = 'specialty_deep_reasoning'
             record = _match_agy_family(families[chosen], tier)
@@ -2075,7 +2103,22 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         receipt['invocation_started'] = True
         receipt['returncode'] = result.returncode
         if result.returncode:
-            detail = ((result.stderr or '') + '\n' + (result.stdout or '')).strip()
+            if prefix == 'agy':
+                agy_diag_parts = [result.stderr or '']
+                for raw_line in (result.stdout or '').splitlines():
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        evt = json.loads(stripped)
+                    except ValueError:
+                        agy_diag_parts.append(stripped)
+                        continue
+                    if isinstance(evt, dict) and evt.get('event') in ('error', 'result'):
+                        agy_diag_parts.append(json.dumps(evt, ensure_ascii=False))
+                detail = '\n'.join(part for part in agy_diag_parts if part).strip()
+            else:
+                detail = ((result.stderr or '') + '\n' + (result.stdout or '')).strip()
             if _is_quota_exhausted(detail):
                 cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
                 raise HarnessError(f'{prefix} 额度不足或已达用量上限，已停止并记录冷却状态',
@@ -2513,7 +2556,20 @@ def cmd_audit(args):
     try:
         _prepare_execution(backends, engines, batch, dry_run=args.dry_run)
     except HarnessError as exc:
-        return _print({'status': exc.status, **meta, 'error': str(exc), 'requested_engines': list(engines), **exc.details})
+        q_backend = exc.details.get('quota_backend') or ''
+        fb_engine = _local_fallback_engine(caller, f'{q_backend}:default', backends) if (
+            exc.status == 'quota_exhausted' and q_backend and getattr(args, 'fallback_on_quota', False)
+        ) else None
+        if not fb_engine:
+            return _print({'status': exc.status, **meta, 'error': str(exc), 'requested_engines': list(engines), **exc.details})
+        tripped_spec = next((e for e in engines if e and _engine_parts(e)[0] == q_backend), f'{q_backend}:default')
+        meta['quota_fallback'] = _quota_fallback_record(tripped_spec, fb_engine, exc.details)
+        kept = [e for e in engines if e and _engine_parts(e)[0] != q_backend]
+        engines = (kept[0] if kept else fb_engine, None)
+        try:
+            _prepare_execution(backends, engines, batch, dry_run=args.dry_run)
+        except HarnessError as fb_exc:
+            return _print({'status': fb_exc.status, **meta, 'error': str(fb_exc), 'requested_engines': list(engines), **fb_exc.details})
     profiles = {}
     for side, engine in zip(('left', 'right'), engines):
         if engine:
@@ -2654,6 +2710,44 @@ def _run_cli_gate(args, root, requested_target, text, caller, engine, backends, 
     return result
 
 
+def _local_fallback_engine(caller, engine, backends):
+    fallback = {'antigravity': 'agy:default', 'codex': 'codex:default'}.get(caller)
+    if not fallback:
+        return None
+    cur_prefix, _ = _engine_parts(engine)
+    fb_prefix, _ = _engine_parts(fallback)
+    if cur_prefix == fb_prefix or not backends.get(fb_prefix, {}).get('available'):
+        return None
+    return fallback
+
+
+def _quota_fallback_record(from_engine, to_engine, details):
+    details = details or {}
+    return {
+        'from_engine': from_engine,
+        'to_engine': to_engine,
+        'reason': 'quota_exhausted',
+        'preflight_blocked': bool(details.get('preflight_blocked')),
+        'quota_cooldown': details.get('quota_cooldown'),
+    }
+
+
+def _safe_changes_report(before, root, scopes, readonly):
+    try:
+        report = _changes_report(before, root, scopes, readonly)
+        report['scope_verified'] = True
+        return report
+    except (HarnessError, OSError) as exc:
+        return {
+            'changed_files': None,
+            'scope_violations': [],
+            'scope_check': 'unverified',
+            'scope_verified': False,
+            'scope_error': str(exc),
+            'scope_error_path': getattr(exc, 'details', {}).get('snapshot_path'),
+        }
+
+
 def cmd_gate(args):
     requested_target, root = _target(args)
     text = _task_text(args)
@@ -2661,6 +2755,8 @@ def cmd_gate(args):
     caller = resolve_caller(args.caller)
     engine = choose_engine(backends, caller, args.worker)
     scopes = _scope_patterns(args.write_scope)
+    if requested_target.is_file() and not scopes:
+        scopes = [requested_target.relative_to(root).as_posix()]
     file_count, est_tokens = _target_metrics(requested_target, text)
     tier, tier_reason = select_task_tier(args.tier, 'gate', text, file_count, est_tokens)
     batch = _QuotaBatch(args.retry_quota)
@@ -2670,7 +2766,18 @@ def cmd_gate(args):
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
     except HarnessError as exc:
-        return _print({'status': exc.status, **meta, 'error': str(exc), **exc.details})
+        fb_engine = _local_fallback_engine(caller, engine, backends) if (
+            exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
+        ) else None
+        if not fb_engine:
+            return _print({'status': exc.status, **meta, 'error': str(exc), **exc.details})
+        meta['quota_fallback'] = _quota_fallback_record(engine, fb_engine, exc.details)
+        engine = fb_engine
+        meta.update(engine=engine, worker_engine=engine)
+        try:
+            _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
+        except HarnessError as fb_exc:
+            return _print({'status': fb_exc.status, **meta, 'error': str(fb_exc), **fb_exc.details})
     profile = _planned_profile(args, backends, engine, tier, tier_reason, text, 'gate', est_tokens)
     if args.dry_run:
         prefix, _ = _engine_parts(engine)
@@ -2679,7 +2786,26 @@ def cmd_gate(args):
                        'work_dir': str(root), 'verify_cmd': args.verify_cmd, 'write_scope': scopes, 'max_rounds': args.max_rounds})
     _require_execution_profile(profile)
     base = _git_head(root)
+    pre_gate_snap = snapshot_files(root) if (getattr(args, 'fallback_on_quota', False) and 'quota_fallback' not in meta) else None
     result = _run_cli_gate(args, root, requested_target, text, caller, engine, backends, scopes, profile, 'gate', est_tokens, batch)
+    if (result.get('status') == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
+            and 'quota_fallback' not in meta):
+        fb_engine = _local_fallback_engine(caller, engine, backends)
+        no_writes = not result.get('changed_files') and (
+            pre_gate_snap is None or not changed_files(pre_gate_snap, snapshot_files(root))
+        )
+        if fb_engine and no_writes:
+            try:
+                _prepare_execution(backends, (fb_engine,), batch, dry_run=False)
+                fb_profile = _planned_profile(args, backends, fb_engine, tier, tier_reason, text, 'gate', est_tokens)
+                _require_execution_profile(fb_profile)
+                meta['quota_fallback'] = _quota_fallback_record(engine, fb_engine, result)
+                engine = fb_engine
+                meta.update(engine=engine, worker_engine=engine)
+                result = _run_cli_gate(args, root, requested_target, text, caller, engine, backends, scopes,
+                                       fb_profile, 'gate', est_tokens, batch)
+            except HarnessError as fb_exc:
+                return _print({'status': fb_exc.status, **meta, 'base_commit': base, 'error': str(fb_exc), **fb_exc.details})
     return _print({**meta, **result, 'base_commit': base})
 
 
@@ -2693,6 +2819,9 @@ def cmd_task(args):
     readonly = args.kind != 'code'
     if readonly and (scopes or args.verify_cmd):
         raise HarnessError('只读任务不可声明写入范围或验收命令')
+    rel_single_file = requested_target.relative_to(root).as_posix() if requested_target.is_file() else None
+    if not readonly and rel_single_file and not scopes:
+        scopes = [rel_single_file]
     base = _git_head(root)
     if args.base_commit:
         expected = _local_command(['git', '-C', str(root), 'rev-parse', args.base_commit + '^{commit}'])
@@ -2708,8 +2837,20 @@ def cmd_task(args):
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
     except HarnessError as exc:
-        return _print({'status': exc.status, **payload, 'result': {}, 'changed_files': [], 'scope_violations': [],
-                       'error': str(exc), **exc.details})
+        fb_engine = _local_fallback_engine(caller, engine, backends) if (
+            exc.status == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
+        ) else None
+        if not fb_engine:
+            return _print({'status': exc.status, **payload, 'result': {}, 'changed_files': [], 'scope_violations': [],
+                           'error': str(exc), **exc.details})
+        payload['quota_fallback'] = _quota_fallback_record(engine, fb_engine, exc.details)
+        engine = fb_engine
+        payload['engine'] = engine
+        try:
+            _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
+        except HarnessError as fb_exc:
+            return _print({'status': fb_exc.status, **payload, 'result': {}, 'changed_files': [], 'scope_violations': [],
+                           'error': str(fb_exc), **fb_exc.details})
     profile = _planned_profile(args, backends, engine, tier, tier_reason, text, args.kind, est_tokens)
     prefix, _ = _engine_parts(engine)
     payload.update(_profile_payload(profile))
@@ -2717,11 +2858,33 @@ def cmd_task(args):
         return _print({'status': 'ok', 'dry_run': True, 'quota_cooldown': backends.get(prefix, {}).get('quota_cooldown'), **payload})
     _require_execution_profile(profile)
     if args.kind == 'code' and args.verify_cmd:
+        pre_gate_snap = snapshot_files(root) if (getattr(args, 'fallback_on_quota', False) and 'quota_fallback' not in payload) else None
         result = _run_cli_gate(args, root, requested_target, text, caller, engine, backends, scopes,
                                profile, args.kind, est_tokens, batch)
+        if (result.get('status') == 'quota_exhausted' and getattr(args, 'fallback_on_quota', False)
+                and 'quota_fallback' not in payload):
+            fb_engine = _local_fallback_engine(caller, engine, backends)
+            no_writes = not result.get('changed_files') and (
+                pre_gate_snap is None or not changed_files(pre_gate_snap, snapshot_files(root))
+            )
+            if fb_engine and no_writes:
+                try:
+                    _prepare_execution(backends, (fb_engine,), batch, dry_run=False)
+                    fb_profile = _planned_profile(args, backends, fb_engine, tier, tier_reason, text, args.kind, est_tokens)
+                    _require_execution_profile(fb_profile)
+                    payload['quota_fallback'] = _quota_fallback_record(engine, fb_engine, result)
+                    engine = fb_engine
+                    payload['engine'] = engine
+                    payload.update(_profile_payload(fb_profile))
+                    result = _run_cli_gate(args, root, requested_target, text, caller, engine, backends, scopes,
+                                           fb_profile, args.kind, est_tokens, batch)
+                except HarnessError as fb_exc:
+                    return _print({'status': fb_exc.status, **payload, 'result': {}, 'changed_files': [],
+                                   'scope_violations': [], 'error': str(fb_exc), **fb_exc.details})
         return _print({**payload, **result})
     before = snapshot_files(root)
-    rel_hint = f'（相对路径: {requested_target.relative_to(root).as_posix()}）' if requested_target != root else ''
+    rel_hint = f'（相对路径: {rel_single_file}）' if rel_single_file else ''
+    stage_files = [rel_single_file] if (readonly and rel_single_file) else None
     prompt = (f'任务类型 {args.kind}。当前总控 {caller}。工作目录为当前目录。任务目标 {requested_target}{rel_hint}。\n'
               + ('只读完成任务，正文通过回执返回。' if readonly else f"允许写入范围 {scopes or '调用方授权的目标工作目录'}。")
               + '严禁在目标工作目录外创建、修改或删除任何文件或目录（含严禁向目录外执行 git worktree add）。'
@@ -2729,16 +2892,41 @@ def cmd_task(args):
               + '\n按给定 JSON Schema 返回正文、证据及未验证事项。')
     result, error, status, invocation = {}, {}, 'ok', {}
     try:
-        result = invoke_engine(profile['spec'], root, prompt, backends, TASK_JSON_SCHEMA,
-                               readonly, args.timeout, 'readonly-collaborator', None, profile['cli_effort'], args.retry_quota,
-                               profile=profile, batch=batch, receipt=invocation)
+        try:
+            result = invoke_engine(profile['spec'], root, prompt, backends, TASK_JSON_SCHEMA,
+                                   readonly, args.timeout, 'readonly-collaborator', stage_files, profile['cli_effort'], args.retry_quota,
+                                   profile=profile, batch=batch, receipt=invocation)
+        except Exception as exc:
+            fb_engine = _local_fallback_engine(caller, engine, backends) if (
+                getattr(exc, 'status', None) == 'quota_exhausted'
+                and getattr(args, 'fallback_on_quota', False)
+                and 'quota_fallback' not in payload
+                and not changed_files(before, snapshot_files(root))
+            ) else None
+            if not fb_engine:
+                raise
+            _prepare_execution(backends, (fb_engine,), batch, dry_run=False)
+            fb_profile = _planned_profile(args, backends, fb_engine, tier, tier_reason, text, args.kind, est_tokens)
+            _require_execution_profile(fb_profile)
+            payload['quota_fallback'] = _quota_fallback_record(engine, fb_engine, getattr(exc, 'details', {}))
+            engine = fb_engine
+            prefix, _ = _engine_parts(engine)
+            payload['engine'] = engine
+            payload.update(_profile_payload(fb_profile))
+            invocation = {}
+            result = invoke_engine(fb_profile['spec'], root, prompt, backends, TASK_JSON_SCHEMA,
+                                   readonly, args.timeout, 'readonly-collaborator', stage_files, fb_profile['cli_effort'], args.retry_quota,
+                                   profile=fb_profile, batch=batch, receipt=invocation)
     except Exception as exc:
         status = getattr(exc, 'status', 'failed')
         error = {'error': str(exc), **getattr(exc, 'details', {})}
     finally:
-        scope = _changes_report(before, root, scopes, readonly)
+        scope = _safe_changes_report(before, root, scopes, readonly)
     payload['quota_status'] = backends.get(prefix, {}).get('quota_status', payload['quota_status'])
-    if scope['scope_violations']:
+    if not scope.get('scope_verified', True) and status == 'ok':
+        status = 'failed'
+        error.setdefault('error', scope.get('scope_error') or '工作区快照核对失败')
+    elif scope['scope_violations']:
         status = 'scope_violation'
     return _print({'status': status, **payload, 'invocation': invocation, 'result': result, **error, **scope})
 
@@ -2790,6 +2978,8 @@ def build_arg_parser():
                              help='挡位策略：auto 按任务专长选模并分级思考挡位（攻坚用单模型最高挡 max，常规用 high，短润色用 medium，表面检查用 low）')
         command.add_argument('--retry-quota', action='store_true',
                              help='用户确认已充值或额度恢复后，忽略本地额度冷却记录重试发起')
+        command.add_argument('--fallback-on-quota', action='store_true',
+                             help='跨端目标触发额度熔断且未修改工作区时，自动切回发起方本侧合适的模型与挡位执行')
         command.add_argument('--timeout', type=_positive_arg, default=600)
         command.add_argument('--dry-run', action='store_true')
     return parser

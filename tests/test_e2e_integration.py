@@ -1570,6 +1570,46 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertIn("recommended_app_mode", json.loads(result.stdout))
             self.assertIn("启动", result.stderr)
 
+    def test_29_empty_mcp_no_zotero_rules_upgrade_dryrun_sync_and_both_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_root = root / ".gemini" / "config"
+            cfg_root.mkdir(parents=True)
+            (cfg_root / "mcp_config.json").write_bytes(b"")
+            self.assertIsNone(INSTALLER._plan_user_zotero(cfg_root, None))
+            with self.assertRaises(ValueError):
+                INSTALLER._plan_user_zotero(cfg_root, str(root / "zotero-mcp"))
+
+            codex_dir = root / "codex_rules"
+            codex_dir.mkdir()
+            codex_agents = codex_dir / "AGENTS.md"
+            codex_agents.write_text(
+                "# 用户规则（全局生效）\n- 旧规则\n\n## 工具与运行环境\n- **R10. 旧版环境说明**：旧内容\n",
+                encoding="utf-8",
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                INSTALLER._sync_codex_global_rules(TEMPLATE_DIR / "rules" / "AGENTS.md", codex_dir, dry_run=False)
+            upgraded = codex_agents.read_text(encoding="utf-8")
+            self.assertIn("## 工具与运行环境", upgraded)
+            self.assertNotIn("旧版环境说明", upgraded)
+            self.assertIn("R11.", upgraded)
+
+            plugin_dir = root / "plugins" / "user-guard"
+            with contextlib.redirect_stdout(io.StringIO()):
+                INSTALLER.mirror_sync_plugin(TEMPLATE_DIR, plugin_dir, dry_run=False)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                INSTALLER.mirror_sync_plugin(TEMPLATE_DIR, plugin_dir, dry_run=True)
+            self.assertNotIn("[SYNC]", buf.getvalue())
+
+            bad_argv = ["install.py", "--app", "both", "--target-dir", str(plugin_dir), "--no-zotero", "--dry-run"]
+            with mock.patch.object(sys, "argv", bad_argv), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as cm:
+                INSTALLER.main()
+            self.assertNotEqual(cm.exception.code, 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
