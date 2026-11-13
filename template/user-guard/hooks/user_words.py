@@ -13,6 +13,8 @@ import json
 import os
 import re
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -49,10 +51,23 @@ def resolve_data_dirs(hooks_dir: Path) -> Tuple[Path, Path]:
     return state_dir, logs_dir
 
 
+def resolve_compact_transcript_path(raw_path: Path) -> Path:
+    """
+    Antigravity 宿主传入 transcriptPath 时可能指向 transcript_full.jsonl；
+    若同目录存在紧凑版 transcript.jsonl，优先定位至 transcript.jsonl，
+    既严格对齐 4MB/6MB 遥测标定基准，又将增量扫描与原话索引体积降低约 3 倍（截断正文按需回查 transcript_full.jsonl）。
+    """
+    if raw_path.name == "transcript_full.jsonl":
+        compact = raw_path.with_name("transcript.jsonl")
+        if compact.exists() and compact.is_file():
+            return compact
+    return raw_path
+
+
 def atomic_write_text(target_path: Path, content: str) -> None:
     """使用同目录临时文件 + fsync + os.replace 原子更新文件，防止并发或中断产生半截损坏文件"""
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target_path.with_name(f".{target_path.name}.tmp.{os.getpid()}")
+    tmp_path = target_path.with_name(f".{target_path.name}.tmp.{os.getpid()}.{time.time_ns()}")
     try:
         with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(content)
@@ -61,7 +76,14 @@ def atomic_write_text(target_path: Path, content: str) -> None:
                 os.fsync(f.fileno())
             except OSError:
                 pass
-        os.replace(tmp_path, target_path)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, target_path)
+                break
+            except PermissionError:
+                if attempt >= 4:
+                    raise
+                time.sleep(0.01)
     finally:
         try:
             tmp_path.unlink(missing_ok=True)
@@ -210,8 +232,18 @@ def _extract_ask_question_summary(tool_calls: Any) -> Optional[str]:
         if not isinstance(tc, dict) or tc.get("name") != "ask_question":
             continue
         args = tc.get("args")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = None
         if isinstance(args, dict):
             qs = args.get("questions")
+            if isinstance(qs, str):
+                try:
+                    qs = json.loads(qs)
+                except Exception:
+                    qs = None
             if isinstance(qs, list):
                 for q in qs:
                     if isinstance(q, dict) and isinstance(q.get("question"), str):
@@ -230,31 +262,19 @@ def _clean_generic_tool_answer(raw_output: str) -> str:
     return cleaned
 
 
-def extract_user_words(
+def extract_user_words_with_status(
     transcript_path_str: Optional[str],
     include_subagent_msgs: bool = True,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[int]]:
     """
-    从 transcript.jsonl 提取会话全部历史用户原话（含被截断长指令还原与 ask_question 选项回答）。
-
-    返回结构列表:
-    [
-      {
-        "turn": 1,
-        "step_index": 0,
-        "created_at": "2026-...",
-        "kind": "user_input" | "ask_question_answer" | "subagent_message",
-        "content": "纯净的用户输入文本"
-      },
-      ...
-    ]
+    提取会话全部历史用户原话，并同时返回未能在 transcript_full.jsonl 中补全的截断 step_index 列表。
     """
     if not transcript_path_str:
-        return []
+        return [], []
 
-    transcript_path = Path(transcript_path_str)
+    transcript_path = resolve_compact_transcript_path(Path(transcript_path_str))
     if not transcript_path.exists() or not transcript_path.is_file():
-        return []
+        return [], []
 
     full_transcript_path = transcript_path.parent / "transcript_full.jsonl"
 
@@ -328,10 +348,11 @@ def extract_user_words(
                     }
                 )
     except Exception:
-        return []
+        return [], []
 
     # 单次按需补全所有被截断的记录
     full_map = _load_truncated_contents_map(full_transcript_path, truncated_needed)
+    unresolved_steps = sorted(idx for idx in truncated_needed if idx not in full_map)
 
     results: List[Dict[str, Any]] = []
     turn_counter = 0
@@ -365,7 +386,18 @@ def extract_user_words(
             }
         )
 
-    return results
+    return results, unresolved_steps
+
+
+def extract_user_words(
+    transcript_path_str: Optional[str],
+    include_subagent_msgs: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    从 transcript.jsonl 提取会话全部历史用户原话（含被截断长指令还原与 ask_question 选项回答）。
+    """
+    words, _ = extract_user_words_with_status(transcript_path_str, include_subagent_msgs=include_subagent_msgs)
+    return words
 
 
 def format_user_words_markdown(conversation_id: str, words: List[Dict[str, Any]]) -> str:
@@ -821,3 +853,46 @@ def refresh_codex_session_archive(
         "saved": saved_info,
         "meta_path": str(meta_path),
     }
+
+
+MAX_LOG_BYTES = 2 * 1024 * 1024
+TRIM_LOG_BYTES = 1 * 1024 * 1024
+
+
+def current_iso_time() -> str:
+    """返回带本机时区偏移的 ISO-8601 时间戳"""
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def append_lifecycle_log(
+    hooks_dir: Path,
+    event_name: str,
+    conversation_id: str,
+    message: str,
+    payload_summary: Optional[Dict[str, Any]] = None,
+) -> None:
+    """向 logs/lifecycle.log 追加结构化 JSONL 日志，附带 2MB 自动滚动裁剪防无限膨胀"""
+    try:
+        _, logs_dir = resolve_data_dirs(hooks_dir)
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        log_file = logs_dir / "lifecycle.log"
+
+        if log_file.exists() and log_file.stat().st_size > MAX_LOG_BYTES:
+            raw = log_file.read_bytes()
+            tail = raw[-TRIM_LOG_BYTES:]
+            nl = tail.find(b"\n")
+            if nl != -1:
+                tail = tail[nl + 1 :]
+            atomic_write_text(log_file, tail.decode("utf-8", errors="replace"))
+
+        log_entry = {
+            "timestamp": current_iso_time(),
+            "event": event_name,
+            "conversationId": conversation_id,
+            "message": message,
+            "summary": payload_summary or {},
+        }
+        with open(log_file, "a", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass

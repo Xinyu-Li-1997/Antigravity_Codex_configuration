@@ -423,6 +423,199 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
         self.assertIn("保留上次已验证文档", gap_ctx)
         self.assertEqual(md_file.read_text(encoding="utf-8"), md_text)
 
+    def test_07_handoff_gate_telemetry_advisory_drain_and_override(self) -> None:
+        """验证长会话遥测建档、Turn-1 防误伤、Stage-1 预警、检查点坍塌 drain 及 R8 显式暂缓"""
+        import handoff_gate
+
+        # 1) Turn-1 提问引用英文 UI Banner 严禁误触发 Stage-2
+        conv_turn1 = "ag-handoff-turn1"
+        tp_t1 = self.tmp_root / "t1.jsonl"
+        banner = "This conversation grew too large, so the history before this point may be missing or incomplete."
+        _append_jsonl(tp_t1, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": f"<USER_REQUEST>\n{banner}\n请分析原因\n</USER_REQUEST>"})
+        out_t1 = session_context_loader.handle_pre_invocation({"conversationId": conv_turn1, "transcriptPath": str(tp_t1)})
+        self.assertEqual(out_t1["injectSteps"], [], "新会话首轮仅引用 Banner 不得误触发")
+
+        # 2) 旧版 v1 state 平滑回填遥测，不重复注入已注入检查点，且健康会话保持仅 Stage-1 advisory
+        conv_healthy = "ag-handoff-healthy"
+        tp_ok = self.tmp_root / "healthy.jsonl"
+        _append_jsonl(tp_ok, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "开始长期研究"})
+        step_cursor = 140
+        for _ in range(11):
+            _append_jsonl(tp_ok, {"step_index": step_cursor, "source": "SYSTEM", "type": "CHECKPOINT"})
+            step_cursor += 140
+        out_ok = session_context_loader.handle_pre_invocation({"conversationId": conv_healthy, "transcriptPath": str(tp_ok)})
+        self.assertEqual(len(out_ok["injectSteps"]), 1)
+        msg_ok = out_ok["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn("Stage-1 advisory", msg_ok)
+        self.assertNotIn("Stage-2 drain", msg_ok)
+        gate_ok = handoff_gate.load_gate_state(self.plugin_data / "state", conv_healthy)
+        self.assertEqual(gate_ok["phase"], "advisory")
+
+        # 3) 检查点间隔坍塌（cp >= 10 且尾 3 段间隔 <= 75）：触发 Stage-2 drain
+        conv_thrash = "ag-handoff-thrash"
+        tp_th = self.tmp_root / "thrash.jsonl"
+        _append_jsonl(tp_th, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "/goal\n完成批量校准，不要擅自停止"})
+        s = 100
+        for i in range(10):
+            _append_jsonl(tp_th, {"step_index": s, "source": "SYSTEM", "type": "CHECKPOINT"})
+            s += 150 if i < 6 else 50
+        out_th = session_context_loader.handle_pre_invocation({"conversationId": conv_thrash, "transcriptPath": str(tp_th)})
+        msg_th = out_th["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn("Stage-2 drain", msg_th)
+        self.assertIn("GOAL_CANCELLED", msg_th)
+
+        # 4) 用户发送 "请你处理好交接" 不得误触发 R8 暂缓；发送 "先别交接，继续当前对话" 则触发 overridden 宽限
+        _append_jsonl(tp_th, {"step_index": s + 5, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "请你处理好交接"})
+        session_context_loader.handle_pre_invocation({"conversationId": conv_thrash, "transcriptPath": str(tp_th)})
+        self.assertEqual(handoff_gate.load_gate_state(self.plugin_data / "state", conv_thrash)["phase"], "drain")
+
+        _append_jsonl(tp_th, {"step_index": s + 10, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "先别交接，继续当前对话做完这一批"})
+        out_ovr = session_context_loader.handle_pre_invocation({"conversationId": conv_thrash, "transcriptPath": str(tp_th)})
+        self.assertEqual(handoff_gate.load_gate_state(self.plugin_data / "state", conv_thrash)["phase"], "overridden")
+        self.assertEqual(out_ovr["injectSteps"], [])
+
+        # 5) 真实 protojson 双重引号路径图片读取计数、外层 <EPHEMERAL_MESSAGE> UI Banner 及超 4000 字符末尾 R8 暂缓识别
+        conv_proto = "ag-handoff-proto"
+        tp_pr = self.tmp_root / "proto.jsonl"
+        img_file = self.tmp_root / "plot_01.png"
+        img_file.write_bytes(b"PNG" + b"\x00" * 2048)
+        _append_jsonl(
+            tp_pr,
+            {
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "content": f"<EPHEMERAL_MESSAGE>\n{banner}\n</EPHEMERAL_MESSAGE>\n<USER_REQUEST>\n检查图片轨迹\n</USER_REQUEST>",
+            },
+        )
+        _append_jsonl(tp_pr, {"step_index": 120, "source": "SYSTEM", "type": "CHECKPOINT"})
+        _append_jsonl(
+            tp_pr,
+            {
+                "step_index": 125,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{"name": "read_file", "args": {"Path": json.dumps(str(img_file))}}],
+            },
+        )
+        out_pr = session_context_loader.handle_pre_invocation({"conversationId": conv_proto, "transcriptPath": str(tp_pr)})
+        self.assertEqual(handoff_gate.load_gate_state(self.plugin_data / "state", conv_proto)["phase"], "drain")
+        self.assertEqual(len(out_pr["injectSteps"]), 1)
+        gate_pr = handoff_gate.load_gate_state(self.plugin_data / "state", conv_proto)
+        self.assertEqual(gate_pr["imageReads"].get(str(img_file.resolve()).casefold() if os.name == "nt" else str(img_file.resolve())), 2051)
+
+        long_tail_r8 = ("补充长指令背景说明。\n" * 400) + "暂不交接，继续当前对话"
+        _append_jsonl(tp_pr, {"step_index": 130, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": long_tail_r8})
+        session_context_loader.handle_pre_invocation({"conversationId": conv_proto, "transcriptPath": str(tp_pr)})
+        self.assertEqual(handoff_gate.load_gate_state(self.plugin_data / "state", conv_proto)["phase"], "overridden")
+
+    def test_11_compact_transcript_resolution_and_legacy_gate_recalibration(self) -> None:
+        """传入 transcript_full.jsonl 时优先度量紧凑版 transcript.jsonl，兼顾截断原文还原与旧误报自愈"""
+        import handoff_gate
+
+        conv_id = "ag-compact-resolve"
+        log_dir = self.tmp_root / "brain" / conv_id / ".system_generated" / "logs"
+        compact_tp = log_dir / "transcript.jsonl"
+        full_tp = log_dir / "transcript_full.jsonl"
+
+        full_user_text = "<USER_REQUEST>\n重要原始需求：保持数值守恒\n</USER_REQUEST>"
+        _append_jsonl(
+            compact_tp,
+            {
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>\n重要原始<truncated 12 bytes>",
+                "truncated_fields": ["content"],
+            },
+        )
+        _append_jsonl(compact_tp, {"step_index": 10, "source": "SYSTEM", "type": "CHECKPOINT"})
+
+        _append_jsonl(
+            full_tp,
+            {
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "content": full_user_text,
+            },
+        )
+        pad_block = "X" * (650 * 1024)
+        for idx in range(1, 11):
+            _append_jsonl(full_tp, {"step_index": idx, "source": "SYSTEM", "type": "GENERIC", "content": pad_block})
+
+        self.assertGreater(full_tp.stat().st_size, 6 * 1024 * 1024)
+        self.assertLess(compact_tp.stat().st_size, 1024 * 1024)
+
+        out = session_context_loader.handle_pre_invocation({"conversationId": conv_id, "transcriptPath": str(full_tp)})
+        self.assertEqual(handoff_gate.load_gate_state(self.plugin_data / "state", conv_id)["phase"], "normal")
+        self.assertEqual(len(out["injectSteps"]), 1)
+        self.assertIn("重要原始需求：保持数值守恒", out["injectSteps"][0]["systemMessage"]["systemMessage"])
+        comp_saved = json.loads((self.plugin_data / "state" / f"{conv_id}_compaction.json").read_text(encoding="utf-8"))
+        self.assertEqual(comp_saved.get("scannedTranscriptName"), "transcript.jsonl")
+
+        # 模拟从旧版 telemetryVersion=2 + gateSchemaVersion=1（因 transcript_full 体积误进入 drain）平滑升级
+        conv_legacy = "ag-compact-legacy"
+        state_dir = self.plugin_data / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / f"{conv_legacy}_compaction.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "telemetryVersion": 2,
+                    "conversationId": conv_legacy,
+                    "scannedByteOffset": full_tp.stat().st_size,
+                    "latestCheckpointStep": 10,
+                    "lastInjectedCheckpointStep": 10,
+                    "hasExplicitUserInput": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (state_dir / f"{conv_legacy}_handoff_gate.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "conversationId": conv_legacy,
+                    "phase": "drain",
+                    "triggers": ["transcript_bytes"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        out_leg = session_context_loader.handle_pre_invocation({"conversationId": conv_legacy, "transcriptPath": str(full_tp)})
+        self.assertEqual(out_leg["injectSteps"], [], "升级重标定时不得重复注入已注入过的 CHECKPOINT")
+        gate_leg = handoff_gate.load_gate_state(state_dir, conv_legacy)
+        self.assertEqual(gate_leg["phase"], "normal")
+        self.assertEqual(gate_leg["gateSchemaVersion"], 2)
+
+        # 取消 /goal 与宽限期届满后重复发送相同文本 R8 暂缓指令必须生效
+        conv_r8 = "ag-cancel-repeat-r8"
+        tp_r8 = self.tmp_root / f"{conv_r8}.jsonl"
+        _append_jsonl(tp_r8, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "/goal\n开始执行"})
+        s = 100
+        for _ in range(16):
+            _append_jsonl(tp_r8, {"step_index": s, "source": "SYSTEM", "type": "CHECKPOINT"})
+            s += 100
+        session_context_loader.handle_pre_invocation({"conversationId": conv_r8, "transcriptPath": str(tp_r8)})
+        self.assertTrue(handoff_gate.load_gate_state(state_dir, conv_r8)["isGoalActive"])
+
+        _append_jsonl(tp_r8, {"step_index": s + 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "取消 /goal\n先别交接，继续当前对话"})
+        session_context_loader.handle_pre_invocation({"conversationId": conv_r8, "transcriptPath": str(tp_r8)})
+        g_r8 = handoff_gate.load_gate_state(state_dir, conv_r8)
+        self.assertFalse(g_r8["isGoalActive"], "显式取消 /goal 必须关闭 isGoalActive")
+        self.assertEqual(g_r8["phase"], "overridden")
+
+        for k in range(3):
+            s += 150
+            _append_jsonl(tp_r8, {"step_index": s, "source": "SYSTEM", "type": "CHECKPOINT"})
+        session_context_loader.handle_pre_invocation({"conversationId": conv_r8, "transcriptPath": str(tp_r8)})
+        self.assertEqual(handoff_gate.load_gate_state(state_dir, conv_r8)["phase"], "drain")
+
+        _append_jsonl(tp_r8, {"step_index": s + 5, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "取消 /goal\n先别交接，继续当前对话"})
+        session_context_loader.handle_pre_invocation({"conversationId": conv_r8, "transcriptPath": str(tp_r8)})
+        self.assertEqual(handoff_gate.load_gate_state(state_dir, conv_r8)["phase"], "overridden")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

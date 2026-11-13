@@ -569,6 +569,62 @@ class HarnessTests(unittest.TestCase):
         a_explicit_3p = harness.resolve_execution_profile(engines, 'agy:othervendor-pro-high', 'high', '指定模型审查', kind='review')
         self.assertEqual(a_explicit_3p['model'], 'othervendor-pro-high')
 
+        # 5. 新一代轻量高速标识 (hydrogen) 与混动路由器共存：深思与主力锁定 flagship (carbon)，low 挡精准命中同代 hydrogen（不误用旧代 flash），显式/模糊调用均可用
+        g4_engines = backends()
+        g4_engines['agy']['models'] = [
+            {'slug': 'omega-hydrogen-xhigh', 'display_name': 'Omega 4 Hydrogen XHigh'},
+            {'slug': 'omega-carbon-medium', 'display_name': 'Omega 4 Carbon (Medium)'},
+            {'slug': 'omega-carbon-high', 'display_name': 'Omega 4 Carbon (High)'},
+            {'slug': 'omega-carbon-low', 'display_name': 'Omega 4 Carbon (Low)'},
+            {'slug': 'omega-argon-high', 'display_name': 'Omega 4 Argon (High)'},
+            {'slug': 'omega-hydrogen-low', 'display_name': 'Omega 4 Hydrogen (Low)'},
+            {'slug': 'omega-pro-orchestrator', 'display_name': 'Orchestrator (Carbon)'},
+            {'slug': 'omega-pro-orchestrator-argon', 'display_name': 'Orchestrator (Argon)'},
+            {'slug': 'omega-3.8-flash-low', 'display_name': 'Omega 3.8 Flash (Low)'},
+        ]
+        g4_work = harness.resolve_execution_profile(g4_engines, 'agy:default', 'high', '常规功能实现', kind='code')
+        g4_deep = harness.resolve_execution_profile(g4_engines, 'agy:default', 'max', '推导熵守恒格式', kind='math')
+        g4_fast = harness.resolve_execution_profile(g4_engines, 'agy:default', 'low', '省额度快速扫查', kind='review')
+        g4_no_light = harness.resolve_execution_profile(g4_engines, 'agy:default', 'low', '不要 hydrogen 低档看下', kind='review')
+        self.assertEqual((g4_work['model'], g4_work['profile_source']), ('omega-carbon-high', 'frontier_catalog'))
+        self.assertEqual((g4_deep['model'], g4_deep['profile_source']), ('omega-carbon-high', 'specialty_deep_reasoning'))
+        self.assertEqual((g4_fast['model'], g4_fast['profile_source']), ('omega-hydrogen-low', 'specialty_fast_lightweight'))
+        self.assertEqual(g4_no_light['model'], 'omega-carbon-low')
+        self.assertEqual(harness.resolve_execution_profile(g4_engines, 'agy:Orchestrator (Carbon)', 'high')['model'], 'omega-pro-orchestrator')
+        self.assertEqual(harness.resolve_execution_profile(g4_engines, 'agy:orchestrator-argon', 'high')['model'], 'omega-pro-orchestrator-argon')
+        self.assertEqual(harness.resolve_execution_profile(g4_engines, 'agy:carbon', 'medium')['model'], 'omega-carbon-medium')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'codex:fast', 'low')['model'], 'model-fast')
+
+        # 自然语言显式/模糊点名模型 + CFD 物理术语/否定词零误触 + Codex 模糊预算 + agy:<alias> 目录发现
+        nl_argon = harness.resolve_execution_profile(g4_engines, 'agy:default', 'high', '请调用 Argon 模型复核推导', kind='review')
+        self.assertEqual((nl_argon['model'], nl_argon['profile_source']), ('omega-argon-high', 'prompt_fuzzy_model'))
+        nl_carbon_med = harness.resolve_execution_profile(g4_engines, 'agy:default', 'high', '请调用 Carbon (Medium) 模型复核', kind='review')
+        self.assertEqual((nl_carbon_med['model'], nl_carbon_med['profile_source']), ('omega-carbon-medium', 'prompt_fuzzy_model'))
+        nl_orch = harness.resolve_execution_profile(g4_engines, 'agy:default', 'high', '请使用混动 Orchestrator 路由检查', kind='review')
+        self.assertEqual((nl_orch['model'], nl_orch['profile_source']), ('omega-pro-orchestrator', 'prompt_fuzzy_model'))
+        nl_codex = harness.resolve_execution_profile(engines, 'codex:default', 'max', '请调用 demanding 模型推导', kind='math')
+        self.assertEqual((nl_codex['model'], nl_codex['profile_source']), ('model-demanding', 'prompt_fuzzy_model'))
+
+        cfd_safe = harness.resolve_execution_profile(
+            g4_engines, 'agy:default', 'high',
+            '计算 hydrogen detonation 爆轰波与 carbon 热流，采用 k-omega 模型与 Navier-Stokes 模型离散；采用 hydrogen 模型计算爆轰', kind='code',
+        )
+        self.assertEqual((cfd_safe['model'], cfd_safe['profile_source']), ('omega-carbon-high', 'frontier_catalog'))
+        self.assertIsNone(harness._match_effort_level(['ultra'], 'high', ['ultra']))
+        neg_prompt = harness.resolve_execution_profile(g4_engines, 'agy:default', 'high', '不要用 Argon 模型，常规复核', kind='review')
+        self.assertEqual((neg_prompt['model'], neg_prompt['profile_source']), ('omega-carbon-high', 'frontier_catalog'))
+
+        self.assertEqual(harness._budget_for_spec(engines, 'codex:demanding'), int(272000 * 0.90))
+
+        fake_agy_bin = self.root / ('agy.exe' if os.name == 'nt' else 'agy')
+        fake_agy_bin.write_text('stub', encoding='utf-8')
+        fresh_backends = backends()
+        fresh_backends['agy']['binary'] = str(fake_agy_bin)
+        with patch.object(harness, 'probe_backends', return_value=g4_engines) as mock_probe:
+            harness._ensure_live_agy_catalog(self.args('probe'), fresh_backends, ('agy:carbon',))
+        mock_probe.assert_called_once()
+        self.assertEqual(fresh_backends['agy']['models'], g4_engines['agy']['models'])
+
         # 单文件表面拼写检查自动降至 low
         tier_typo, reason_typo = harness.select_task_tier('auto', 'review', '检查注释错别字与 typo', 1, 300)
         self.assertEqual((tier_typo, reason_typo), ('low', 'complexity_trivial_surface_task'))

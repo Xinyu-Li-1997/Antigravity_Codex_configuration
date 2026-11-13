@@ -263,7 +263,7 @@ def _model_records(cache):
                 for lvl in levels
                 if isinstance(lvl, dict)
                 and lvl.get('effort') in EFFORT_LADDER
-                and 'delegation' in str(lvl.get('description') or '').lower()
+                and ('delegation' in str(lvl.get('description') or '').lower() or lvl.get('effort') == 'ultra')
             ]
             if delegating:
                 rec['delegating_efforts'] = delegating
@@ -373,10 +373,11 @@ def _match_effort_level(supported, target_tier, delegating_efforts=None):
     if not valid:
         return None
     if target_tier != 'ultra':
-        blocked = set(delegating_efforts if delegating_efforts is not None else ('ultra',))
+        blocked = set(delegating_efforts or ()) | {'ultra'}
         non_delegating = [item for item in valid if item not in blocked]
-        if non_delegating:
-            valid = non_delegating
+        if not non_delegating:
+            return None
+        valid = non_delegating
     if target_tier in ('max', 'ultra'):
         return max(valid, key=EFFORT_LADDER.index)
     target_rank = EFFORT_LADDER.index(target_tier)
@@ -458,18 +459,204 @@ def select_task_tier(requested_tier='auto', kind='review', text='', file_count=1
     return 'high', 'task_routine_high'
 
 
+ROUTER_MODEL_TAGS = {'orchestrator', 'router', 'auto'}
+FAST_MODEL_TAGS = {'lite', 'mini', 'fast', 'flash', 'hydrogen'}
+NON_AI_MODEL_STOPWORDS = {
+    'turbulence', 'rans', 'les', 'dns', 'sst', 'kepsilon', 'komega', 'spalart', 'allmaras',
+    'epsilon', 'navier', 'stokes', 'euler', 'boltzmann', 'bgk', 'muscl', 'tvd', 'godunov',
+    'smagorinsky', 'vreman', 'courant', 'knudsen', 'reynolds', 'prandtl', 'mach',
+    'weno', 'cweno', 'eno', 'dg', 'dgsem', 'fvm', 'fem', 'fdm', 'cfd', 'cae', 'eos',
+    'riemann', 'roe', 'hll', 'hllc', 'hlle', 'ausm', 'rusanov', 'rk', 'bdf', 'cfl',
+    'model', 'models', 'default', 'auto', 'cli', 'lite', 'lightweight',
+}
+PROMPT_MODEL_HINT_PATTERNS = (
+    re.compile(
+        r'(?:请)?(?:使用|调用|采用|切到|切换至|指定|选用|改用|用)\s*'
+        r'((?:混动\s*)?[A-Za-z][A-Za-z0-9._()（） -]{1,40}?|混动(?:路由(?:器)?)?)\s*'
+        r'(?:AI\s*)?(?:模型|路由(?:器)?|引擎)',
+        re.IGNORECASE,
+    ),
+    re.compile(r'(?:指定模型|执行模型|目标模型)\s*[:=：]\s*([A-Za-z][A-Za-z0-9._()（）-]{1,40})', re.IGNORECASE),
+    re.compile(
+        r'(?:请)?(?:使用|调用|采用|切到|切换至|指定|选用|改用|用)\s*'
+        r'(?:混动\s*)?(orchestrator(?:\s*[-()（）A-Za-z0-9]+)?)',
+        re.IGNORECASE,
+    ),
+)
+
+
+PHYSICAL_SUBSTANCE_TAGS = {
+    'hydrogen', 'carbon', 'argon', 'oxygen', 'nitrogen', 'helium', 'methane', 'air', 'water', 'soot',
+}
+PHYSICS_MODEL_CONTEXT_RE = re.compile(
+    r'(?:计算|模拟|仿真|求解|离散|预测|分析|爆轰|燃烧|反应|组分|流场|传热|热流|'
+    r'detonation|combustion|reaction|species|flow|chemistry|flame)',
+    re.IGNORECASE,
+)
+
+
+def _extract_prompt_model_hint(prompt_text):
+    text = str(prompt_text or '').strip()
+    if not text:
+        return ''
+    stop_words = NON_AI_MODEL_STOPWORDS - ROUTER_MODEL_TAGS
+    for pattern in PROMPT_MODEL_HINT_PATTERNS:
+        for match in pattern.finditer(text):
+            prefix = text[max(0, match.start() - 4):match.start()].lower()
+            if any(neg in prefix for neg in NEGATION_PREFIXES):
+                continue
+            cand = re.sub(r'\s+', ' ', match.group(1)).strip()
+            if not cand:
+                continue
+            tokens = [tok for tok in re.findall(r'[a-z0-9]+', cand.lower()) if tok]
+            collapsed = re.sub(r'[^a-z0-9]+', '', cand.lower())
+            if collapsed in stop_words or any(tok in stop_words for tok in tokens):
+                continue
+            if collapsed in PHYSICAL_SUBSTANCE_TAGS:
+                has_ai_qualifier = bool(re.search(r'(?:\bAI\b|\bagy\b|\bcodex\b|\bgemini\b|\borchestrator\b|[()（）])', match.group(0), re.IGNORECASE))
+                tail_ctx = text[match.end():min(len(text), match.end() + 24)]
+                head_ctx = text[max(0, match.start() - 16):match.start()]
+                if not has_ai_qualifier and cand.islower() and (
+                    PHYSICS_MODEL_CONTEXT_RE.search(tail_ctx) or PHYSICS_MODEL_CONTEXT_RE.search(head_ctx)
+                ):
+                    continue
+            if tokens or '混动' in cand:
+                return cand
+    return ''
+
+
+def _tokens_lower(text):
+    return set(re.split(r'[^a-z0-9]+', str(text or '').lower())) - {''}
+
+
+def _resolve_explicit_codex_record(models, explicit_model):
+    q = str(explicit_model or '').strip()
+    if not q:
+        return {}
+    ql = q.lower()
+    exact = next((item for item in models if str(item.get('slug') or '').lower() == ql), None)
+    if exact:
+        return exact
+    visible = [
+        item for item in models
+        if item.get('visibility') != 'hide' and 'auto-review' not in str(item.get('slug') or '').lower()
+    ] or list(models)
+    ordered = sorted(
+        visible,
+        key=lambda item: (
+            1 if str(item.get('description') or '').strip().lower().startswith('older ') else 0,
+            _positive_int(item.get('priority')) or 9999,
+            0,
+        ),
+    )
+    q_tokens = [tok for tok in re.findall(r'[a-z0-9.]+', ql) if tok]
+    if not q_tokens:
+        return {}
+    matched = [
+        item for item in ordered
+        if all(tok in f"{item.get('slug', '')} {item.get('display_name', '')}".lower() for tok in q_tokens)
+    ]
+    return matched[0] if matched else {}
+
+
+def _resolve_explicit_agy_model(models, explicit_model, tier, strict_catalog=False):
+    q = str(explicit_model or '').strip()
+    ql = q.lower()
+    exact = next(
+        (
+            item['slug'] for item in models
+            if str(item.get('slug') or '').lower() == ql
+            or str(item.get('display_name') or '').lower() == ql
+        ),
+        '',
+    )
+    if exact:
+        _, slug_tier = _agy_slug_tier(exact)
+        cli_effort = None if slug_tier else (tier if tier in ('low', 'medium', 'high', 'xhigh', 'max') and tier != 'max' else None)
+        return {'spec': f'agy:{exact}', 'model': exact, 'reasoning_effort': slug_tier or cli_effort,
+                'cli_effort': cli_effort, 'tier': tier, 'profile_source': 'explicit_engine_model'}
+
+    # Fuzzy alias resolution (e.g. "carbon", "argon", "hydrogen", "orchestrator", "orchestrator-argon")
+    q_clean = re.sub(r'[（）()]', ' ', ql).strip()
+    q_tokens = [tok for tok in re.findall(r'[a-z0-9.]+', q_clean) if tok]
+    wants_router = bool(set(q_tokens) & ROUTER_MODEL_TAGS) or ('混动' in q)
+    families = {}
+    router_candidates = []
+    for item in models:
+        slug = str(item.get('slug') or '')
+        label = str(item.get('display_name') or '')
+        fam, fam_tier = _agy_slug_tier(slug)
+        if fam and fam_tier and not (_tokens_lower(fam) & ROUTER_MODEL_TAGS):
+            families.setdefault(fam, {})[fam_tier] = slug
+        else:
+            router_candidates.append((slug, label))
+
+    explicit_q_tiers = [tok for tok in q_tokens if tok in EFFORT_LADDER]
+    fam_q_tokens = [tok for tok in q_tokens if tok not in EFFORT_LADDER] or q_tokens
+    if not wants_router and fam_q_tokens:
+        fam_hits = [
+            fam for fam in families
+            if all(tok in fam.lower() for tok in fam_q_tokens)
+        ]
+        if fam_hits:
+            chosen_fam = fam_hits[0]
+            target_tier = explicit_q_tiers[-1] if explicit_q_tiers else tier
+            best_tier = _match_effort_level(list(families[chosen_fam]), target_tier)
+            slug = families[chosen_fam][best_tier]
+            return {'spec': f'agy:{slug}', 'model': slug, 'reasoning_effort': best_tier,
+                    'cli_effort': None, 'tier': target_tier, 'profile_source': 'explicit_fuzzy_model'}
+
+    if q_tokens or wants_router:
+        search_tokens = [tok for tok in q_tokens if tok not in ('orchestrator', 'router')] if wants_router else q_tokens
+        hits = []
+        for slug, label in router_candidates:
+            hay = f'{slug} {label}'.lower()
+            is_router_item = bool(_tokens_lower(hay) & ROUTER_MODEL_TAGS)
+            if wants_router and not is_router_item:
+                continue
+            if not search_tokens and wants_router and is_router_item:
+                hits.append(slug)
+            elif search_tokens and all(tok in hay for tok in search_tokens):
+                hits.append(slug)
+        if hits:
+            slug = hits[0]
+            return {'spec': f'agy:{slug}', 'model': slug, 'reasoning_effort': None,
+                    'cli_effort': None, 'tier': tier, 'profile_source': 'explicit_fuzzy_model'}
+
+    if strict_catalog:
+        return None
+
+    _, slug_tier = _agy_slug_tier(q)
+    cli_effort = None if slug_tier else (tier if tier in ('low', 'medium', 'high', 'xhigh', 'max') and tier != 'max' else None)
+    return {'spec': f'agy:{q}', 'model': q, 'reasoning_effort': slug_tier or cli_effort,
+            'cli_effort': cli_effort, 'tier': tier, 'profile_source': 'explicit_engine_model'}
+
+
 def resolve_execution_profile(backends, spec, tier='high', prompt_text='', kind='review', estimated_tokens=0):
     prefix, explicit_model = _engine_parts(spec)
     info = backends.get(prefix, {})
     models = info.get('models', [])
     if prefix == 'codex':
         if explicit_model:
-            record = next((item for item in models if item.get('slug') == explicit_model), {})
+            record = _resolve_explicit_codex_record(models, explicit_model)
+            resolved_slug = record.get('slug') or explicit_model
+            source = 'explicit_engine_model' if resolved_slug == explicit_model else 'explicit_fuzzy_model'
             effort = _match_effort_level(record.get('supported_efforts', []), tier, record.get('delegating_efforts'))
             if not effort and tier not in ('max', 'ultra'):
                 effort = tier
-            return {'spec': f'codex:{explicit_model}', 'model': explicit_model, 'reasoning_effort': effort,
-                    'cli_effort': effort, 'tier': tier, 'profile_source': 'explicit_engine_model'}
+            return {'spec': f'codex:{resolved_slug}', 'model': resolved_slug, 'reasoning_effort': effort,
+                    'cli_effort': effort, 'tier': tier, 'profile_source': source}
+        if models and prompt_text:
+            hint = _extract_prompt_model_hint(prompt_text)
+            if hint:
+                hint_rec = _resolve_explicit_codex_record(models, hint)
+                if hint_rec and hint_rec.get('slug'):
+                    resolved_slug = hint_rec['slug']
+                    effort = _match_effort_level(hint_rec.get('supported_efforts', []), tier, hint_rec.get('delegating_efforts'))
+                    if not effort and tier not in ('max', 'ultra'):
+                        effort = tier
+                    return {'spec': f'codex:{resolved_slug}', 'model': resolved_slug, 'reasoning_effort': effort,
+                            'cli_effort': effort, 'tier': tier, 'profile_source': 'prompt_fuzzy_model'}
         record, cat_source = _select_codex_specialty_record(models, info.get('model'), kind, tier, prompt_text, estimated_tokens)
         slug = record.get('slug') or info.get('model') or ''
         effort = _match_effort_level(record.get('supported_efforts', []), tier, record.get('delegating_efforts'))
@@ -482,26 +669,28 @@ def resolve_execution_profile(backends, spec, tier='high', prompt_text='', kind=
                 'reasoning_effort': effort, 'cli_effort': effort, 'tier': tier,
                 'profile_source': cat_source if record.get('slug') else ('local_config' if slug else 'cli_default')}
     if explicit_model:
-        by_label = next((item['slug'] for item in models if item.get('display_name', '').lower() == explicit_model.lower()), '')
-        slug = by_label or explicit_model
-        _, slug_tier = _agy_slug_tier(slug)
-        cli_effort = None if slug_tier else (tier if tier in ('low', 'medium', 'high', 'xhigh', 'max') and tier != 'max' else None)
-        return {'spec': f'agy:{slug}', 'model': slug, 'reasoning_effort': slug_tier or cli_effort,
-                'cli_effort': cli_effort, 'tier': tier, 'profile_source': 'explicit_engine_model'}
+        return _resolve_explicit_agy_model(models, explicit_model, tier)
+    if models and prompt_text:
+        hint = _extract_prompt_model_hint(prompt_text)
+        if hint:
+            hint_prof = _resolve_explicit_agy_model(models, hint, tier, strict_catalog=True)
+            if hint_prof is not None:
+                hint_prof['profile_source'] = 'prompt_fuzzy_model'
+                return hint_prof
     families = {}
     for item in models:
         fam, fam_tier = _agy_slug_tier(item.get('slug', ''))
-        if fam and fam_tier:
+        if fam and fam_tier and not (_tokens_lower(fam) & ROUTER_MODEL_TAGS):
             families.setdefault(fam, {})[fam_tier] = item['slug']
     if families:
         ordered_names = list(families)
         primary_vendor = ordered_names[0].split('-', 1)[0]
         native_families = [name for name in ordered_names if name.split('-', 1)[0] == primary_vendor] or ordered_names
-        chosen_family = native_families[0]
+        is_fast_family = lambda name: bool(_tokens_lower(name) & FAST_MODEL_TAGS)
+        non_fast = [name for name in native_families if not is_fast_family(name)] or native_families
+        chosen_family = non_fast[0]
         profile_source = 'frontier_catalog'
-        fast_tags = {'lite', 'mini', 'fast', 'flash'}
-        is_fast_family = lambda name: bool(set(re.split(r'[^a-z0-9]+', name.lower())) & fast_tags)
-        fast_negated = _has_negated_cue(prompt_text or '', ('轻量', '极速', 'lite', 'mini', 'fast', 'flash'))
+        fast_negated = _has_negated_cue(prompt_text or '', ('轻量', '极速', 'lite', 'mini', 'fast', 'flash', 'hydrogen', '氢'))
         if tier == 'low' and not fast_negated:
             fast_family = next((name for name in native_families if is_fast_family(name)), '')
             if fast_family:
@@ -512,16 +701,12 @@ def resolve_execution_profile(backends, spec, tier='high', prompt_text='', kind=
             and tier in ('max', 'xhigh', 'ultra')
             and _has_positive_cue(prompt_text or '', ('证明', '定理', '引理', '推导', '守恒', '熵', '收敛阶', '稳定性'))
         ):
-            non_fast = [name for name in native_families if not is_fast_family(name)] or native_families
-            primary_max_rank = max(EFFORT_LADDER.index(t) for t in families[chosen_family] if t in EFFORT_LADDER)
             deep_family = max(
                 non_fast,
                 key=lambda name: (max(EFFORT_LADDER.index(t) for t in families[name] if t in EFFORT_LADDER), -non_fast.index(name)),
             )
-            deep_max_rank = max(EFFORT_LADDER.index(t) for t in families[deep_family] if t in EFFORT_LADDER)
-            if deep_max_rank > primary_max_rank:
-                chosen_family = deep_family
-                profile_source = 'specialty_deep_reasoning'
+            chosen_family = deep_family
+            profile_source = 'specialty_deep_reasoning'
         best_tier = _match_effort_level(list(families[chosen_family]), tier)
         slug = families[chosen_family][best_tier]
         return {'spec': f'agy:{slug}', 'model': slug, 'reasoning_effort': best_tier,
@@ -891,7 +1076,7 @@ def _budget_for_spec(backends, spec):
     info = backends[name]
     if not model or name != 'codex':
         return info['safe_input_budget_tokens']
-    record = next((item for item in info.get('models', []) if item.get('slug') == model), {})
+    record = _resolve_explicit_codex_record(info.get('models', []), model)
     cap = info.get('configured_window_tokens') or _positive_int(record.get('context_window'))
     maximum = _positive_int(record.get('max_context_window'))
     if cap and maximum:
@@ -1557,7 +1742,7 @@ def cmd_probe(args):
 def _ensure_live_agy_catalog(args, backends, specs):
     if getattr(args, 'dry_run', False):
         return
-    needs_agy = any(spec and _engine_parts(spec)[0] == 'agy' and not _engine_parts(spec)[1] for spec in specs)
+    needs_agy = any(spec and _engine_parts(spec)[0] == 'agy' for spec in specs)
     agy_info = backends.get('agy', {})
     binary = agy_info.get('binary')
     if (needs_agy and not agy_info.get('models') and agy_info.get('execution_config_supported', True)
@@ -1804,23 +1989,23 @@ def build_arg_parser():
     parser = argparse.ArgumentParser(description='Codex / Antigravity 双向任务与审计编排')
     sub = parser.add_subparsers(dest='subcommand', required=True)
     probe = sub.add_parser('probe', help='只读探测程序与配置，认证和执行能力分别验证')
-    probe.add_argument('--discover-models', action='store_true', help='显式执行 agy models 查询')
+    probe.add_argument('--discover-models', action='store_true', help='显式执行 agy models 查询并刷新本地模型目录缓存')
     audit = sub.add_parser('audit', help='单路或双路文件审计')
     audit.add_argument('--target', required=True)
     audit.add_argument('--focus', default='')
     audit.add_argument('--strategy', choices=['auto', 'single-pass', 'whole-1m', 'sharded'], default='auto')
     audit.add_argument('--single', action='store_true')
-    audit.add_argument('--left', default='')
-    audit.add_argument('--right', default='')
+    audit.add_argument('--left', default='', help='左路引擎与模型规格（如 codex:default、agy:default，支持精确 slug、显示名或模糊别名如 agy:carbon）')
+    audit.add_argument('--right', default='', help='右路引擎与模型规格（如 agy:default、codex:default，支持精确 slug、显示名或模糊别名）')
     audit.add_argument('--shard-tokens', type=_positive_arg, default=120_000)
     gate = sub.add_parser('gate', help='修改后运行明确验收命令')
     gate.add_argument('--target', required=True)
-    gate.add_argument('--worker', default='')
+    gate.add_argument('--worker', default='', help='执行引擎与模型规格（如 codex:default、agy:default，支持精确 slug、显示名或模糊别名）')
     gate.add_argument('--verify-cmd', required=True)
     task = sub.add_parser('task', help='通用审查、方向、润色、数学和代码任务')
     task.add_argument('--target', required=True)
     task.add_argument('--kind', required=True, choices=['review', 'direction', 'polish', 'math', 'code'])
-    task.add_argument('--engine', default='')
+    task.add_argument('--engine', default='', help='后端与模型规格（如 codex:default、agy:default，支持精确 slug、显示名或模糊别名如 agy:carbon）')
     task.add_argument('--base-commit')
     task.add_argument('--verify-cmd')
     for command in (gate, task):

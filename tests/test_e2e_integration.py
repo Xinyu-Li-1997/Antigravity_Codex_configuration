@@ -546,8 +546,11 @@ class TestEndToEndIntegration(unittest.TestCase):
         """验证安装器动态选取首族最高挡模型且不破坏 config.toml 下游表结构。"""
         label = INSTALLER._select_agy_frontier_max_label(
             [
+                {"slug": "alpha-hydrogen-xhigh", "display_name": "Alpha Hydrogen XHigh"},
+                {"slug": "alpha-pro-orchestrator", "display_name": "Orchestrator (Core)"},
                 {"slug": "alpha-core-medium", "display_name": "Alpha Core (Medium)"},
                 {"slug": "alpha-core-high", "display_name": "Alpha Core (High)"},
+                {"slug": "alpha-core-ultra", "display_name": "Alpha Core (Ultra)"},
                 {"slug": "alpha-core-low", "display_name": "Alpha Core (Low)"},
                 {"slug": "alpha-lite-high", "display_name": "Alpha Lite (High)"},
             ]
@@ -569,7 +572,12 @@ class TestEndToEndIntegration(unittest.TestCase):
                                 "slug": "frontier-top",
                                 "priority": 1,
                                 "visibility": "list",
-                                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}, {"effort": "ultra"}],
+                                "supported_reasoning_levels": [
+                                    {"effort": "low", "description": "Fast"},
+                                    {"effort": "high", "description": "Greater reasoning"},
+                                    {"effort": "max", "description": "Maximum reasoning depth"},
+                                    {"effort": "ultra", "description": "Maximum reasoning with automatic task delegation"},
+                                ],
                             }
                         ]
                     }
@@ -580,8 +588,31 @@ class TestEndToEndIntegration(unittest.TestCase):
                 INSTALLER._sync_codex_frontier_max(codex_dir, dry_run=False)
             updated = (codex_dir / "config.toml").read_text(encoding="utf-8")
             self.assertIn('model = "frontier-top"', updated)
-            self.assertIn('model_reasoning_effort = "ultra"', updated)
+            self.assertIn('model_reasoning_effort = "max"', updated)
+            self.assertNotIn('model_reasoning_effort = "ultra"', updated)
             self.assertIn('[projects."demo"]', updated)
+
+            # 无 delegation/max 的模型列表应正确选出最高非委派挡位 high
+            (codex_dir / "models_cache.json").write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "slug": "frontier-high-only",
+                                "priority": 1,
+                                "visibility": "list",
+                                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                INSTALLER._sync_codex_frontier_max(codex_dir, dry_run=False)
+            updated_high = (codex_dir / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('model = "frontier-high-only"', updated_high)
+            self.assertIn('model_reasoning_effort = "high"', updated_high)
 
     def test_13_installer_codex_workspace_boundary_sync(self) -> None:
         """验证安装器将 Codex 沙箱收紧为 workspace-write + on-request + network_access=true，幂等且保留下游表。"""
@@ -799,6 +830,117 @@ class TestEndToEndIntegration(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             plan_wsl = INSTALLER.resolve_app_plan("auto", False, False, wsl_interop_det, interactive=True, auto_yes=False, dry_run=False)
         self.assertEqual(plan_wsl, (True, False))
+
+    def test_17_handoff_gate_subprocess_pipeline_and_codex_isolation(self) -> None:
+        """通过真实 OS 子进程串联验证长会话交接门禁三点联动，并确保单 Codex 安装不含 handoff_gate.py"""
+        hooks_cfg = json.loads((ACTIVE_PLUGIN_DIR / "hooks.json").read_text(encoding="utf-8"))["user-guard-lifecycle"]
+        pre_cmd = hooks_cfg["PreInvocation"][0]["command"]
+        ptu_cmd = hooks_cfg["PreToolUse"][0]["hooks"][0]["command"]
+        stop_cmd = hooks_cfg["Stop"][0]["command"]
+        self.assertIn("invoke_subagent", hooks_cfg["PreToolUse"][0]["matcher"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin_data = root / "plugin_data"
+            ws_dir = root / "proj"
+            brain_dir = root / "brain" / "e2e-handoff-conv"
+            ws_dir.mkdir(parents=True)
+            tp = brain_dir / ".system_generated" / "logs" / "transcript.jsonl"
+            tp.parent.mkdir(parents=True)
+
+            env = os.environ.copy()
+            env["PLUGIN_DATA"] = str(plugin_data)
+            env.pop("USER_GUARD_STATE_DIR", None)
+            env.pop("USER_GUARD_LOGS_DIR", None)
+
+            def run_sub(raw_cmd: str, payload_dict: dict) -> dict:
+                proc = subprocess.run(
+                    _build_subprocess_cmd(raw_cmd),
+                    input=json.dumps(payload_dict, ensure_ascii=False),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    cwd=str(ACTIVE_PLUGIN_DIR),
+                    env=env,
+                    timeout=15,
+                )
+                self.assertEqual(proc.returncode, 0, f"{raw_cmd} 失败: {proc.stderr}")
+                return json.loads(proc.stdout.strip())
+
+            # 写入人类首条含 /goal 指令与 16 次 CHECKPOINT，直接激发 Stage-2 drain
+            lines = [json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "/goal\n执行端到端长会话验证"}, ensure_ascii=False)]
+            for idx in range(1, 17):
+                lines.append(json.dumps({"step_index": idx * 100, "source": "SYSTEM", "type": "CHECKPOINT"}))
+            tp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            conv_id = "e2e-handoff-conv"
+            out_pre = run_sub(pre_cmd, {"conversationId": conv_id, "transcriptPath": str(tp), "hookEventName": "PreInvocation"})
+            self.assertEqual(len(out_pre["injectSteps"]), 1)
+            self.assertIn("Stage-2 drain", out_pre["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+            # 子进程调用 invoke_subagent 必被阻断；写交接档放行
+            out_subagent = run_sub(ptu_cmd, {"conversationId": conv_id, "cwd": str(ws_dir), "workspacePaths": [str(ws_dir)], "toolCall": {"name": "invoke_subagent", "args": {}}})
+            self.assertEqual(out_subagent["decision"], "deny")
+
+            out_handoff = run_sub(
+                ptu_cmd,
+                {
+                    "conversationId": conv_id,
+                    "cwd": str(ws_dir),
+                    "workspacePaths": [str(ws_dir)],
+                    "toolCall": {"name": "write_file", "args": {"Path": str(ws_dir / "HANDOFF_NEXT.md"), "Content": "# handoff"}},
+                },
+            )
+            self.assertEqual(out_handoff["decision"], "allow")
+
+            # Stop 子进程验收缺失 prompt / GOAL_CANCELLED 时阻断，补全后放行
+            with open(tp, "a", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps({"step_index": 1605, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "准备收尾"}, ensure_ascii=False) + "\n")
+            out_stop_bad = run_sub(stop_cmd, {"conversationId": conv_id, "terminationReason": "NO_TOOL_CALL", "transcriptPath": str(tp)})
+            self.assertEqual(out_stop_bad["decision"], "continue")
+
+            with open(tp, "a", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps({"step_index": 1606, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "补齐交接"}, ensure_ascii=False) + "\n")
+                f.write(
+                    json.dumps(
+                        {
+                            "step_index": 1607,
+                            "source": "MODEL",
+                            "type": "PLANNER_RESPONSE",
+                            "content": "交接已完成。\n\n### 新对话提示词\n```markdown\n请基于 HANDOFF_NEXT.md 接续验证并提交。\n```\n<!-- GOAL_CANCELLED -->",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+            out_stop_ok = run_sub(stop_cmd, {"conversationId": conv_id, "terminationReason": "NO_TOOL_CALL", "transcriptPath": str(tp)})
+            self.assertEqual(out_stop_ok["decision"], "allow")
+
+            # 验证单 Codex 安装不复制 handoff_gate.py 且保持解耦独立运行
+            codex_only_home = root / "codex_only"
+            proc_cx = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-X",
+                    "utf8",
+                    str(REPO_ROOT / "install.py"),
+                    "--app",
+                    "codex",
+                    "--codex-home",
+                    str(codex_only_home),
+                    "--no-zotero",
+                    "--skip-test",
+                    "--yes",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=30,
+            )
+            self.assertEqual(proc_cx.returncode, 0, proc_cx.stderr)
+            self.assertFalse((codex_only_home / "hooks" / "handoff_gate.py").exists())
+            self.assertTrue((codex_only_home / "hooks" / "session_context_loader.py").is_file())
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@
 
 协作是一回事，单客户端自身的工作流通用合理是另一回事。本仓库同时支持三种部署形态，且**支持两边自己给自己配、互相给对方配**：
 
-1. **单 Codex 独立模式（`--app codex`）**：本机只装了 Codex 时独立生效——完整配置 `~/.codex/AGENTS.md` 全局规则（无损保留本机硬件段）、3 个只读子代理（`agents/readonly-*.toml`）、压缩／恢复用户原话回溯钩子（`hooks.json` + `hooks/`）、项目目录边界沙箱与防污染基线（`config.toml`）、主窗口最高挡模型及可选本地 `zotero-mcp`。
-2. **单反重力独立模式（`--app antigravity`）**：本机只装了反重力时独立生效——完整部署 `~/.gemini/config/plugins/user-guard` 原生插件（全局规则、四类生命周期守护钩子、3 个只读子代理）、CLI 最高挡模型及可选本地 `zotero-mcp`。
+1. **单 Codex 独立模式（`--app codex`）**：本机只装了 Codex 时独立生效——完整配置 `~/.codex/AGENTS.md` 全局规则（无损保留本机硬件段）、3 个只读子代理（`agents/readonly-*.toml`）、压缩／恢复用户原话回溯钩子（`hooks.json` + `hooks/`）、项目目录边界沙箱与防污染基线（`config.toml`）、单模型最高挡基线（默认跳过套娃委派 `ultra`）及可选本地 `zotero-mcp`。
+2. **单反重力独立模式（`--app antigravity`）**：本机只装了反重力时独立生效——完整部署 `~/.gemini/config/plugins/user-guard` 原生插件（全局规则、四类生命周期守护钩子：原话压缩恢复、项目硬边界、防空转刷新及反重力专有两阶段长会话交接停机门禁 `handoff_gate.py`，以及 3 个严格只读子代理）、CLI 单模型最高挡及可选本地 `zotero-mcp`。
 3. **双端完整协作模式（默认自动识别双端）**：同时配齐上述两套独立工作流，并启用双端共享的 `cae-harness` 双向派工与验收技能（支持 Windows 与 WSL 原生及跨子系统自动桥接）。
 
 > **单客户端智能提示**：如果本机只安装了其中一个 APP（例如只有 Codex 没装反重力，或只有反重力没装 Codex），无论是直接运行安装脚本还是让 AI 读仓库自举配置，都会先明确提示你**“要不要先去安装另一个客户端以启用双端协作”**；选择不安装，即自动单独配好当前已安装的客户端，零报错、不向未安装一侧生成多余目录。
@@ -62,7 +62,7 @@ cd Antigravity_Codex_configuration
 | 防上下文压缩失忆 | `SessionStart` + `PreInvocation` 增量检查点游标，压缩后首轮自动落盘 `_user_words.md` 并注入 | `SessionStart`（匹配 `compact\|resume`）合并同会话全部 `rollout-*.jsonl` 分段，落盘 `hooks/state/user-words/<id>.md` 并注入（已有有效 `hooks.json` 保持原信任哈希不变） |
 | 三个严格只读子代理 | `agents/readonly-{reader,auditor,collaborator}.md`（仅开放 `read_file`、`search_web`） | `agents/readonly-{reader,auditor,collaborator}.toml`（仅限只读读取、检索与列目录，禁写禁构建） |
 | 项目目录硬边界约束 | `PreToolUse`（`status_guard.py`）AST + Shell 命令头配对拦截越界写删，交互弹窗四要素请示、后台硬阻断；兼防日志原地空转轮询 | `config.toml` 收紧 `sandbox_mode = "workspace-write"`、`approval_policy = "on-request"`、`network_access = true`，并默认关闭外部钩子自动导入（`HOOKS = false`） |
-| 防同质废话与默认挡位 | `Stop`（`reply_repeat_guard.py`）拦截无进展重复等待刷屏；CLI 默认对齐旗舰最高挡 | 默认对齐旗舰模型最高挡与 `model_reasoning_summary = "auto"`，关闭未核实跨会话自动记忆污染 |
+| 防同质废话、长会话交接停机与默认挡位 | `Stop`（`reply_repeat_guard.py`）拦截无进展重复等待刷屏；`handoff_gate.py` 提供反重力专有两阶段“原子收口＋交接停机”硬门禁（防长会话历史截断与多模态读图坍塌，禁新开派工并验收 `/goal` 停止标记）；CLI 默认对齐单模型最高挡 | 默认对齐旗舰单模型纯思考最高挡（跳过 `ultra` 套娃自动委派）与 `model_reasoning_summary = "auto"`，关闭未核实跨会话自动记忆污染 |
 | 本地文献库接入（可选） | 自动探测本机 `zotero-mcp` 并无损写入 `mcp_config.json`（未安装则静默跳过） | 自动探测本机 `zotero-mcp` 并无损写入 `config.toml` 的 `[mcp_servers.zotero]`（未安装则静默跳过） |
 
 ### 2. 双端安装时的跨平台自动协作（`cae-harness`）
@@ -74,7 +74,7 @@ cd Antigravity_Codex_configuration
 | 代码工程 | Codex | 反重力参与方向校正、技术表述润色和独立验收 |
 | 科研主题 | 反重力 | Codex 承担其中部分高质量编码和数学推导工作 |
 
-1. **模型因地制宜按专长选路，思考挡位按任务分级**：运行期动态解析两侧模型元数据——数理推导（`math`）与路线攻坚（`direction`）优先调度深度推理专长模型并采用**单模型纯思考最高挡**（`max`／`xhigh`，后台子任务默认禁开二次套娃派生挡位 `ultra`）；大窗口编码（`code`）、全量审计（`audit`）与门禁闭环（`gate`）调度大上下文工程主力模型（常规 `high` 挡，高阶数值格式／守恒性／并发根因或门禁排错轮自动升至 `max` 挡）；短篇纯润色采用 `medium` 挡；表面核查采用轻量高速 `low` 挡；自动保护宿主内长周期稀缺配额池不被后台消耗。
+1. **两级模型架构与专长分级选路（一级总控不冲突 + 二级自适应／显式／模糊选路）**：前端交互式主会话（一级总控）完全支持用户直接选用纯旗舰深思模型或 `Orchestrator` 混动自动路由器作为优先总控；后台并发流与跨端任务（二级执行层，`cae-harness`）在不冲突的前提下按专长动态自适应选路（自动区分深度推理旗舰、大上下文主力与含 `flash`/`hydrogen`/`lite`/`mini` 标签的同代轻量高速家族，排除混动路由器与长周期稀缺配额池误抢占），同时支持 `--engine` 与 `--tier` 的显式精确指定、模糊别名直达及任务描述显式点名模型（内置 CFD 物理名词防误触保护）：数理推导（`math`）与路线攻坚（`direction`）拉满**单模型纯思考最高挡**（`max`／`xhigh`，后台默认禁开套娃派生 `ultra`）；常规编码／审计／`gate` 首轮用主力 `high` 挡（复杂格式／根因或重试轮升至 `max`）；短润色用 `medium` 挡；表面核查用轻量高速 `low` 挡。
 2. **额度不足自动熔断，交由你二选一**：任一端触发额度上限时立即停止重试（返回 `quota_exhausted`，退出码 `5`）并记入本侧冷却缓存；冷却期内再次触发跨端调用前自动拦截，提示你选择 **① 先不发起（由当前主控在本侧独立完成）** 或 **② 充值／恢复后加 `--retry-quota` 重试**。
 3. **无痕会话隔离**：调用 Codex 固定启用 `codex exec --ephemeral`，调用反重力走独立无头存储 `~/.gemini/antigravity-cli`，绝不污染两侧桌面聊天侧边栏与项目树。
 
@@ -127,6 +127,6 @@ python -B -X utf8 -m unittest discover -s tests -p "test_*.py" -v
 
 ## 六、 安全边界与开源许可
 
-- **安全使用边界**：授权代码写入子任务（`task --kind code` 与 `gate`）由宿主工作区沙箱（`codex -s workspace-write`／`agy --sandbox`）与 `PreToolUse` 硬边界钩子双重兜底（越界操作硬阻断），并在执行前后核对工作区文件快照；建议始终在受 Git 管理的项目工作区中使用。
+- **安全使用边界**：授权代码写入子任务（`task --kind code` 与 `gate`）由宿主工作区沙箱（`codex -s workspace-write`／`agy --sandbox`）与 `PreToolUse` 硬边界钩子双重防护（越界操作硬阻断），并在执行前后核对工作区文件快照；建议始终在受 Git 管理的项目工作区中使用。
 - **外部工具与合规声明**：本仓库仅包含原创 Python 标准库脚本与声明式配置文档，仅通过操作系统标准命令行子进程调用用户自行从官方渠道安装并完成官方账号登录的本地客户端（`agy`、`codex` 及可选本地文献工具 `zotero-mcp`）；不包含、不链接亦不分发任何第三方专有程序或认证凭据，不接入任何非官方第三方接口，亦不包含任何绕过官方认证、权限或计费限制的机制。
 - **开源许可证**：本仓库采用 [Apache License 2.0](LICENSE) 开源许可（`Copyright 2026 Xinyu-Li-1997`）。软件按“原样（AS IS）”提供，不附带任何明示或暗示担保；任何修改版分发须按许可证第 4(b) 条在变更文件中保留显著修改声明。

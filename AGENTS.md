@@ -4,9 +4,9 @@
 
 ## 一、 核心原则：独立工作流与跨端协作解耦
 
-1. **单 Codex 独立生效（`--app codex`）**：部署 `~/.codex/AGENTS.md`（保留末尾自定义 `## 工具与本机`）、只读子代理（`agents/readonly-*.toml`）、压缩／恢复原话回溯钩子（`hooks.json` + `hooks/`）、项目边界沙箱与最高挡模型基线（`config.toml`）及可选 `zotero-mcp`。
-2. **单反重力独立生效（`--app antigravity`）**：部署 `~/.gemini/config/plugins/user-guard` 全套原生插件（全局规则、四类生命周期守护钩子、三个只读子代理）、CLI 最高挡模型基线及可选 `zotero-mcp`。
-3. **双端完整生效与双向协作（`--app both` 或自动检测双端）**：同时部署上述两套独立工作流，并启用双端共享的 `cae-harness` 跨平台派工与验收技能（支持 Windows 与 WSL 原生及跨子系统互操作回退）。
+1. **单 Codex 独立生效（`--app codex`）**：部署 `~/.codex/AGENTS.md`（保留末尾自定义 `## 工具与本机`）、只读子代理（`agents/readonly-*.toml`）、压缩／恢复原话回溯钩子（`hooks.json` + `hooks/`）、项目边界沙箱与单模型最高挡基线（`config.toml`，默认跳过套娃委派 `ultra`）及可选 `zotero-mcp`。
+2. **单反重力独立生效（`--app antigravity`）**：部署 `~/.gemini/config/plugins/user-guard` 全套原生插件（全局规则、四类生命周期事件守护钩子——含压缩原话恢复 `session_context_loader.py`、项目目录硬边界与防空转 `status_guard.py`、防刷屏与终止检验 `reply_repeat_guard.py` 及反重力专有两阶段长会话交接停机门禁 `handoff_gate.py`、以及三个只读子代理）、CLI 单模型最高挡基线及可选 `zotero-mcp`。
+3. **双端完整生效与双向协作（`--app both` 或自动检测双端）**：同时部署上述两套独立工作流，并启用双端共享的 `cae-harness` 跨平台派工与验收技能（支持 Windows 与 WSL 原生及跨子系统互操作回退；前端一级交互总控优先尊重用户所选纯旗舰或 `Orchestrator` 混动模型，后台二级并发流独立执行专长自适应与显式／模糊选路）。
 
 ## 二、 AI 引导本机配置标准流程（双向自举）
 

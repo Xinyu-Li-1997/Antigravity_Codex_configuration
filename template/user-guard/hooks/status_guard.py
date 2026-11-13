@@ -1,5 +1,5 @@
 """
-status_guard.py - 反重力 PreToolUse 项目目录硬边界与防空转轮询门禁 (user-guard)
+status_guard.py - 反重力 PreToolUse 项目目录硬边界、长会话交接门禁与防空转轮询门禁 (user-guard)
 
 核心职责：
 1. 项目目录外文件改动硬约束（R4 硬门禁，防在业务盘乱建目录与越权篡改配置）：
@@ -7,7 +7,9 @@ status_guard.py - 反重力 PreToolUse 项目目录硬边界与防空转轮询�
    - 通过内联 Python AST 语法树分析与 Shell 子句命令头精确配对，拦截 run_command 向项目目录外创建 git worktree（如 ../.codex-worktrees）、写删改外部路径或执行全局生产安装（忽略只读打开、数组 .copy()、.md 文件名与外部解释器调用，杜绝误报）；
    - 自动放行系统标准临时目录、宿主与项目关联的对话记忆/子代理轨迹/制品草稿（brain / plugin_data / memories / sessions 等）、标准工具缓存（~/.cache）及 Windows<->WSL 同项目挂载路径；
    - 交互主会话触发真实越界时返回 force_ask，在弹窗清晰列出“当前任务意图 + 具体写删动作 + 项目外目标路径 + 触发语句”请求用户明确批准；无头跨端子任务（CAE_HARNESS_DEPTH=1）直接硬 deny。
-2. 防空转轮询门禁（适配 Antigravity Reactive Wakeup 响应式唤醒机制）：
+2. 反重力专有长会话两阶段交接停机门禁（联动 handoff_gate.py）：
+   - 在 drain/freeze 收口期内严禁新开子代理/swarm/schedule/browser/cae_harness 派工、禁止读图及 git push，按排空预算管控写/运行动作并无阻断放行只读核对、交接档写入与本地 git add/commit。
+3. 防空转轮询门禁（适配 Antigravity Reactive Wakeup 响应式唤醒机制）：
    - read_file 读取算例/任务证据文件（将 StartLine/EndLine/ByteOffset 编入查询键，放行正常长文件翻页阅读）；
    - run_command 使用只读命令查看证据文件（将归一化命令参数编入查询键，放行变参检索）；
    - manage_task (Action == "status") 轮询后台任务状态（自动联动 .system_generated/tasks/<TaskId>.log 真实物理指纹，有新输出自动放行，杜绝永久锁死）。
@@ -24,12 +26,12 @@ import sys
 import tempfile
 import time
 import traceback
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 HOOKS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOOKS_DIR))
+import handoff_gate  # noqa: E402
 import user_words  # noqa: E402
 
 user_words.ensure_utf8_stdio()
@@ -67,8 +69,8 @@ SHELL_WRAPPERS = {"bash", "sh", "zsh", "cmd", "cmd.exe", "powershell", "powershe
 LARGE_FILE_THRESHOLD = 4 * 1024 * 1024  # 4 MB
 CHUNK_SAMPLE_BYTES = 1 * 1024 * 1024    # 1 MB
 TASK_NO_LOG_COOLDOWN_SEC = 30.0
-MAX_LOG_BYTES = 2 * 1024 * 1024
-TRIM_LOG_BYTES = 1 * 1024 * 1024
+MAX_LOG_BYTES = user_words.MAX_LOG_BYTES
+TRIM_LOG_BYTES = user_words.TRIM_LOG_BYTES
 
 DENY_REASON_TEXT = (
     "【user-guard 防空转门禁阻断】目标证据文件内容与查询参数自上次读取后未发生任何变化。"
@@ -82,32 +84,11 @@ def get_data_dirs() -> Tuple[Path, Path]:
 
 
 def get_current_iso_time() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat()
+    return user_words.current_iso_time()
 
 
 def log_event(event_name: str, conversation_id: str, message: str) -> None:
-    try:
-        _, logs_dir = get_data_dirs()
-        logs_dir.mkdir(parents=True, exist_ok=True)
-        log_file = logs_dir / "lifecycle.log"
-        if log_file.exists() and log_file.stat().st_size > MAX_LOG_BYTES:
-            raw = log_file.read_bytes()
-            tail = raw[-TRIM_LOG_BYTES:]
-            nl = tail.find(b"\n")
-            if nl != -1:
-                tail = tail[nl + 1 :]
-            user_words.atomic_write_text(log_file, tail.decode("utf-8", errors="replace"))
-        entry = {
-            "timestamp": get_current_iso_time(),
-            "event": event_name,
-            "conversationId": conversation_id,
-            "message": message,
-            "summary": {},
-        }
-        with open(log_file, "a", encoding="utf-8", newline="\n") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    user_words.append_lifecycle_log(HOOKS_DIR, event_name, conversation_id, message)
 
 
 def is_evidence_file(file_path_str: str) -> bool:
@@ -786,6 +767,24 @@ def _extract_and_mask_inline_python(command_line: str) -> Tuple[List[str], str]:
     return blocks, "".join(out_parts)
 
 
+def _is_anchored_path_str(path_str: str) -> bool:
+    s = path_str.strip()
+    return s.startswith(("/", "\\", "~")) or bool(re.match(r"^[A-Za-z]:", s))
+
+
+def _join_ast_path_parts(parts: List[str]) -> Optional[str]:
+    valid = [s for s in parts if s]
+    if not valid:
+        return None
+    acc = valid[0].rstrip("/\\") or valid[0]
+    for seg in valid[1:]:
+        if _is_anchored_path_str(seg):
+            acc = seg.rstrip("/\\") or seg
+        else:
+            acc = (acc.rstrip("/\\") + "/" + seg.lstrip("/\\")) if acc else seg
+    return acc
+
+
 def _eval_ast_path_expr(node: ast.AST, bindings: Dict[str, str]) -> Optional[str]:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
@@ -803,9 +802,11 @@ def _eval_ast_path_expr(node: ast.AST, bindings: Dict[str, str]) -> Optional[str
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
         left = _eval_ast_path_expr(node.left, bindings)
         right = _eval_ast_path_expr(node.right, bindings)
+        if right and _is_anchored_path_str(right):
+            return right
         if left and right:
             return left.rstrip("/\\") + "/" + right.lstrip("/\\")
-        return left
+        return left or right
     if isinstance(node, ast.Call):
         fn = node.func
         fn_name = ""
@@ -815,14 +816,10 @@ def _eval_ast_path_expr(node: ast.AST, bindings: Dict[str, str]) -> Optional[str
             fn_name = fn.attr
         if fn_name in ("Path", "PurePath", "WindowsPath", "PosixPath", "expanduser", "abspath", "realpath") and node.args:
             subs = [_eval_ast_path_expr(a, bindings) for a in node.args]
-            valid = [s for s in subs if s]
-            if valid:
-                return "/".join(v.strip("/\\") if i > 0 else v.rstrip("/\\") for i, v in enumerate(valid))
+            return _join_ast_path_parts([s for s in subs if s])
         if fn_name == "join" and node.args:
             subs = [_eval_ast_path_expr(a, bindings) for a in node.args]
-            valid = [s for s in subs if s]
-            if valid:
-                return "/".join(v.strip("/\\") if i > 0 else v.rstrip("/\\") for i, v in enumerate(valid))
+            return _join_ast_path_parts([s for s in subs if s])
     return None
 
 
@@ -1376,6 +1373,11 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
                         tool_summary=cmd_summary,
                         snippet=clause_snip,
                     )
+
+    # 分支 0.5: 反重力专有长会话“原子收口 + 交接停机”硬门禁
+    gate_resp = handoff_gate.check_pre_tool_use(payload, state_dir)
+    if gate_resp is not None:
+        return gate_resp
 
     # 分支 1: read_file 或 run_command 访问证据文件
     if tool_name in ("read_file", "run_command"):

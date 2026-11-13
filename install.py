@@ -5,9 +5,9 @@
 ================================================================================
 功能特性：
 1. 支持三种部署形态，自动探测本机已安装客户端并按需适配（--app auto|both|antigravity|codex）：
-   - 单反重力独立模式：部署 ~/.gemini/config/plugins/user-guard 全套插件、最高挡模型与可选 Zotero MCP；
+   - 单反重力独立模式：部署 ~/.gemini/config/plugins/user-guard 全套插件（含双模压缩恢复与反重力专有两阶段长会话交接停机门禁）、CLI 最高挡模型与可选 Zotero MCP；
    - 单 Codex 独立模式：部署 ~/.codex/AGENTS.md（保留自定义本机硬件段）、agents/readonly-*.toml 只读子代理、
-     hooks/ 原话压缩恢复钩子与 hooks.json（保持已有信任哈希）、config.toml 安全沙箱与基线、最高挡模型及可选 Zotero MCP；
+     hooks/ 原话压缩恢复钩子与 hooks.json（保持已有信任哈希）、config.toml 安全沙箱与基线、单模型最高挡基线（默认跳过套娃自动委派 ultra）及可选 Zotero MCP；
    - 双端完整协作模式：同时部署上述两套独立工作流，并同步双端共享的 cae-harness 跨平台派工与验收技能。
 2. 当本机仅检测到单客户端时，清晰提示是否先安装另一方；选择不安装（或非交互 --yes）即单独配置当前客户端，零报错闭环。
 3. 提供 --probe-apps 纯只读环境探测 JSON 输出，供 Codex 或反重力读取仓库后自动引导自举配置。
@@ -427,21 +427,22 @@ def _load_wsl_windows_agy_cache() -> List[Dict[str, str]]:
 
 
 def _select_agy_frontier_max_label(models: List[Dict[str, str]]) -> Optional[str]:
-    primary_family = ""
-    variants: Dict[str, str] = {}
+    skip_tokens = {"lite", "mini", "fast", "flash", "hydrogen", "orchestrator", "router"}
+    tiered: List[Tuple[str, str, str]] = []
     for item in models:
         m = re.match(r"^(.+)-(minimal|low|medium|high|xhigh|max|ultra)$", item["slug"].lower())
-        if not m:
-            continue
-        fam, tier = m.group(1), m.group(2)
-        if not primary_family:
-            primary_family = fam
-        if fam == primary_family:
-            variants[tier] = item["display_name"]
-    if not variants:
+        if m:
+            tiered.append((m.group(1), m.group(2), item["display_name"]))
+    if not tiered:
         return models[0]["display_name"] if models else None
-    best_tier = max(variants, key=EFFORT_ORDER.index)
-    return variants[best_tier]
+    primary_family = next(
+        (fam for fam, _, _ in tiered if not (set(re.split(r"[^a-z0-9]+", fam)) & skip_tokens)),
+        tiered[0][0],
+    )
+    variants = {tier: label for fam, tier, label in tiered if fam == primary_family}
+    non_ultra = {tier: label for tier, label in variants.items() if tier != "ultra"} or variants
+    best_tier = max(non_ultra, key=EFFORT_ORDER.index)
+    return non_ultra[best_tier]
 
 
 def _sync_codex_frontier_max(codex_root: Path, dry_run: bool = False) -> None:
@@ -457,12 +458,18 @@ def _sync_codex_frontier_max(codex_root: Path, dry_run: bool = False) -> None:
             return
         frontier = min(visible, key=lambda m: (int(m.get("priority") or 9999), 0))
         slug = str(frontier["slug"])
-        levels = [
-            lvl.get("effort")
+        raw_levels = [
+            lvl
             for lvl in frontier.get("supported_reasoning_levels", [])
             if isinstance(lvl, dict) and lvl.get("effort") in EFFORT_ORDER
         ]
-        max_effort = max(levels, key=EFFORT_ORDER.index) if levels else None
+        non_delegating = [
+            lvl.get("effort")
+            for lvl in raw_levels
+            if "delegation" not in str(lvl.get("description") or "").lower()
+            and lvl.get("effort") != "ultra"
+        ]
+        max_effort = max(non_delegating, key=EFFORT_ORDER.index) if non_delegating else None
         raw_lines = cfg_path.read_text(encoding="utf-8").splitlines()
     except Exception:
         return
@@ -480,7 +487,7 @@ def _sync_codex_frontier_max(codex_root: Path, dry_run: bool = False) -> None:
             cur_effort, effort_idx = m_eff.group(1), idx
 
     if cur_model == slug and (not max_effort or cur_effort == max_effort):
-        print(f"[*] Codex 本机默认模型已处于最高挡: {slug} ({cur_effort or 'default'})")
+        print(f"[*] Codex 本机默认模型已处于单模型最高挡: {slug} ({cur_effort or 'default'})")
         return
     if dry_run:
         print(f"[Dry-Run] 将更新 {cfg_path} 默认模型挡位 -> {slug} ({max_effort or 'default'})")
@@ -497,7 +504,7 @@ def _sync_codex_frontier_max(codex_root: Path, dry_run: bool = False) -> None:
             insert_at = (model_idx + 1) if model_idx is not None else 1
             header.insert(insert_at, f'model_reasoning_effort = "{max_effort}"')
     cfg_path.write_text("\n".join(header + body) + "\n", encoding="utf-8")
-    print(f"[+] 已配置 Codex 本机默认最高挡模型: {slug} ({max_effort or 'default'})")
+    print(f"[+] 已配置 Codex 本机默认单模型最高挡: {slug} ({max_effort or 'default'})")
 
 
 def _sync_codex_workspace_boundary(codex_root: Path, dry_run: bool = False) -> None:

@@ -1,12 +1,14 @@
 """
-reply_repeat_guard.py - 反重力 Stop 防连续同质等待刷屏门禁 (user-guard)
+reply_repeat_guard.py - 反重力 Stop 交接终审与防连续同质等待刷屏门禁 (user-guard)
 
-核心职责（适配 Antigravity Stop 钩子契约）：
-1. 仅在正常结束回合（terminationReason == "NO_TOOL_CALL"）且非强制续跑重入（continuationActive == False）时检查；
-2. 尾部高效读取 transcript.jsonl（>256KB 时仅扫描末尾窗口），按最近一条 USER_INPUT 或父代理消息定位当前回合；
-3. 检测模型最新回复是否为短状态等待回复（<=300 字符、含后台运行等待词、不含向用户提问或等待用户拍板词）；
-4. 严格执行相邻归一化文本同质比对（保留数字以区分真实迭代步数/残差进展！）：
-   - 仅当同一回合连续 3 次输出同质无增量的短状态等待回复时，触发 1 次 decision="continue" 阻断提醒；
+核心职责（适配 Antigravity Stop 钩子协议规范，仅在 terminationReason == "NO_TOOL_CALL" 且非 continuationActive 时检查）：
+1. 长会话 Stage-2 (drain/freeze) 交接终审（联动 handoff_gate.py）：
+   - 核验是否已落盘非空交接文档或回复中已给出可粘贴【新对话提示词】；开启 /goal 时同时强制校验末尾是否附带 `<!-- GOAL_CANCELLED -->` 终止标记（每回合至多阻断 1 次）。
+2. 日常防连续同质等待刷屏：
+   - 优先定位紧凑版 transcript.jsonl，尾部高效读取末尾窗口（>256KB 时仅扫描末尾窗口，并在单回合超长时分块逆序溯源），按最近一条 USER_INPUT 或父代理消息定位当前回合；
+   - 检测模型最新回复是否为短状态等待回复（<=300 字符、含后台运行等待词、不含向用户提问或等待用户拍板词）；
+   - 严格执行相邻归一化文本同质比对（保留数字以区分真实迭代步数/残差进展！）：
+     仅当同一回合连续 3 次输出同质无增量的短状态等待回复时，触发 1 次 decision="continue" 阻断提醒；
    - 配合 continuationActive 检查与已拦截签名去重，100% 杜绝循环唤醒死锁。
 """
 
@@ -16,12 +18,12 @@ import json
 import re
 import sys
 import traceback
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 HOOKS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOOKS_DIR))
+import handoff_gate  # noqa: E402
 import user_words  # noqa: E402
 
 user_words.ensure_utf8_stdio()
@@ -30,8 +32,8 @@ MAX_SHORT_REPLY_CHARS = 300
 TAIL_SCAN_BYTES = 256 * 1024  # 256 KB
 SIMILARITY_THRESHOLD = 0.80
 CORE_SIMILARITY_THRESHOLD = 0.75
-MAX_LOG_BYTES = 2 * 1024 * 1024
-TRIM_LOG_BYTES = 1 * 1024 * 1024
+MAX_LOG_BYTES = user_words.MAX_LOG_BYTES
+TRIM_LOG_BYTES = user_words.TRIM_LOG_BYTES
 
 WAIT_KEYWORDS = (
     "仍在运行",
@@ -119,32 +121,11 @@ def get_data_dirs() -> Tuple[Path, Path]:
 
 
 def get_current_iso_time() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat()
+    return user_words.current_iso_time()
 
 
 def log_event(event_name: str, conversation_id: str, message: str) -> None:
-    try:
-        _, logs_dir = get_data_dirs()
-        logs_dir.mkdir(parents=True, exist_ok=True)
-        log_file = logs_dir / "lifecycle.log"
-        if log_file.exists() and log_file.stat().st_size > MAX_LOG_BYTES:
-            raw = log_file.read_bytes()
-            tail = raw[-TRIM_LOG_BYTES:]
-            nl = tail.find(b"\n")
-            if nl != -1:
-                tail = tail[nl + 1 :]
-            user_words.atomic_write_text(log_file, tail.decode("utf-8", errors="replace"))
-        entry = {
-            "timestamp": get_current_iso_time(),
-            "event": event_name,
-            "conversationId": conversation_id,
-            "message": message,
-            "summary": {},
-        }
-        with open(log_file, "a", encoding="utf-8", newline="\n") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    user_words.append_lifecycle_log(HOOKS_DIR, event_name, conversation_id, message)
 
 
 def is_short_status_reply(text: str) -> bool:
@@ -218,21 +199,27 @@ def are_replies_homogeneous(prev_norm: str, curr_norm: str) -> bool:
     return False
 
 
-def _read_tail_steps(transcript_path: Path) -> List[Dict[str, Any]]:
-    """读取 transcript.jsonl 末尾窗口并解析步骤列表，避免大会话全量读盘"""
+def _read_tail_steps_with_offset(transcript_path: Path) -> Tuple[List[Dict[str, Any]], int]:
+    """读取 transcript.jsonl 末尾窗口并解析步骤列表，同时返回窗口起始字节偏移"""
     try:
         fsize = transcript_path.stat().st_size
+        start_offset = 0
         with open(transcript_path, "rb") as f:
             if fsize > TAIL_SCAN_BYTES:
-                f.seek(fsize - TAIL_SCAN_BYTES)
+                seek_pos = fsize - TAIL_SCAN_BYTES
+                f.seek(seek_pos)
                 raw = f.read()
                 first_nl = raw.find(b"\n")
                 if first_nl != -1:
+                    start_offset = seek_pos + first_nl + 1
                     raw = raw[first_nl + 1 :]
+                else:
+                    start_offset = fsize
+                    raw = b""
             else:
                 raw = f.read()
     except OSError:
-        return []
+        return [], 0
 
     steps: List[Dict[str, Any]] = []
     for line in raw.decode("utf-8", errors="replace").splitlines():
@@ -245,7 +232,57 @@ def _read_tail_steps(transcript_path: Path) -> List[Dict[str, Any]]:
                 steps.append(obj)
         except json.JSONDecodeError:
             continue
+    return steps, start_offset
+
+
+def _read_tail_steps(transcript_path: Path) -> List[Dict[str, Any]]:
+    """读取 transcript.jsonl 末尾窗口并解析步骤列表，避免大会话全量读盘"""
+    steps, _ = _read_tail_steps_with_offset(transcript_path)
     return steps
+
+
+def _find_turn_key_before_offset(transcript_path: Path, end_offset: int) -> str:
+    """当单回合轨迹超过尾部 256KB 窗口时，向前分块逆序定位最近一次回合起点并返回 turn_<step>_<hash>"""
+    if end_offset <= 0:
+        return "turn_0_initial"
+    try:
+        pos = end_offset
+        carry = b""
+        with open(transcript_path, "rb") as f:
+            while pos > 0:
+                chunk_start = max(0, pos - TAIL_SCAN_BYTES)
+                f.seek(chunk_start)
+                chunk = f.read(pos - chunk_start)
+                buf = chunk + carry
+                lines = buf.split(b"\n")
+                if chunk_start > 0:
+                    carry = lines[0]
+                    candidate_lines = lines[1:]
+                else:
+                    carry = b""
+                    candidate_lines = lines
+                for raw_line in reversed(candidate_lines):
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        continue
+                    if (
+                        b'"USER_INPUT"' not in stripped
+                        and b'"USER_EXPLICIT"' not in stripped
+                        and b"[Message]" not in stripped
+                    ):
+                        continue
+                    try:
+                        st = json.loads(stripped.decode("utf-8", errors="replace"))
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(st, dict) and _is_turn_boundary_step(st):
+                        s_idx = st.get("step_index", 0)
+                        c_hash = hashlib.sha256(str(st.get("content", "")).encode("utf-8")).hexdigest()[:12]
+                        return f"turn_{s_idx}_{c_hash}"
+                pos = chunk_start
+    except OSError:
+        pass
+    return "turn_0_initial"
 
 
 def _is_turn_boundary_step(step: Dict[str, Any]) -> bool:
@@ -267,12 +304,12 @@ def extract_current_turn_latest_reply(transcript_path_str: Optional[str]) -> Tup
     if not transcript_path_str:
         return "turn_0_initial", None, ""
 
-    tp = Path(transcript_path_str)
+    tp = user_words.resolve_compact_transcript_path(Path(transcript_path_str))
     if not tp.exists() or not tp.is_file():
         return "turn_0_initial", None, ""
 
-    steps = _read_tail_steps(tp)
-    if not steps:
+    steps, window_start_offset = _read_tail_steps_with_offset(tp)
+    if not steps and window_start_offset <= 0:
         return "turn_0_initial", None, ""
 
     turn_key = "turn_0_initial"
@@ -287,8 +324,12 @@ def extract_current_turn_latest_reply(transcript_path_str: Optional[str]) -> Tup
             turn_start_pos = i + 1
             break
 
+    if turn_key == "turn_0_initial" and window_start_offset > 0:
+        turn_key = _find_turn_key_before_offset(tp, window_start_offset)
+
     latest_step_idx: Optional[int] = None
     latest_text = ""
+    latest_is_truncated = False
 
     for pos, st in enumerate(steps[turn_start_pos:], start=turn_start_pos):
         if st.get("type") == "PLANNER_RESPONSE" or st.get("source") == "MODEL":
@@ -300,6 +341,18 @@ def extract_current_turn_latest_reply(transcript_path_str: Optional[str]) -> Tup
                 raw_idx = st.get("step_index")
                 latest_step_idx = int(raw_idx) if isinstance(raw_idx, int) else pos
                 latest_text = content.strip()
+                trunc_fields = st.get("truncated_fields") or []
+                latest_is_truncated = isinstance(trunc_fields, list) and "content" in trunc_fields
+
+    if latest_is_truncated and latest_step_idx is not None:
+        full_map = user_words._load_truncated_contents_map(
+            tp.parent / "transcript_full.jsonl",
+            {latest_step_idx},
+        )
+        if latest_step_idx in full_map and isinstance(full_map[latest_step_idx], str):
+            full_text = full_map[latest_step_idx].strip()
+            if full_text:
+                latest_text = full_text
 
     return turn_key, latest_step_idx, latest_text
 
@@ -331,15 +384,21 @@ def handle_stop_repeat_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
     if termination_reason != "NO_TOOL_CALL":
         return {"decision": "allow"}
 
-    # 2. 官方防死循环契约：若当前回合已处于 Stop 钩子触发的续跑状态，立即放行，绝不循环唤醒
+    # 2. 官方防死循环协议规范：若当前回合已处于 Stop 钩子触发的续跑状态，立即放行，绝不循环唤醒
     if bool(payload.get("continuationActive", False)):
         return {"decision": "allow"}
 
     turn_key, step_idx, latest_reply = extract_current_turn_latest_reply(payload.get("transcriptPath"))
+    state_dir, _ = get_data_dirs()
+
+    # 若当前会话处于长会话 Stage-2 (drain/freeze)，优先验收交接完整性与 /goal 停止标记（每回合至多阻断 1 次）
+    handoff_resp = handoff_gate.check_stop_handoff(payload, state_dir, turn_key, latest_reply or "")
+    if handoff_resp is not None:
+        return handoff_resp
+
     if not latest_reply:
         return {"decision": "allow"}
 
-    state_dir, _ = get_data_dirs()
     state_file = state_dir / f"{conversation_id}_repeat_guard.json"
     state = _load_repeat_state(state_file, conversation_id)
     turns = state.setdefault("turns", {})

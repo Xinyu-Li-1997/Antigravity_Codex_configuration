@@ -512,6 +512,379 @@ class TestGuardsOffline(unittest.TestCase):
         self.assertIn("Python 写入/修改文件", res_c["reason"])
         self.assertIn("/mnt/x/Projects/outside_garbage.txt", res_c["reason"])
 
+    def test_11_handoff_gate_image_flood_drain_freeze_and_stop_goal_verification(self) -> None:
+        """验证单回合读图过载自动进 drain/freeze、派工/读图禁令、R4 优先级、本地 commit 及 Stop /goal 终审"""
+        import session_context_loader
+
+        conv_id = "guard-handoff-011"
+        ws_dir = self.tmp_root / "workspace"
+        brain_dir = self.tmp_root / ".gemini" / "antigravity" / "brain" / conv_id
+        ws_dir.mkdir(parents=True)
+        brain_dir.mkdir(parents=True)
+        tp = brain_dir / ".system_generated" / "logs" / "transcript.jsonl"
+        _append_jsonl(tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "/goal\n逐批执行并核图"})
+        session_context_loader.handle_pre_invocation({"conversationId": conv_id, "transcriptPath": str(tp)})
+
+        # 构造 4 张合计 >100MB 的模拟 PNG 并在单回合内连续 read_file，第 4 张跨过 100MB 阈值当场进 drain 并阻断读图
+        for i in range(4):
+            img = ws_dir / f"page_{i}.png"
+            with open(img, "wb") as f:
+                f.seek(26 * 1024 * 1024 - 1)
+                f.write(b"\0")
+            res = status_guard.handle_pre_tool_use(
+                {
+                    "conversationId": conv_id,
+                    "cwd": str(ws_dir),
+                    "workspacePaths": [str(ws_dir)],
+                    "transcriptPath": str(tp),
+                    "toolCall": {"name": "read_file", "args": {"Path": str(img)}},
+                }
+            )
+            if i < 3:
+                self.assertEqual(res["decision"], "allow")
+            else:
+                self.assertEqual(res["decision"], "deny")
+                self.assertIn("禁止继续调用 `read_file` 看图", res["reason"])
+
+        # 非图片文本 read_file 仍放行
+        txt_file = ws_dir / "summary.txt"
+        txt_file.write_text("ok", encoding="utf-8")
+        self.assertEqual(
+            status_guard.handle_pre_tool_use(
+                {
+                    "conversationId": conv_id,
+                    "cwd": str(ws_dir),
+                    "workspacePaths": [str(ws_dir)],
+                    "toolCall": {"name": "read_file", "args": {"Path": str(txt_file)}},
+                }
+            )["decision"],
+            "allow",
+        )
+
+        # drain 期禁止新开子代理 / swarm / browser / cae_harness 派工 / git push
+        for tool_nm in ("invoke_subagent", "swarm", "schedule", "browser_click"):
+            r_blk = status_guard.handle_pre_tool_use(
+                {"conversationId": conv_id, "cwd": str(ws_dir), "toolCall": {"name": tool_nm, "args": {}}}
+            )
+            self.assertEqual(r_blk["decision"], "deny", f"{tool_nm} 必须在 drain 期被阻断")
+
+        self.assertEqual(
+            status_guard.handle_pre_tool_use(
+                {
+                    "conversationId": conv_id,
+                    "cwd": str(ws_dir),
+                    "workspacePaths": [str(ws_dir)],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": "python cae_harness.py task --kind code"}},
+                }
+            )["decision"],
+            "deny",
+        )
+        self.assertEqual(
+            status_guard.handle_pre_tool_use(
+                {
+                    "conversationId": conv_id,
+                    "cwd": str(ws_dir),
+                    "workspacePaths": [str(ws_dir)],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": "git push origin main"}},
+                }
+            )["decision"],
+            "deny",
+        )
+        # drain 期禁止多子句串联偷跑 cae_harness 派工、& git push 与 bash -lc 包装 push
+        for sneaky_cmd in (
+            "python cae_harness.py probe && python cae_harness.py task --kind review",
+            "& git push origin main",
+            'bash -lc "git status && git push origin main"',
+        ):
+            self.assertEqual(
+                status_guard.handle_pre_tool_use(
+                    {
+                        "conversationId": conv_id,
+                        "cwd": str(ws_dir),
+                        "workspacePaths": [str(ws_dir)],
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": sneaky_cmd}},
+                    }
+                )["decision"],
+                "deny",
+                f"drain 期必须硬阻断变体派工/推送命令: {sneaky_cmd}",
+            )
+
+        # 含引号内 '>' 的 git commit -m "fix > ok" 须识别为本地 commit 放行（且不消耗业务修改预算）
+        self.assertEqual(
+            status_guard.handle_pre_tool_use(
+                {
+                    "conversationId": conv_id,
+                    "cwd": str(ws_dir),
+                    "workspacePaths": [str(ws_dir)],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": 'git add -A && git commit -m "chore: > ok"'}},
+                }
+            )["decision"],
+            "allow",
+        )
+
+        # R4 项目越界检查优先级仍高于 handoff_gate
+        outside_path = self.tmp_root / "outside_dir" / "bad.txt"
+        res_r4 = status_guard.handle_pre_tool_use(
+            {
+                "conversationId": conv_id,
+                "cwd": str(ws_dir),
+                "workspacePaths": [str(ws_dir)],
+                "toolCall": {"name": "write_file", "args": {"Path": str(outside_path), "Content": "x"}},
+            }
+        )
+        self.assertEqual(res_r4["decision"], "force_ask")
+
+        # 消耗 8 次 drain 业务写动作进入 freeze；freeze 后普通源码 write_file 阻断，但交接文档写入放行
+        for k in range(8):
+            self.assertEqual(
+                status_guard.handle_pre_tool_use(
+                    {
+                        "conversationId": conv_id,
+                        "cwd": str(ws_dir),
+                        "workspacePaths": [str(ws_dir)],
+                        "toolCall": {"name": "write_file", "args": {"Path": str(ws_dir / f"src_{k}.py"), "Content": "pass"}},
+                    }
+                )["decision"],
+                "allow",
+            )
+        self.assertEqual(
+            status_guard.handle_pre_tool_use(
+                {
+                    "conversationId": conv_id,
+                    "cwd": str(ws_dir),
+                    "workspacePaths": [str(ws_dir)],
+                    "toolCall": {"name": "write_file", "args": {"Path": str(ws_dir / "src_8.py"), "Content": "pass"}},
+                }
+            )["decision"],
+            "deny",
+        )
+
+        # freeze 阶段放行带引号路径的 cae_harness.py probe，阻断带引号路径的 cae_harness.py task 派工
+        self.assertEqual(
+            status_guard.handle_pre_tool_use(
+                {
+                    "conversationId": conv_id,
+                    "cwd": str(ws_dir),
+                    "workspacePaths": [str(ws_dir)],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": 'python -B "d:/repo/cae_harness.py" probe'}},
+                }
+            )["decision"],
+            "allow",
+        )
+        self.assertEqual(
+            status_guard.handle_pre_tool_use(
+                {
+                    "conversationId": conv_id,
+                    "cwd": str(ws_dir),
+                    "workspacePaths": [str(ws_dir)],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": 'python -B "d:/repo/cae_harness.py" task --kind review'}},
+                }
+            )["decision"],
+            "deny",
+        )
+        # freeze 阶段放行只读 find 检索，拦截带删除副作用的 find -delete
+        self.assertEqual(
+            status_guard.handle_pre_tool_use(
+                {
+                    "conversationId": conv_id,
+                    "cwd": str(ws_dir),
+                    "workspacePaths": [str(ws_dir)],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": 'find . -maxdepth 2 -name "*.py"'}},
+                }
+            )["decision"],
+            "allow",
+        )
+        self.assertEqual(
+            status_guard.handle_pre_tool_use(
+                {
+                    "conversationId": conv_id,
+                    "cwd": str(ws_dir),
+                    "workspacePaths": [str(ws_dir)],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": 'find . -name "*.tmp" -delete'}},
+                }
+            )["decision"],
+            "deny",
+        )
+        # freeze 阶段放行 git 操作 cae_harness.py 文件及 wsl bash -lc 只读 git status（不得被全局正则误杀）
+        for safe_freeze_cmd in (
+            "git diff template/cae_harness.py",
+            'git add template/cae_harness.py && git commit -m "fix cae_harness.py"',
+            'wsl -d Ubuntu-24.04 -- bash -lc "git status"',
+        ):
+            self.assertEqual(
+                status_guard.handle_pre_tool_use(
+                    {
+                        "conversationId": conv_id,
+                        "cwd": str(ws_dir),
+                        "workspacePaths": [str(ws_dir)],
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": safe_freeze_cmd}},
+                    }
+                )["decision"],
+                "allow",
+                f"freeze 期应放行合法本地 Git/shell 命令: {safe_freeze_cmd}",
+            )
+
+        handoff_doc = ws_dir / "handoff_next.md"
+        self.assertEqual(
+            status_guard.handle_pre_tool_use(
+                {
+                    "conversationId": conv_id,
+                    "cwd": str(ws_dir),
+                    "workspacePaths": [str(ws_dir)],
+                    "toolCall": {"name": "write_file", "args": {"Path": str(handoff_doc), "Content": "# Handoff"}},
+                }
+            )["decision"],
+            "allow",
+        )
+        handoff_doc.write_text("# 本会话交接档案\n\n已完成核对，可在新对话继续推进第 4 批。\n" * 3, encoding="utf-8")
+
+        # Stop 门禁：已落盘交接档但 /goal 未带 <!-- GOAL_CANCELLED --> 时先拦截 1 次；同回合续跑必放行
+        _append_jsonl(tp, {"step_index": 20, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "已写入交接文档，停机等待新对话。"})
+        stop_incomplete = reply_repeat_guard.handle_stop_repeat_guard(
+            {"conversationId": conv_id, "terminationReason": "NO_TOOL_CALL", "transcriptPath": str(tp)}
+        )
+        self.assertEqual(stop_incomplete["decision"], "continue")
+        self.assertIn("GOAL_CANCELLED", stop_incomplete["reason"])
+
+        # 同回合 continuationActive=True 必放行；新回合带全交接内容 + <!-- GOAL_CANCELLED --> 也放行
+        self.assertEqual(
+            reply_repeat_guard.handle_stop_repeat_guard(
+                {"conversationId": conv_id, "terminationReason": "NO_TOOL_CALL", "continuationActive": True, "transcriptPath": str(tp)}
+            )["decision"],
+            "allow",
+        )
+        _append_jsonl(tp, {"step_index": 21, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "补充停机"})
+        _append_jsonl(
+            tp,
+            {
+                "step_index": 22,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "content": "已核验并整理交接。\n```markdown\n继续下一批\n```\n<!-- GOAL_CANCELLED -->",
+            },
+        )
+        self.assertEqual(
+            reply_repeat_guard.handle_stop_repeat_guard(
+                {"conversationId": conv_id, "terminationReason": "NO_TOOL_CALL", "transcriptPath": str(tp)}
+            )["decision"],
+            "allow",
+        )
+
+        # 验证 Stop 门禁面对带 truncated_fields: ["content"] 的截断交接回复时，能回溯 transcript_full.jsonl 放行
+        _append_jsonl(tp, {"step_index": 23, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "/goal\n再核一次截断回复"})
+        full_tp = tp.parent / "transcript_full.jsonl"
+        full_reply = "完整收口交接已完成。\n```markdown\n接续提示词正文足够长用于新会话接续。\n```\n<!-- GOAL_CANCELLED -->"
+        _append_jsonl(
+            tp,
+            {
+                "step_index": 24,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "content": "完整收口交接已完成。\n<truncated 128 bytes>",
+                "truncated_fields": ["content"],
+            },
+        )
+        _append_jsonl(full_tp, {"step_index": 24, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": full_reply})
+        self.assertEqual(
+            reply_repeat_guard.handle_stop_repeat_guard(
+                {"conversationId": conv_id, "terminationReason": "NO_TOOL_CALL", "transcriptPath": str(tp)}
+            )["decision"],
+            "allow",
+        )
+
+    def test_12_long_turn_over_256kb_preserves_exact_turn_key(self) -> None:
+        """单回合产出超过 256KB 时，extract_current_turn_latest_reply 仍向前溯源锁定真实回合键"""
+        tp = self.tmp_root / "long_turn.jsonl"
+        _append_jsonl(tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "第 1 轮"})
+        _append_jsonl(tp, {"step_index": 10, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "第 2 轮真实起点"})
+        expected_key, _, _ = reply_repeat_guard.extract_current_turn_latest_reply(str(tp))
+        self.assertTrue(expected_key.startswith("turn_10_"))
+
+        chunk_payload = "data_" + ("A" * 40000)
+        for k in range(11, 20):
+            _append_jsonl(tp, {"step_index": k, "source": "SYSTEM", "type": "GENERIC", "content": chunk_payload})
+        _append_jsonl(tp, {"step_index": 20, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "阶段汇报已完成。"})
+
+        self.assertGreater(tp.stat().st_size, reply_repeat_guard.TAIL_SCAN_BYTES)
+        actual_key, step_idx, latest_txt = reply_repeat_guard.extract_current_turn_latest_reply(str(tp))
+        self.assertEqual(actual_key, expected_key)
+        self.assertEqual(step_idx, 20)
+        self.assertEqual(latest_txt, "阶段汇报已完成。")
+
+    def test_13_ast_anchored_path_cmd_subst_and_handoff_false_positive_guards(self) -> None:
+        """覆盖 Python AST 绝对右操作数拼接、$(git push) 替换、源码假交接与普通代码回答误放行防护"""
+        import handoff_gate
+        import session_context_loader
+
+        conv_id = "guard-edge-013"
+        ws_dir = self.tmp_root / "ws13"
+        ws_dir.mkdir(parents=True)
+        outside_abs = (self.tmp_root / "outside13" / "leak.txt").as_posix()
+        tp = self.tmp_root / "brain" / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
+        _append_jsonl(tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "开始"})
+        for k in range(16):
+            _append_jsonl(tp, {"step_index": (k + 1) * 100, "source": "SYSTEM", "type": "CHECKPOINT"})
+        session_context_loader.handle_pre_invocation({"conversationId": conv_id, "transcriptPath": str(tp)})
+
+        state_dir = self.plugin_data / "state"
+        gs = handoff_gate.load_gate_state(state_dir, conv_id)
+        gs["phase"] = "freeze"
+        handoff_gate.save_gate_state(state_dir, conv_id, gs)
+
+        # 1) Python Path('src') / '/abs/outside' 与 Path('src', '/abs/outside') 必须被 R4 拦下
+        res_ast = status_guard.handle_pre_tool_use(
+            {
+                "conversationId": conv_id,
+                "cwd": str(ws_dir),
+                "workspacePaths": [str(ws_dir)],
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": f'python -c "from pathlib import Path; (Path(\'src\') / \'{outside_abs}\').write_text(\'x\')"'},
+                },
+            }
+        )
+        self.assertEqual(res_ast["decision"], "force_ask")
+
+        # 2) echo "$(git push origin main)" 在 freeze/drain 期必须阻断
+        res_sub = status_guard.handle_pre_tool_use(
+            {
+                "conversationId": conv_id,
+                "cwd": str(ws_dir),
+                "workspacePaths": [str(ws_dir)],
+                "toolCall": {"name": "run_command", "args": {"CommandLine": 'echo "$(git push origin main)"'}},
+            }
+        )
+        self.assertEqual(res_sub["decision"], "deny")
+
+        # 3) src/resume_solver.py 与 handoff/solver.cpp 在 freeze 期不得作为交接文档放行
+        for bad_src in (ws_dir / "src" / "resume_solver.py", ws_dir / "handoff" / "solver.cpp"):
+            self.assertEqual(
+                status_guard.handle_pre_tool_use(
+                    {
+                        "conversationId": conv_id,
+                        "cwd": str(ws_dir),
+                        "workspacePaths": [str(ws_dir)],
+                        "toolCall": {"name": "write_file", "args": {"Path": str(bad_src), "Content": "pass"}},
+                    }
+                )["decision"],
+                "deny",
+            )
+
+        # 4) 普通排错回答附带代码块不得误通过 Stop 交接验收
+        _append_jsonl(
+            tp,
+            {
+                "step_index": 2000,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "content": "定位到计算错误，示例代码如下：\n```python\nx = 1 + 2\nprint(x)\n```\n已检查完毕。",
+            },
+        )
+        res_stop = reply_repeat_guard.handle_stop_repeat_guard(
+            {"conversationId": conv_id, "terminationReason": "NO_TOOL_CALL", "transcriptPath": str(tp)}
+        )
+        self.assertEqual(res_stop["decision"], "continue")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
