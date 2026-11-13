@@ -9,12 +9,12 @@ description: >-
 
 # 反重力与 Codex 双向协作技能（`cae-harness`）
 
-日常科研与数值求解器开发**默认由反重力总控**（负责全局统筹、多篇文献对照、跨模块梳理、方向把关与技术写作），遇到**偏微分方程推导、高阶数值格式分析（如 DGSEM／WENO 通量、雅可比矩阵与守恒性证明）及核心求解器代码实现／门禁验收**时，按需通过本技能调用 Codex 攻坚。若用户指定纯代码项目由 Codex 总控，反重力则配合承担方案复核、技术润色与独立验收。所有跨端调用结果均返回发起方总控，经核对原文件行号与运行证据后再整合交付。
+日常科研与数值求解器开发**默认由反重力总控**（负责全局统筹、多篇文献对照、跨模块梳理、方向把关、中文技术写作与最终验收）；双端均可用时，凡涉及**偏微分方程推导、高阶数值格式分析（如 DGSEM／WENO 通量、雅可比矩阵与守恒性证明）、核心求解器编码、严苛边界／脱敏审计及带验证命令的门禁闭环**，**优先通过本技能发起 Codex 无头工作流攻坚**（发挥其深度推理、高保持率长上下文与工程沙箱优势）。若用户指定纯代码项目由 Codex 总控，反重力则配合承担方案复核、技术润色与独立验收。所有跨端调用结果均返回发起方总控，经亲自核对原文件行号与运行证据后再整合交付。
 
-## 职责边界：与宿主原生子代理完全分离
+## 职责边界：Codex 跨端攻坚优先与本侧原生工具解耦
 
 本技能仅管理通过官方 `codex` 与 `agy` CLI 启动的无头独立子进程：
-1. **不干预反重力原生子代理**：反重力主会话通过 `invoke_subagent` 派生的 `readonly-reader`、`readonly-auditor`、`readonly-collaborator` 始终采用默认 `inherit`，直接继承当前前端主会话的模型、挡位并各自拥有独立大上下文窗口。
+1. **Codex 跨端攻坚优先，不干预本侧原生只读工具**：硬核推导、核心编码、深度审查与 `--verify-cmd` 门禁闭环优先通过本技能交由 Codex 端执行；反重力主会话通过 `invoke_subagent` 派生的 `readonly-reader`、`readonly-auditor`、`readonly-collaborator` 始终采用默认 `inherit`（直接继承当前前端主会话模型与挡位并各自拥有独立大上下文窗口），而反重力原生 `run_workflow` 仅用于同端 10 个以上同构模块或算例目录的轻量纯只读盘点（启动前由 `status_guard.py` 执行 R4 边界预审）。
 2. **不受前端主控模型切换影响**：无论用户在反重力或 Codex 前端界面选了哪个模型，`cae-harness` 始终独立读取实际运行侧的模型目录，按任务性质匹配专长模型、思考挡位与最大上下文窗口。
 
 ## 选模、最高思考挡位与最长上下文规则
@@ -43,7 +43,7 @@ python -B scripts/cae_harness.py assess --caller antigravity
 python -B scripts/cae_harness.py task --help
 ```
 
-- `probe`：只读检查双端 CLI 可执行路径、登录态配置与本地模型缓存；附带 `--discover-models` 时调用 `agy models` 刷新反重力模型目录缓存。
+- `probe`：只读检查双端 CLI 可执行路径、登录态配置与本地模型缓存；附带 `--discover-models` 时调用 `agy models` 刷新反重力模型目录缓存（遇到官方模型代际切换，如 `2026-11-18` 下线 `Claude 4.6`／`GPT-OSS-120b` 并切换至 `Claude 5.5` 与 `Gemini 4` 系列后，可执行一次 `probe --discover-models` 同步本地目录缓存）。
 - `assess`：零写入输出双端可用性、模型目录来源与采集时间、声明窗口与支持挡位、以及各任务类型的推荐执行画像。
 
 ### 2. 独立任务派发（`task`）
@@ -69,7 +69,7 @@ python -B scripts/cae_harness.py task --caller codex --engine agy:default --kind
 | `polish` | 只读读取原稿，在回执 `content` 中直接交付去套话、防无声放大的润色稿 |
 | `code` | 仅在 `--write-scope` 授权范围内修改文件，可附 `--verify-cmd` 执行自动化验收 |
 
-写入范围必须位于 `--target` 目录之内（若 `--target` 指向单个文件且未传 `--write-scope`，默认仅授权修改该文件）。任务前后自动对比全目录快照，任何白名单外的写入或删除均判定为 `scope_violation`。
+写入范围必须位于 `--target` 目录之内（若 `--target` 指向单个文件且未传 `--write-scope`，默认仅授权修改该文件）。任务前后自动对比全目录快照，任何白名单外的写入或删除均判定为 `scope_violation`。调用 `Astra (max)` 执行 `math`／`direction` 任务时，输入应聚焦预提炼的控制方程或架构边界（必要时将 `--timeout` 设为 `900–1200`）；多文件常规代码对账优先选用 `review`（自动路由至最新代 `Sol`）。
 
 ### 3. 大型求解器审计（`audit`）与物理／测试门禁（`gate`）
 

@@ -1081,6 +1081,56 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
         session_context_loader.handle_pre_invocation({"conversationId": conv_r8, "transcriptPath": str(tp_r8)})
         self.assertEqual(handoff_gate.load_gate_state(state_dir, conv_r8)["phase"], "overridden")
 
+    def test_12_agy_handoff_gate_v232_workflow_swarm_and_edit_aliases(self) -> None:
+        """验证 v2.32.0 / CLI v1.5.8 新增工具在 drain 与 freeze 阶段的收口门禁行为"""
+        import handoff_gate
+        import status_guard
+
+        cid = "ag-v232-tools"
+        project = self.tmp_root / "proj_v232"
+        project.mkdir()
+        state_dir = self.plugin_data / "state"
+        tp = self.tmp_root / "v232.jsonl"
+        _append_jsonl(tp, {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "请整理交接并停机"})
+        base = {"conversationId": cid, "transcriptPath": str(tp), "cwd": str(project), "workspacePaths": [str(project)]}
+        session_context_loader.handle_pre_invocation(base)
+        self.assertEqual(handoff_gate.load_gate_state(state_dir, cid)["phase"], "drain")
+
+        def pre_tool(name: str, args: dict) -> dict:
+            return status_guard.handle_pre_tool_use({**base, "toolCall": {"name": name, "args": args}})
+
+        # drain 阶段：run_workflow 作为多代理编排委派工具立即拦截（不消耗 drain 预算）
+        self.assertEqual(pre_tool("run_workflow", {"Script": "x = 1\n"})["decision"], "deny")
+        # drain 阶段（总预算 8 次）：post_message / swarm_wait / sed_file / notebook_edit 各消耗 1 次动作预算
+        self.assertEqual(pre_tool("post_message", {"Message": "请立即汇总收口"})["decision"], "allow")
+        self.assertEqual(pre_tool("swarm_wait", {})["decision"], "allow")
+        for idx in range(3):
+            self.assertEqual(pre_tool("sed_file", {"Path": str(project / f"a_{idx}.py")})["decision"], "allow")
+            self.assertEqual(pre_tool("notebook_edit", {"NotebookPath": str(project / f"b_{idx}.ipynb")})["decision"], "allow")
+        # 满 8 次动作后已自动转入 freeze，后续局部编辑立即拒绝
+        self.assertEqual(handoff_gate.load_gate_state(state_dir, cid)["phase"], "freeze")
+        self.assertEqual(pre_tool("sed_file", {"Path": str(project / "c.py")})["decision"], "deny")
+
+        # freeze 阶段：只读盘点（含 read_board / read_url_content / list_resources / read_resource / 文本 view_file）放行
+        for ro_tool, ro_args in (
+            ("read_board", {}),
+            ("read_url_content", {"Url": "https://antigravity.google/docs/changelog"}),
+            ("list_resources", {"ServerName": "zotero"}),
+            ("read_resource", {"ServerName": "zotero", "Uri": "zotero://item/1"}),
+            ("view_file", {"TargetFile": str(project / "notes.md")}),
+        ):
+            self.assertEqual(pre_tool(ro_tool, ro_args)["decision"], "allow", ro_tool)
+
+        # freeze 阶段：图片读取、Swarm 通信、编排委派与普通编辑一律拒绝
+        for blocked_tool, blocked_args in (
+            ("view_file", {"TargetFile": str(project / "mesh.png")}),
+            ("post_message", {"Message": "继续派活"}),
+            ("swarm_wait", {}),
+            ("run_workflow", {"Script": "x = 1\n"}),
+            ("notebook_edit", {"NotebookPath": str(project / "b.ipynb")}),
+        ):
+            self.assertEqual(pre_tool(blocked_tool, blocked_args)["decision"], "deny", blocked_tool)
+
 
 class TestCodexHandoffAdapter(unittest.TestCase):
     """Codex 独立协议、保守默认值和严格模式的可观察状态转换。"""
@@ -1154,6 +1204,33 @@ class TestCodexHandoffAdapter(unittest.TestCase):
         self.assertEqual(blocked["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(self.call("PreToolUse", mode="enforce", limit=1, tool_name="Bash", tool_input={"command": "git status --short"}), {})
         self.assertEqual(self.call("PreToolUse", mode="enforce", limit=1, tool_name="get_goal"), {})
+
+    def test_git_branch_mutations_block_in_both_frozen_hosts(self):
+        self.call("UserPromptSubmit", mode="enforce", prompt="请整理交接并停机")
+        state = self.state()
+        state["phase"] = "freeze"
+        self.gate.save_gate_state(self.state_dir, self.sid, state)
+        agy_sid = "agy-frozen-branch"
+        self.gate.save_gate_state(self.state_dir, agy_sid, {**state, "conversationId": agy_sid})
+        safe = ("", "-a -vv", "--list feature/*", "--contains HEAD", "--merged HEAD --format=%(refname)",
+                "--points-at HEAD --sort=-committerdate", "--abbrev=8 --color=never", "--no-column")
+        unsafe = ("--unset-upstream", "--set-upstream-to=origin/main", "-u origin/main", "--track", "--no-track",
+                  "--edit-description", "-f", "--force", "-d old", "-D old", "-m old new", "-M old new",
+                  "-c old new", "-C old new", "--delete old", "--move old new", "--copy old new",
+                  "--list --unset-upstream", "new-branch", "--contains HEAD new-branch", "--unknown-option")
+        for options, denied in [(args, False) for args in safe] + [(args, True) for args in unsafe]:
+            command = "git branch " + options
+            with self.subTest(command=command):
+                result = self.call("PreToolUse", mode="enforce", tool_name="Bash", tool_input={"command": command})
+                if denied:
+                    self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+                else:
+                    self.assertEqual(result, {})
+                agy = self.gate.check_pre_tool_use_locked({
+                    "conversationId": agy_sid, "cwd": str(self.root), "workspacePaths": [str(self.root)],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": command}},
+                }, self.state_dir)
+                self.assertEqual(agy["decision"] if agy else "allow", "deny" if denied else "allow")
 
     def test_frozen_patch_exemption_is_only_for_in_project_handoff_documents(self):
         self.call("UserPromptSubmit", mode="enforce", prompt="请整理交接并停机")

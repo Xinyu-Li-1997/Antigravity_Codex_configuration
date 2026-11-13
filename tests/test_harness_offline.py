@@ -18,6 +18,12 @@ from unittest.mock import patch, Mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'template' / 'user-guard' / 'skills' / 'cae-harness' / 'scripts' / 'cae_harness.py'
+for installed_key in ('USER_GUARD_INSTALLED_CODEX_DIR', 'USER_GUARD_INSTALLED_DIR'):
+    installed_root = os.environ.get(installed_key)
+    installed_script = Path(installed_root) / 'skills' / 'cae-harness' / 'scripts' / 'cae_harness.py' if installed_root else None
+    if installed_script is not None and installed_script.is_file():
+        SCRIPT = installed_script
+        break
 spec = importlib.util.spec_from_file_location('cae_harness_test', SCRIPT)
 harness = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(harness)
@@ -1732,6 +1738,95 @@ else:
         self.assertEqual(harness.select_task_tier('auto', 'math', '降档推导离散格式'), ('high', 'economy_adaptive_high'))
         self.assertEqual(harness.select_task_tier('auto', 'code', '用中档整理逻辑'), ('medium', 'user_description_medium'))
         self.assertEqual(harness.select_task_tier('auto', 'review', '不省token，不降档，绝不省额度，检查 typo'), ('max', 'default_flagship_max'))
+
+    def test_agy_print_timeout_exit_code_and_terminal_statuses(self):
+        # 1) agy --print-timeout 在 -p 模式退出码 3 或 stream-json 穿插 AGY_ERROR 行时须精确归类为 timeout
+        engines = backends()
+        observed_timeouts = []
+
+        def fake_timeout_exit3(command, cwd, input_text, timeout_sec, **kwargs):
+            observed_timeouts.append(timeout_sec)
+            stderr = (
+                '[agy] print timeout after 30s\n'
+                'AGY_ERROR: {"short_error":"print timeout after 30s","status":"DEADLINE_EXCEEDED","reason":"print_timeout"}\n'
+            )
+            return subprocess.CompletedProcess(command, 3, '', stderr)
+
+        with patch.object(harness, 'run_process', side_effect=fake_timeout_exit3):
+            with self.assertRaises(harness.HarnessError) as ctx:
+                harness.invoke_readonly_engine('agy:default', self.root, '审查通量', engines, 30, [])
+        self.assertEqual(ctx.exception.status, 'timeout')
+        self.assertEqual(ctx.exception.details.get('finished_reason'), 'print_timeout')
+        # 外层 run_process 超时在 agy --print-timeout 基础上预留 15s 缓冲窗口
+        self.assertEqual(observed_timeouts, [45])
+
+        # 2) NDJSON 中夹带 AGY_ERROR / [agy] print timeout 诊断行且退出码为 0 时，_decode_output_json 同样归类为 timeout
+        ndjson_timeout = (
+            '{"event":"init","session_id":"s1"}\n'
+            '[agy] print timeout after 30s\n'
+            'AGY_ERROR: {"short_error":"print timeout after 30s","status":"DEADLINE_EXCEEDED","reason":"print_timeout"}\n'
+        )
+        with self.assertRaises(harness.HarnessError) as ctx_nd:
+            harness._decode_output_json(ndjson_timeout)
+        self.assertEqual(ctx_nd.exception.status, 'timeout')
+
+        # 3) 官方 CLI Headless 规范中的 INVALID / WAITING / RUNNING 非正常终态须拦截为 failed（覆盖单行 JSON 与多行 NDJSON）
+        for bad_status in ('INVALID', 'WAITING', 'RUNNING'):
+            single_json = json.dumps({'event': 'result', 'status': bad_status, 'structured_output': {'summary': 'x'}})
+            with self.assertRaises(harness.HarnessError) as ctx_single:
+                harness._extract_json_object(single_json)
+            self.assertEqual(ctx_single.exception.status, 'failed', bad_status)
+
+            ndjson_stream = '{"event":"init","session_id":"s1"}\n' + single_json + '\n'
+            with self.assertRaises(harness.HarnessError) as ctx_st:
+                harness._decode_output_json(ndjson_stream)
+            self.assertEqual(ctx_st.exception.status, 'failed', bad_status)
+
+    def test_zero_exit_stderr_terminal_diagnostics_override_result(self):
+        output = json.dumps({'event': 'result', 'structured_output': TASK})
+        cases = (
+            ('AGY_ERROR: {"short_error":"connection reset"}', 'failed'),
+            ('AGY_ERROR: {"short_error":"usage limit reached"}', 'quota_exhausted'),
+            ('AGY_ERROR: {"short_error":"print timeout after 30s","reason":"print_timeout"}', 'timeout'),
+            ('[agy] print timeout after 30s', 'timeout'),
+            ('error: print timeout after 30s', 'timeout'),
+        )
+        for index, (stderr, expected) in enumerate(cases):
+            engines = backends()
+            engines['agy']['config_home'] = str(self.root / ('agy-' + str(index)))
+            with self.subTest(stderr=stderr), patch.object(harness, 'run_process', return_value=subprocess.CompletedProcess([], 0, output, stderr)):
+                with self.assertRaises(harness.HarnessError) as caught:
+                    harness.invoke_engine('agy:default', self.root, 'review', engines, harness.TASK_JSON_SCHEMA)
+                self.assertEqual(caught.exception.status, expected)
+                self.assertEqual(harness._load_active_quota_cooldown('agy', engines['agy']) is not None, expected == 'quota_exhausted')
+        engines = backends()
+        engines['agy']['config_home'] = str(self.root / 'warning-only')
+        for stderr in ('warning: optional cache missing', 'warning: report discusses usage limit and print timeout after 30s'):
+            with self.subTest(stderr=stderr), patch.object(harness, 'run_process', return_value=subprocess.CompletedProcess([], 0, output, stderr)):
+                self.assertEqual(harness.invoke_engine('agy:default', self.root, 'review', engines, harness.TASK_JSON_SCHEMA), TASK)
+                self.assertIsNone(harness._load_active_quota_cooldown('agy', engines['agy']))
+
+    def test_agy_error_and_success_result_cannot_cancel_each_other(self):
+        output = 'AGY_ERROR: {"short_error":"connection reset"}\n' + json.dumps({'event': 'result', 'structured_output': TASK})
+        with self.assertRaises(harness.HarnessError) as caught:
+            harness._decode_output_json(output)
+        self.assertEqual(caught.exception.status, 'failed')
+
+    def test_failure_diagnostics_exclude_result_business_content(self):
+        body = {**TASK, 'content': 'The report discusses usage limit reached and print timeout after 30s.'}
+        for status in ('success', 'failed'):
+            engines = backends()
+            engines['agy']['config_home'] = str(self.root / status)
+            event = {'event': 'result', 'status': status, 'message': 'upstream connection reset',
+                     'structured_output': body, 'result': body, 'content': body}
+            proc = subprocess.CompletedProcess([], 1, json.dumps(event), 'upstream connection reset')
+            detail = harness._backend_diagnostics(proc)
+            self.assertNotIn('usage limit', detail)
+            self.assertNotIn('print timeout after', detail)
+            with self.subTest(status=status), patch.object(harness, 'run_process', return_value=proc), self.assertRaises(harness.HarnessError) as caught:
+                harness.invoke_engine('agy:default', self.root, 'review', engines, harness.TASK_JSON_SCHEMA)
+            self.assertEqual(caught.exception.status, 'failed')
+            self.assertIsNone(harness._load_active_quota_cooldown('agy', engines['agy']))
 
 
 if __name__ == '__main__':

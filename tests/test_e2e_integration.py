@@ -10,6 +10,7 @@ test_e2e_integration.py - 全系统端到端集成验证、隐私脱敏审计与
 
 import contextlib
 import datetime
+import getpass
 import io
 import json
 import importlib.util
@@ -30,6 +31,82 @@ ACTIVE_PLUGIN_DIR = Path(os.environ.get("USER_GUARD_INSTALLED_DIR", str(TEMPLATE
 INSTALLER_SPEC = importlib.util.spec_from_file_location("user_guard_installer", REPO_ROOT / "install.py")
 INSTALLER = importlib.util.module_from_spec(INSTALLER_SPEC)
 INSTALLER_SPEC.loader.exec_module(INSTALLER)
+
+
+ALLOWED_PLACEHOLDERS = {
+    "...", "<user>", "user", "username", "yourname", "example", "alice", "bob", "charlie",
+    "public", "default", "test", "mock", "fixture", "guest", "sample", "runner", "developer",
+}
+HARDCODED_HOME_PATTERNS = (
+    re.compile(r"(?:[A-Za-z]:|/mnt/[A-Za-z])[/\\]{1,2}users[/\\]{1,2}([^/\\\'\"\s`<>]+)", re.I),
+    re.compile(r"[/\\]{1,2}(?:home|users)[/\\]{1,2}([^/\\\'\"\s`<>]+)", re.I),
+)
+SECRET_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|AKIA[A-Z0-9]{16}|hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,})\b"),
+    re.compile(r"\b(?:access_token|refresh_token|id_token|api[_-]?key|client_secret)['\"]?\s*[:=]\s*['\"][A-Za-z0-9_.-]{24,}['\"]", re.I),
+)
+HARDWARE_PATTERNS = (
+    re.compile(r"\b(?:NVIDIA\s+)?(?:GeForce\s+)?(?:RTX|GTX)\s+(?:PRO\s+)?[A-Z]?\d{3,4}\s*(?:Ti|Super|Ada)?\b", re.I),
+    re.compile(r"\b(?:NVIDIA\s+)?(?:[AHV](?:100|200)|L40[S])\b", re.I),
+    re.compile(r"\b(?:Radeon\s+)?RX\s+[5679]\d{3}\s*(?:XT|XTX)?\b", re.I),
+    re.compile(r"\b(?:HP\s+)?OMEN\s+\d{2}[A-Za-z]\b", re.I),
+    re.compile(r"\b(?:Intel\s+)?(?:Core\s+)?i[3579]-\d{4,5}[A-Za-z]{0,3}\b", re.I),
+    re.compile(r"\b(?:Intel\s+)?Core\s+Ultra\s+[3579]\s+\d{3}[A-Za-z]{0,3}\b", re.I),
+    re.compile(r"\b(?:Intel\s+)?Xeon(?:\s+(?:Platinum|Gold|Silver|Bronze|Max|W|D|E))?\s+(?:[A-Z]\d[- ]?)?\d{3,5}[A-Za-z+]*\b", re.I),
+    re.compile(r"\b(?:AMD\s+)?(?:Ryzen(?:\s+Threadripper)?|Threadripper|EPYC)\s+(?:(?:[3579]|PRO)\s+)*[A-Za-z]?\d{3,5}[A-Za-z0-9]*\b", re.I),
+    re.compile(r"\b(?:Apple\s+)?M[1-4]\s+(?:Pro|Max|Ultra)\b", re.I),
+)
+UUID_PATTERN = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
+
+
+def _path_spelling_variants(paths):
+    variants = set()
+    for path in paths:
+        posix = str(path).replace("\\", "/")
+        spellings = {posix, posix.replace("/", "\\")}
+        if re.match(r"^[A-Za-z]:/", posix):
+            spellings.add("/mnt/" + posix[0].lower() + posix[2:])
+        match = re.match(r"^/mnt/([A-Za-z])/(.*)$", posix)
+        if match:
+            windows = match[1] + ":/" + match[2]
+            spellings.update((windows, windows.replace("/", "\\")))
+        for spelling in spellings:
+            variants.add(spelling.casefold())
+            variants.add(spelling.replace("\\", "\\\\").casefold())
+    return variants
+
+
+def _sensitive_findings(content, home_variants=(), user_name="", hostname=""):
+    """纯函数：扫描所有文本，测试夹具与规则定义使用同一套判据。"""
+    findings = []
+    low = content.casefold()
+    if any(len(path) >= 6 and path.casefold() in low for path in home_variants):
+        findings.append("本机路径")
+    for label, value in (("用户名", user_name), ("主机名", hostname)):
+        if len(value) >= 3 and value.casefold() not in ALLOWED_PLACEHOLDERS and value.casefold() in low:
+            findings.append(label)
+    for pattern in HARDCODED_HOME_PATTERNS:
+        for match in pattern.finditer(content):
+            captured = match[1].strip().casefold()
+            if re.search(r"[\[\](){}+*?\\]", captured):
+                continue  # 只跳过正则定义自身，不豁免任何文件。
+            if captured and captured not in ALLOWED_PLACEHOLDERS and not captured.startswith("$"):
+                findings.append("未脱敏主目录")
+    if any(pattern.search(content) for pattern in SECRET_PATTERNS):
+        findings.append("凭据")
+    if any(pattern.search(content) for pattern in HARDWARE_PATTERNS):
+        findings.append("硬件型号")
+    if UUID_PATTERN.search(content):
+        findings.append("会话标识")
+    for match in re.finditer(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b", content):
+        if match[1].lower() not in ("example.com", "example.org", "example.net", "example.invalid"):
+            findings.append("邮箱")
+    if re.search(r"\b(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})\b", content):
+        findings.append("内网地址")
+    return findings
 
 
 def _build_subprocess_cmd(hook_cmd: str) -> list:
@@ -74,9 +151,11 @@ class TestEndToEndIntegration(unittest.TestCase):
         """验证插件结构严格符合 Antigravity 官方 Native Plugin 规范"""
         plugin_json = json.loads((ACTIVE_PLUGIN_DIR / "plugin.json").read_text(encoding="utf-8"))
         allowed_keys = {
+            "$schema",
             "name",
             "description",
             "logo",
+            "license",
             "suggestedPrompts",
             "displayName",
             "version",
@@ -86,6 +165,10 @@ class TestEndToEndIntegration(unittest.TestCase):
             "disabled",
         }
         self.assertEqual(plugin_json.get("name"), "user-guard")
+        self.assertEqual(plugin_json.get("$schema"), "https://antigravity.google/schemas/v1/plugin.json")
+        self.assertEqual(plugin_json.get("license"), "Apache-2.0")
+        self.assertEqual(plugin_json.get("logo"), "assets/logo.svg")
+        self.assertTrue((ACTIVE_PLUGIN_DIR / "assets" / "logo.svg").is_file(), "plugin.json 声明的 logo.svg 必须存在")
         self.assertTrue(set(plugin_json.keys()).issubset(allowed_keys), "plugin.json 不可包含未定义顶层字段")
 
         hooks_json = json.loads((ACTIVE_PLUGIN_DIR / "hooks.json").read_text(encoding="utf-8"))
@@ -103,19 +186,24 @@ class TestEndToEndIntegration(unittest.TestCase):
         for r_code in ("R0.", "R1.", "R2.", "R3.", "R3.1.", "R3.6.", "R4.", "R5.", "R6.", "R7.", "R8.", "R9.", "R10.", "R11."):
             self.assertIn(r_code, rules_text)
         self.assertIn("CAE", rules_text)
+        self.assertLess(
+            len(rules_file.read_bytes()),
+            16000,
+            "rules/AGENTS.md UTF-8 字节数须显著低于 Antigravity 24,000 字节规则截断上限",
+        )
 
         for agent_name in ("readonly-auditor.md", "readonly-reader.md", "readonly-collaborator.md"):
             agent_path = ACTIVE_PLUGIN_DIR / "agents" / agent_name
             self.assertTrue(agent_path.exists())
             agent_text = agent_path.read_text(encoding="utf-8")
             self.assertIn(
-                "tools: [read_file, search_web, finish]",
+                "tools: [read_file, search_web, send_message, finish]",
                 agent_text,
-                "只读代理须精确限定为只读工具及 agy --json-schema 结构化收尾工具 finish",
+                "只读代理须精确限定为只读工具、父代理回传工具 send_message 及 agy --json-schema 收尾工具 finish",
             )
             self.assertIn("subagent: true", agent_text)
             self.assertIn("mainAgent: true", agent_text, "agy CLI --agent 需要 mainAgent: true 方可识别")
-            self.assertIn("hidden: true", agent_text)
+            self.assertNotIn("hidden: true", agent_text, "App v2.32.0 下 hidden: true 会将子代理从 <subagents> 目录隐藏")
 
         skill_md = ACTIVE_PLUGIN_DIR / "skills" / "cae-harness" / "SKILL.md"
         skill_script = ACTIVE_PLUGIN_DIR / "skills" / "cae-harness" / "scripts" / "cae_harness.py"
@@ -131,8 +219,18 @@ class TestEndToEndIntegration(unittest.TestCase):
         self.assertIn("Apache License", license_text)
         self.assertIn("Version 2.0, January 2004", license_text)
 
+        changelog_file = REPO_ROOT / "CHANGELOG.md"
+        self.assertTrue(changelog_file.is_file(), "仓库根目录须维护规范的 CHANGELOG.md 更新日志")
+        changelog_text = changelog_file.read_text(encoding="utf-8")
+        self.assertIn(f"[{plugin_json.get('version')}]", changelog_text, "CHANGELOG.md 须记录当前 plugin.json 版本号")
+
         root_agents_md = REPO_ROOT / "AGENTS.md"
         self.assertTrue(root_agents_md.is_file(), "仓库根目录须包含供双端共读自举配置的 AGENTS.md")
+        self.assertLess(
+            len(root_agents_md.read_bytes()),
+            16000,
+            "根目录 AGENTS.md UTF-8 字节数须显著低于 Antigravity 24,000 字节规则截断上限",
+        )
         root_agents_text = root_agents_md.read_text(encoding="utf-8")
         self.assertIn("--probe-apps", root_agents_text)
         self.assertIn("--app codex", root_agents_text)
@@ -149,60 +247,110 @@ class TestEndToEndIntegration(unittest.TestCase):
 
     def test_02_repository_personal_path_hardware_and_credential_patterns(self) -> None:
         """扫描仓库文本中与个人路径、具体硬件型号和常见凭据匹配的内容。"""
-        allowed_placeholders = {
-            "...", "<user>", "user", "username", "yourname", "example",
-            "alice", "bob", "public", "default", "test", "mock",
-        }
-        hardcoded_home_patterns = (
-            re.compile(r"[A-Za-z]:[/\\]{1,2}Users[/\\]{1,2}([^/\\\'\"\s`<>]+)"),
-            re.compile(r"(?<![A-Za-z0-9_])[/\\]{1,2}home[/\\]{1,2}([^/\\\'\"\s`<>]+)"),
-            re.compile(r"(?<![A-Za-z0-9_])[/\\]{1,2}Users[/\\]{1,2}([^/\\\'\"\s`<>]+)"),
-        )
-        secret_patterns = (
-            re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
-            re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
-            re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-            re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|AKIA[A-Z0-9]{16})\b"),
-            re.compile(r"\b(?:access_token|api[_-]?key|client_secret)\s*[:=]\s*['\"][A-Za-z0-9_.-]{24,}['\"]", re.I),
-        )
-        hardware_patterns = (
-            re.compile(r"\b(?:GeForce\s+)?RTX\s+[2345]\d{3}\s*(?:Ti|Super)?\b", re.I),
-            re.compile(r"\b(?:Radeon\s+)?RX\s+[5679]\d{3}\s*(?:XT|XTX)?\b", re.I),
-            re.compile(r"\b(?:HP\s+)?OMEN\s+\d{2}[A-Za-z]\b", re.I),
-        )
-
-        # 动态获取当前机器真实主目录与当前本地克隆路径（任何真实机器路径绝不可硬编码进仓库）
-        home_variants = {str(Path.home()), Path.home().as_posix(), str(REPO_ROOT), REPO_ROOT.as_posix()}
-
+        home_variants = _path_spelling_variants((Path.home(), REPO_ROOT))
+        user_name = getpass.getuser()
+        hostname = os.environ.get("COMPUTERNAME", "")
         checked_count = 0
-        for p in REPO_ROOT.rglob("*"):
-            if not p.is_file() or ".git" in p.parts or "__pycache__" in p.parts:
+        for path in REPO_ROOT.rglob("*"):
+            if not path.is_file() or ".git" in path.parts or "__pycache__" in path.parts:
                 continue
-            if p.suffix.lower() in {".py", ".md", ".json", ".toml", ".yaml", ".yml", ".ps1", ".sh", ".gitignore", ".gitattributes"} or p.name in {".gitignore", ".gitattributes", "LICENSE"}:
-                # 排除测试文件自身对正则字面量的定义误匹配
-                content = p.read_text(encoding="utf-8")
-                rel_name = str(p.relative_to(REPO_ROOT))
-                checked_count += 1
-
-                for hv in home_variants:
-                    if len(hv) >= 6:
-                        self.assertNotIn(
-                            hv,
-                            content,
-                            f"文件 {rel_name} 中检测到本机绝对路径",
-                        )
-
-                if p.name != "test_e2e_integration.py":
-                    for hp in hardcoded_home_patterns:
-                        for m in hp.finditer(content):
-                            captured = m.group(1).strip().lower()
-                            if captured and captured not in allowed_placeholders and not captured.startswith("$"):
-                                self.fail(f"文件 {rel_name} 中检测到未脱敏的用户路径片段: {m.group(0)}")
-
-                for pattern in secret_patterns + hardware_patterns:
-                    self.assertFalse(pattern.search(content), f"文件 {rel_name} 中检测到疑似凭据或硬件型号")
-
+            rel_name = path.relative_to(REPO_ROOT).as_posix()
+            try:
+                content = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                self.fail(f"non-UTF8 file: {rel_name}")
+            checked_count += 1
+            findings = _sensitive_findings(content, home_variants, user_name, hostname)
+            self.assertEqual(findings, [], f"{rel_name}: {', '.join(findings)}")
         self.assertGreaterEqual(checked_count, 16)
+
+    def test_sanitization_helpers_positive_and_negative_examples(self):
+        private_user = "private" + "person"
+        homes = (
+            "C:" + "\\Users\\" + private_user,
+            "c:/" + "users/" + private_user,
+            "/mnt/c/" + "Users/" + private_user,
+            "\\\\wsl.localhost\\Ubuntu" + "\\home\\" + private_user,
+            "/Users/" + private_user,
+            "/home/" + private_user,
+        )
+        models = (
+            "Core " + "i9-" + "14900K", "i5-" + "12400", "Core " + "Ultra " + "9 " + "285K",
+            "Xeon " + "Gold " + "6430", "Xeon " + "E5-" + "2690",
+            "AMD " + "Ryzen " + "9 " + "9950X", "Threadripper " + "PRO " + "7995WX", "EPYC " + "9654",
+            "Apple " + "M4 " + "Max", "RTX " + "5090", "GTX " + "1080", "RTX " + "A6000",
+            "A" + "100", "H" + "100", "H" + "200", "V" + "100", "L" + "40S",
+            "Radeon RX " + "7900 " + "XTX", "OMEN " + "16L",
+        )
+        credentials = (
+            "sk-" + "a" * 32, "AIza" + "a" * 34, "ghp_" + "a" * 32,
+            "github_pat_" + "a" * 42, "AKIA" + "A" * 16,
+            "hf_" + "a" * 30, "glpat-" + "a" * 30,
+            "-----BEGIN " + "PRIVATE KEY-----",
+        ) + tuple('"' + key + '": "' + "a" * 32 + '"' for key in (
+            "api_key", "api-key", "access_token", "refresh_token", "id_token", "client_secret"))
+        for text in homes + models + credentials:
+            with self.subTest(text=text):
+                self.assertTrue(_sensitive_findings(text))
+        for text in (
+            "/home/alice/work", "C:/Users/bob/work", "/home/charlie/work", "/Users/<user>/work",
+            "CPU GPU Intel Core AMD Ryzen Threadripper Xeon EPYC NVIDIA RTX GTX",
+            '"api_key": "<placeholder>"', "refresh_token = None", "user@example.com",
+            "https://github.com/Xinyu-Li-1997/Antigravity_Codex_configuration", "Apache License 2.0",
+            HARDCODED_HOME_PATTERNS[0].pattern, HARDCODED_HOME_PATTERNS[1].pattern,
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(_sensitive_findings(text), [])
+        for path in _path_spelling_variants(("Q:/Private/Checkout",)):
+            self.assertTrue(_sensitive_findings(path.upper(), home_variants=(path,)))
+        self.assertTrue(_sensitive_findings(private_user, user_name=private_user.upper()))
+        self.assertTrue(_sensitive_findings("private" + "host", hostname="PRIVATE" + "HOST"))
+        uuid = "-".join(("a" * 8, "b" * 4, "4" + "c" * 3, "8" + "d" * 3, "e" * 12))
+        self.assertTrue(_sensitive_findings(uuid))
+        self.assertTrue(_sensitive_findings("private" + "@" + "private" + ".invalid"))
+        self.assertTrue(_sensitive_findings("192." + "168." + "42." + "7"))
+
+    def test_three_install_modes_ship_complete_artifacts_and_runnable_hooks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for mode in ("codex", "antigravity", "both"):
+                with self.subTest(mode=mode):
+                    sandbox = root / mode
+                    plugin, codex = sandbox / "plugins" / "user-guard", sandbox / "codex"
+                    command = [sys.executable, "-B", "-X", "utf8", str(REPO_ROOT / "install.py"),
+                               "--app", mode, "--skip-test", "--no-zotero", "--yes"]
+                    if mode != "codex":
+                        command += ["--target-dir", str(plugin)]
+                    if mode != "antigravity":
+                        command += ["--codex-home", str(codex)]
+                    env = os.environ.copy()
+                    for key in ("USER_GUARD_STATE_DIR", "USER_GUARD_LOGS_DIR", "USER_GUARD_INSTALLED_DIR", "USER_GUARD_INSTALLED_CODEX_DIR", "PLUGIN_DATA"):
+                        env.pop(key, None)
+                    env.update(PYTHONDONTWRITEBYTECODE="1", PLUGIN_DATA=str(sandbox / "data"), CODEX_HOME=str(codex))
+                    proc = subprocess.run(command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=30)
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    harnesses = []
+                    if mode != "codex":
+                        for relative in ("plugin.json", "assets/logo.svg", "hooks/status_guard.py", "hooks/handoff_gate.py"):
+                            self.assertTrue((plugin / relative).is_file(), relative)
+                        harnesses.append(plugin / "skills" / "cae-harness" / "scripts" / "cae_harness.py")
+                        hooks = json.loads((plugin / "hooks.json").read_text(encoding="utf-8"))["user-guard-lifecycle"]
+                        command = _build_subprocess_cmd(hooks["PreToolUse"][0]["hooks"][0]["command"])
+                        proc = subprocess.run(command, cwd=plugin, env=env, input=json.dumps({"conversationId": "installed-hook", "toolCall": {"name": "read_file", "args": {}}}), capture_output=True, text=True, encoding="utf-8", timeout=15)
+                        self.assertEqual(proc.returncode, 0, proc.stderr)
+                        self.assertEqual(json.loads(proc.stdout)["decision"], "allow")
+                    if mode != "antigravity":
+                        for relative in ("hooks.json", "hooks/user_words.py", "hooks/handoff_gate.py", "hooks/session_context_loader.py"):
+                            self.assertTrue((codex / relative).is_file(), relative)
+                        harnesses.append(codex / "skills" / "cae-harness" / "scripts" / "cae_harness.py")
+                        proc = subprocess.run([sys.executable, "-B", "-X", "utf8", str(codex / "hooks" / "handoff_gate.py"), "--client", "codex"], env=env, input=json.dumps({"hook_event_name": "PreToolUse"}), capture_output=True, text=True, encoding="utf-8", timeout=15)
+                        self.assertEqual(proc.returncode, 0, proc.stderr)
+                        self.assertIsInstance(json.loads(proc.stdout), dict)
+                    for script in harnesses:
+                        self.assertTrue(script.is_file())
+                        proc = subprocess.run([sys.executable, "-B", "-X", "utf8", str(script), "--help"], env=env, capture_output=True, text=True, encoding="utf-8", timeout=15)
+                        self.assertEqual(proc.returncode, 0, proc.stderr)
+                        self.assertIn("assess", proc.stdout)
 
     def test_03_full_cli_subprocess_utf8_pipeline(self) -> None:
         """通过真实操作系统子进程管道运行全部 4 个生命周期事件，验证 UTF-8 稳定性与协同契约"""
@@ -378,6 +526,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             source = root / "source"
             source.mkdir()
             shutil.copy2(REPO_ROOT / "install.py", source / "install.py")
+            shutil.copy2(REPO_ROOT / "CHANGELOG.md", source / "CHANGELOG.md")
             shutil.copytree(TEMPLATE_DIR, source / "template" / "user-guard")
             source_cache = source / "__pycache__" / "existing.pyc"
             source_cache.parent.mkdir()

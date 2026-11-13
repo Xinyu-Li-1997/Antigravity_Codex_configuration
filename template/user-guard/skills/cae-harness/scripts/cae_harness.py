@@ -2038,6 +2038,28 @@ def _validate_schema(value, schema, location='result'):
             _validate_schema(item, schema['items'], f'{location}[{index}]')
 
 
+def _is_agy_print_timeout_text(text):
+    sample = str(text or '')
+    low = sample.lower()
+    if 'print timeout after' in low:
+        return True
+    if re.search(r'"(?:finished_reason|reason)"\s*:\s*"print_timeout"', sample):
+        return True
+    return False
+
+
+def _parse_agy_error_line(line):
+    stripped = line.strip()
+    if not stripped.startswith('AGY_ERROR:'):
+        return None
+    body = stripped[len('AGY_ERROR:'):].strip()
+    try:
+        parsed = json.loads(body)
+        return parsed if isinstance(parsed, dict) else None
+    except (ValueError, RecursionError):
+        return None
+
+
 def _check_output_status(parsed):
     """只解释协议错误，不把工具读出的额度说明当作后端额度错误。"""
     finished_reason = str(parsed.get('finished_reason', '')).lower()
@@ -2052,7 +2074,7 @@ def _check_output_status(parsed):
         raise HarnessError('后端返回取消回执', 'cancelled', backend_status=status)
     event_error = parsed.get('event', parsed.get('type')) == 'error'
     if (event_error or finished_reason == 'error' or parsed.get('is_error') or parsed.get('error')
-            or status in ('error', 'failed', 'partial', 'incomplete')):
+            or status in ('error', 'failed', 'partial', 'incomplete', 'invalid', 'waiting', 'running')):
         error = str(parsed.get('error') or parsed.get('message') or '')[-2000:]
         error_status = 'quota_exhausted' if _is_quota_exhausted(error) else 'failed'
         raise HarnessError('后端返回错误回执', error_status, backend_status=status or 'error',
@@ -2072,9 +2094,35 @@ def _decode_output_json(raw_text):
         try:
             if fence:
                 return json.loads(fence.group(1))
-            events = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            events = []
+            agy_errors = []
+            saw_timeout_diag = False
+            for line in raw.splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                agy_err = _parse_agy_error_line(stripped)
+                if agy_err is not None:
+                    agy_errors.append(agy_err)
+                    continue
+                if re.match(r'^(?:\[agy\]\s+print timeout after\b|error:\s+print timeout after\b)', stripped, re.I):
+                    saw_timeout_diag = True
+                    continue
+                events.append(json.loads(stripped))
         except (ValueError, RecursionError) as decode_error:
             raise OutputParseError('子任务输出不是合法 JSON') from decode_error
+        for agy_err in agy_errors:
+            reason = str(agy_err.get('reason') or '').lower()
+            short_err = str(agy_err.get('short_error') or agy_err.get('message') or '')
+            if reason == 'print_timeout' or 'print timeout after' in short_err.lower():
+                raise HarnessError('后端输出因超时截断', 'timeout', finished_reason='print_timeout')
+            if _is_quota_exhausted(short_err):
+                raise HarnessError('后端返回错误回执', 'quota_exhausted', error=short_err[-2000:])
+        if saw_timeout_diag:
+            raise HarnessError('后端输出因超时截断', 'timeout', finished_reason='print_timeout')
+        if agy_errors:
+            short_err = str(agy_errors[-1].get('short_error') or agy_errors[-1])[-2000:]
+            raise HarnessError('后端返回错误回执', 'failed', error=short_err)
         results = []
         for event in events:
             if not isinstance(event, dict):
@@ -2341,8 +2389,21 @@ def _backend_diagnostics(result):
         except ValueError:
             parts.append(line)
             continue
-        if isinstance(event, dict) and event.get('event', event.get('type')) in ('error', 'result', 'turn.failed'):
-            parts.append(json.dumps(event, ensure_ascii=False))
+        if isinstance(event, dict):
+            kind = event.get('event', event.get('type'))
+            if kind == 'result':
+                is_error = (event.get('is_error') or event.get('error')
+                            or str(event.get('status', '')).lower() in (
+                                'error', 'failed', 'partial', 'incomplete', 'invalid', 'waiting', 'running',
+                                'timeout', 'cancelled', 'canceled', 'interrupted')
+                            or str(event.get('finished_reason', '')).lower() in (
+                                'error', 'print_timeout', 'interrupted', 'cancelled', 'canceled'))
+                if not is_error:
+                    continue
+                event = {key: event[key] for key in (
+                    'event', 'type', 'status', 'finished_reason', 'is_error', 'error', 'message') if key in event}
+            if kind in ('error', 'result', 'turn.failed'):
+                parts.append(json.dumps(event, ensure_ascii=False))
     return '\n'.join(part for part in parts if part).strip()
 
 
@@ -2439,8 +2500,9 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
         # cannot clear a failure recorded by another unit in this same batch.
         _enforce_preflight_quota(backends, (spec,), batch=batch)
         receipt['launch_attempted'] = True
+        proc_timeout = timeout_sec + 15 if prefix == 'agy' else timeout_sec
         try:
-            result = run_process(command, exec_dir, input_text, timeout_sec, env=env, native_pid_file=native_pid_file)
+            result = run_process(command, exec_dir, input_text, proc_timeout, env=env, native_pid_file=native_pid_file)
         except HarnessError as exc:
             receipt['invocation_started'] = bool(exc.details.get('process_started'))
             raise
@@ -2450,6 +2512,22 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                              for line in (result.stderr or '').splitlines())
         receipt['startup_only'] = (_quota_startup_only(result.stdout) and startup_stderr
                                    and not (output_file.exists() and output_file.stat().st_size))
+        if prefix == 'agy' and result.returncode == 0:
+            # 仅解释 stderr 中明确的终止诊断；普通警告不参与失败分类。
+            diagnostics = [line.strip() for line in (result.stderr or '').splitlines()
+                           if _parse_agy_error_line(line) is not None or re.match(
+                               r'^(?:\[agy\]\s+print timeout after\b|error:\s+print timeout after\b)', line.strip(), re.I)]
+            if diagnostics:
+                detail = '\n'.join(diagnostics)
+                if _is_agy_print_timeout_text(detail):
+                    raise HarnessError('agy 执行触发 --print-timeout 超时', 'timeout',
+                                       returncode=0, finished_reason='print_timeout', stderr=detail[-2000:])
+                if _is_quota_exhausted(detail):
+                    cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
+                    raise HarnessError('agy 额度不足或已达用量上限，已停止并记录冷却状态',
+                                       'quota_exhausted', preflight_blocked=False, returncode=0,
+                                       stderr=detail[-2000:], **_quota_user_choices(prefix, cooldown))
+                raise HarnessError('agy 返回终止错误诊断', 'failed', returncode=0, stderr=detail[-2000:])
         if result.returncode:
             detail = _backend_diagnostics(result)
             if _is_quota_exhausted(detail):
@@ -2457,6 +2535,10 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 raise HarnessError(f'{prefix} 额度不足或已达用量上限，已停止并记录冷却状态',
                                    'quota_exhausted', preflight_blocked=False, returncode=result.returncode,
                                    stderr=(result.stderr or '')[-2000:], **_quota_user_choices(prefix, cooldown))
+            if prefix == 'agy' and _is_agy_print_timeout_text(detail):
+                raise HarnessError('agy 执行触发 --print-timeout 超时', 'timeout',
+                                   returncode=result.returncode, finished_reason='print_timeout',
+                                   stderr=(result.stderr or '')[-2000:])
             # A worker may already have written files. Authentication fallback
             # is allowed only in model listing before planning and execution.
             raise HarnessError(f'{prefix} 执行失败，退出码 {result.returncode}', returncode=result.returncode,

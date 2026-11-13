@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1131,6 +1132,218 @@ class TestGuardsOffline(unittest.TestCase):
             {"conversationId": cid, "terminationReason": "NO_TOOL_CALL", "transcriptPath": str(tp)}
         )
         self.assertEqual(res["decision"], "allow")
+
+    def test_15_run_workflow_boundary_cross_surface_file_aliases_and_cli_continuation(self) -> None:
+        project = self.tmp_root / "proj15"
+        project.mkdir()
+        outside = self.tmp_root / "outside15"
+        outside.mkdir()
+        base_payload = {"conversationId": "guard-15", "cwd": str(project), "workspacePaths": [str(project)]}
+
+        def call(name: str, args: dict) -> dict:
+            return status_guard.handle_pre_tool_use({**base_payload, "toolCall": {"name": name, "args": args}})
+
+        # 1) run_workflow R4 边界：项目内只读放行，项目外 Cwd / Script / ScriptPath 拦截
+        self.assertEqual(
+            call("run_workflow", {"Script": "res = call_tool('read_file', {'Path': 'solver.py'})\n"})["decision"],
+            "allow",
+        )
+        self.assertEqual(
+            call("run_workflow", {"Cwd": str(outside), "Script": "x = 1\n"})["decision"],
+            "force_ask",
+        )
+        with unittest.mock.patch.dict(os.environ, {"CAE_HARNESS_DEPTH": "1"}):
+            self.assertEqual(
+                call("run_workflow", {"Cwd": str(outside), "Script": "x = 1\n"})["decision"],
+                "deny",
+            )
+
+        out_file_posix = (outside / "leak.txt").as_posix()
+        for unsafe_script in (
+            f"from pathlib import Path\nPath({out_file_posix!r}).write_text('x')\n",
+            f"call_tool('write_file', {{'Path': {out_file_posix!r}, 'Content': 'x'}})\n",
+            # 源码顺序：先赋外部路径并调用写工具，后赋项目内路径，严禁被后置安全赋值掩盖
+            f"p = {out_file_posix!r}\ncall_tool('write_file', {{'Path': p, 'Content': 'x'}})\np = 'inside.txt'\n",
+            f"call_tool('run_command', {{'CommandLine': 'touch {out_file_posix}'}})\n",
+            f"agent('review', cwd={outside.as_posix()!r})\n",
+        ):
+            self.assertEqual(call("run_workflow", {"Script": unsafe_script})["decision"], "force_ask", unsafe_script)
+
+        safe_wf = project / "workflows" / "readonly_check.py"
+        safe_wf.parent.mkdir()
+        safe_wf.write_text("out = call_tool('read_file', {'Path': 'README.md'})\n", encoding="utf-8")
+        self.assertEqual(call("run_workflow", {"ScriptPath": str(safe_wf)})["decision"], "allow")
+
+        unsafe_in_proj_wf = project / "workflows" / "write_outside.py"
+        unsafe_in_proj_wf.write_text(
+            f"call_tool('sed_file', {{'Path': {out_file_posix!r}}})\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(call("run_workflow", {"ScriptPath": str(unsafe_in_proj_wf)})["decision"], "force_ask")
+
+        ext_wf = outside / "ext_wf.py"
+        ext_wf.write_text("x = 1\n", encoding="utf-8")
+        self.assertEqual(call("run_workflow", {"ScriptPath": str(ext_wf)})["decision"], "force_ask")
+
+        # 2) 跨宿主表面写改别名 R4 硬边界
+        for tool_name, path_key in (
+            ("write_to_file", "TargetFile"),
+            ("replace_file_content", "TargetFile"),
+            ("multi_replace_file_content", "TargetFile"),
+            ("sed_file", "Path"),
+            ("notebook_edit", "NotebookPath"),
+        ):
+            self.assertEqual(call(tool_name, {path_key: str(project / "ok.ipynb")})["decision"], "allow", tool_name)
+            self.assertEqual(call(tool_name, {path_key: str(outside / "bad.ipynb")})["decision"], "force_ask", tool_name)
+
+        # 3) view_file 与 read_file 共用防空转轮询门禁（含跨别名同参重复读取拦截）
+        log_file = project / "residual.log"
+        log_file.write_text("iter=1 res=1e-3\n", encoding="utf-8")
+        poll_payload = {**base_payload, "conversationId": "poll-view-15"}
+        self.assertEqual(
+            status_guard.handle_pre_tool_use(
+                {**poll_payload, "toolCall": {"name": "read_file", "args": {"Path": str(log_file)}}}
+            )["decision"],
+            "allow",
+        )
+        self.assertEqual(
+            status_guard.handle_pre_tool_use(
+                {**poll_payload, "toolCall": {"name": "view_file", "args": {"TargetFile": str(log_file)}}}
+            )["decision"],
+            "deny",
+        )
+
+        # 4) 先证明短等待回复确实触发门禁，再验证两种字段均能熔断。
+        tp_stop = self.tmp_root / "stop_snake.jsonl"
+        waiting_reply = "正在等待后台算例完成通知..."
+        decisions = []
+        for idx in (1, 2, 3):
+            _append_jsonl(
+                tp_stop,
+                {"type": "PLANNER_RESPONSE", "source": "MODEL", "step_index": idx, "content": waiting_reply},
+            )
+            decisions.append(reply_repeat_guard.handle_stop_repeat_guard({
+                "conversationId": "cli-snake-stop", "terminationReason": "NO_TOOL_CALL", "transcriptPath": str(tp_stop),
+            })["decision"])
+        self.assertEqual(decisions, ["allow", "allow", "continue"])
+        for flag in ("continuationActive", "continuation_active"):
+            self.assertEqual(reply_repeat_guard.handle_stop_repeat_guard({
+                "conversationId": "cli-snake-stop", "terminationReason": "NO_TOOL_CALL",
+                flag: True, "transcriptPath": str(tp_stop),
+            })["decision"], "allow")
+
+    def test_16_ast_dynamic_bindings_control_flow_and_call_order(self):
+        project = self.tmp_root / "ast-project"
+        project.mkdir()
+        (project / "sub").mkdir()
+        base = {"conversationId": "ast-16", "cwd": str(project), "workspacePaths": [str(project)]}
+        bad_scripts = (
+            "p = '../outside/x'\nif False:\n    p = 'inside'\nopen(p, 'w')",
+            "p = '../outside/x'\ntry:\n    p = 'inside'\nexcept Exception:\n    pass\nopen(p, 'w')",
+            "p = '../outside/x'\nfor i in []:\n    p = 'inside'\nopen(p, 'w')",
+            "p = '../outside/x'\nwhile False:\n    p = 'inside'\nopen(p, 'w')",
+            "p = 'inside'\ndef f():\n    open(p, 'w')\np = '../outside/x'\nf()",
+            "def f(p):\n    open(p, 'w')\nf('inside')\nf('../outside/x')",
+            "p = 'inside'\nopen((p := '../outside/x'), 'w')",
+            "p = 'inside'\nopen(p, (mode := 'w'), encoding=(p := '../outside/x'))",
+            "p, q = ('inside', '../outside/x')\nopen(q, 'w')",
+            "[p, q] = ['inside', '../outside/x']\nopen(q, 'w')",
+            "p = 'inside'\nwith unknown_context() as p:\n    open(p, 'w')",
+            "ext = '../outside'\nopen(f'{ext}/x', 'w')",
+            "ext = get_external()\nopen(f'{ext}/x', 'w')",
+            "from pathlib import Path\nPath(unknown_path()).write_text('x')",
+            "import os\nos.remove(unknown_path())",
+            "import shutil\nshutil.rmtree(unknown_path())",
+            "mode = get_mode()\nopen('../outside/x', mode)",
+            "mode = 'r'\nif condition:\n    mode = 'w'\nopen('../outside/x', mode=mode)",
+            "import os\nos.chdir('../outside')\nopen('x', 'w')",
+            "from os import chdir as cd\ncd(unknown_path())\nopen('x', 'w')",
+            "import os as operating\noperating.chdir('../outside')",
+            "import os\nos.chdir('sub')\nopen('../../outside/x', 'w')",
+        )
+        safe_scripts = (
+            "mode = 'rb'\nopen('../outside/input', mode)",
+            "mode = 'rt'\nopen('../outside/input', mode=mode)",
+            "p, q = ('inside', 'also-inside')\nopen(q, 'w')",
+            "def f(p):\n    open(p, 'w')\nf('inside')",
+            "import os\nos.chdir('sub')\nopen('../inside', 'w')",
+            "from os import chdir\nchdir('sub')\nopen('inside', 'w')",
+            "import tempfile\nfrom pathlib import Path\nwith tempfile.TemporaryDirectory() as tmp_dir:\n    Path(tmp_dir).joinpath('x').write_text('x')",
+            "from pathlib import Path\nPath('inside').write_text('<DYNAMIC_UNRESOLVED>')",
+            "arr = [1, 2, 3].copy()\nprint(arr)",
+        )
+        for script, expected in [(s, "force_ask") for s in bad_scripts] + [(s, "allow") for s in safe_scripts]:
+            for tool, args in (("run_workflow", {"Script": script}),
+                               ("run_command", {"CommandLine": "@'\n" + script + "\n'@ | python -B -"})):
+                with self.subTest(script=script, tool=tool):
+                    self.assertEqual(status_guard.handle_pre_tool_use({**base, "toolCall": {"name": tool, "args": args}})["decision"], expected)
+
+    def test_17_workflow_dicts_dynamic_names_and_unreviewable_scripts(self):
+        project = self.tmp_root / "workflow-project"
+        project.mkdir()
+        base = {"conversationId": "workflow-17", "cwd": str(project), "workspacePaths": [str(project)]}
+
+        def call(args):
+            return status_guard.handle_pre_tool_use({**base, "toolCall": {"name": "run_workflow", "args": args}})
+
+        bad_scripts = (
+            "name = 'write_file'\nargs = {'AbsolutePath': '../outside/x'}\ncall_tool(name, args)",
+            "call_tool('write_file', {'Path': 'inside', 'Path': '../outside/x'})",
+            "call_tool('write_file', {'Path': 'inside', **unknown_args})",
+            "call_tool('write_file', {**unknown_args, 'Path': 'inside'})",
+            "call_tool(unknown_name, {'Path': 'inside'})",
+            "call_tool('write_file', unknown_args)",
+            "call_tool('write_file', {'Path': get_path()})",
+            "call_tool('run_command', {'CommandLine': get_command()})",
+            "call_tool('run_workflow', {'Script': get_script()})",
+            "call_tool('run_workflow', {'Script': \"open('../outside/x', 'w')\"})",
+            "args = {'Path': 'inside'}\nargs['Path'] = '../outside/x'\ncall_tool('write_file', args)",
+            "import os\nos.chdir('sub')\ncall_tool('write_file', {'FilePath': '../../outside/x'})",
+        )
+        for script in bad_scripts:
+            with self.subTest(script=script):
+                self.assertEqual(call({"Script": script})["decision"], "force_ask")
+        for script in (
+            "name = 'write_file'\nargs = {'Path': '../outside/x', 'Path': 'inside'}\ncall_tool(name, args)",
+            "args = {'Path': 'inside'}\ncall_tool('write_file', {**args})",
+            "call_tool('run_command', {'CommandLine': 'git status --short'})",
+            "call_tool('read_file', {'AbsolutePath': '../outside/input'})",
+            "call_tool('run_workflow', {'Script': 'print(1)'})",
+        ):
+            with self.subTest(script=script):
+                self.assertEqual(call({"Script": script})["decision"], "allow")
+        script_path = project / "script.py"
+        script_path.write_text("if broken\n", encoding="utf-8")
+        self.assertEqual(call({"ScriptPath": str(script_path)})["decision"], "force_ask")
+        script_path.write_text("#" * 32, encoding="utf-8")
+        with unittest.mock.patch.object(status_guard, "MAX_WORKFLOW_SCRIPT_BYTES", 16):
+            self.assertEqual(call({"ScriptPath": str(script_path)})["decision"], "force_ask")
+        for target in (project / "missing.py", project):
+            self.assertEqual(call({"ScriptPath": str(target)})["decision"], "force_ask")
+        with unittest.mock.patch.object(Path, "read_text", side_effect=OSError("unreadable")):
+            hit = status_guard._detect_workflow_external_mutation(
+                {"ScriptPath": str(script_path)}, str(project), str(project), [str(project)], [str(project)], [str(project)], False,
+            )
+            self.assertIsNotNone(hit)
+
+    def test_18_duplicate_installer_flags_relative_cwd_and_original_tool_name(self):
+        project = self.tmp_root / "fields-project"
+        project.mkdir()
+        (project / "sub").mkdir()
+        base = {"conversationId": "fields-18", "cwd": str(project), "workspacePaths": [str(project)]}
+        for flag in ("--codex-home", "--target-dir", "--codex-skills-dir"):
+            for first, second in (("inside", "../outside"), ("../outside", "inside")):
+                command = f"python -B install.py --codex-home inside --no-zotero {flag} {first} {flag}={second}"
+                self.assertEqual(status_guard.handle_pre_tool_use({**base, "toolCall": {"name": "run_command", "args": {"CommandLine": command}}})["decision"], "force_ask")
+        for tool in ("sed_file", "notebook_edit", "write_to_file"):
+            for key in ("AbsolutePath", "absolute_path", "FilePath"):
+                result = status_guard.handle_pre_tool_use({**base, "toolCall": {"tool_name": tool, "args": {key: "../outside/x"}}})
+                self.assertEqual(result["decision"], "force_ask")
+                self.assertIn(tool, result["reason"])
+        for tool, key, script in (("run_command", "CommandLine", "touch ../inside"),
+                                   ("run_workflow", "Script", "open('../inside', 'w')")):
+            result = status_guard.handle_pre_tool_use({**base, "toolCall": {"tool_name": tool, "args": {"Cwd": "sub", key: script}}})
+            self.assertEqual(result["decision"], "allow")
 
 
 if __name__ == "__main__":

@@ -487,8 +487,8 @@ def handle_stop_repeat_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
             or not user_words.valid_session_id(conversation_id)):
         return {"decision": "allow"}
 
-    # 2. 官方防死循环协议规范：若当前回合已处于 Stop 钩子触发的续跑状态，立即放行，绝不循环唤醒
-    if payload.get("continuationActive") is True:
+    # 2. 官方防死循环协议规范：若当前回合已处于 Stop 钩子触发的续跑状态（兼容 App camelCase 与 CLI v1.5.6+ snake_case），立即放行
+    if payload.get("continuationActive") is True or payload.get("continuation_active") is True:
         return {"decision": "allow"}
 
     state_dir, _ = get_data_dirs()

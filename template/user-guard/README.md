@@ -6,13 +6,14 @@
 
 | 路径 | 组件职责 |
 | --- | --- |
-| `plugin.json` | 反重力原生插件元信息清单（当前版本 `1.7.1`） |
+| `plugin.json` | 反重力原生插件元信息清单（遵循官方 v1 Schema，当前版本 `1.7.2`） |
+| `assets/logo.svg` | 插件矢量图标，满足 `agy plugin validate --strict` 零提示规范 |
 | `hooks.json` | 反重力生命周期钩子注册表，挂载 `SessionStart`、`PreInvocation`、`PreToolUse` 与 `Stop` 四类同步命令事件 |
 | `rules/AGENTS.md` | 双端共用的 `R0–R11` 全局规则：文件精简、中文与 CAE/CFD 规范术语、双端选模与额度回退、项目目录硬边界、防无声放大、验收红线及压缩交接对齐 |
 | `hooks/user_words.py` | 双端共享底层库：UTF-8 标准流重配置、跨平台文件锁、原子写盘、反重力 JSONL 截断回查及 Codex 跨分段 `rollout` 合并与 SHA-256 完整性校验 |
 | `hooks/session_context_loader.py` | 压缩与续接恢复入口：反重力侧按字节游标增量检测 `CHECKPOINT` 并注入用户原话摘要；Codex 侧在 `compact`／`resume` 时归档并注入历史原话 |
-| `hooks/status_guard.py` | `PreToolUse` 守卫：解析工具参数、内联 Python AST 与 Shell 子句拦截未授权的项目外写删（交互会话弹窗 `force_ask`，无头子任务直接 `deny`），并用日志复合指纹阻断无进展重复轮询 |
-| `hooks/reply_repeat_guard.py` | `Stop` 守卫：拦截连续同质的空等刷屏回复（含迭代步数、残差等真实数值推进时正常放行），并在长会话收口阶段联动校验交接四要素与 `/goal` 结束标记 |
+| `hooks/status_guard.py` | `PreToolUse` 守卫：解析跨宿主表面文件修改工具、`run_command` 与 `run_workflow` 动态工作流脚本 AST，拦截未授权的项目外写删（交互会话弹窗 `force_ask`，无头子任务直接 `deny`），并用日志复合指纹阻断无进展重复轮询 |
+| `hooks/reply_repeat_guard.py` | `Stop` 守卫：兼容桌面端 `continuationActive` 与 CLI `continuation_active` 续跑标记，拦截连续同质的空等刷屏回复（含迭代步数、残差等真实数值推进时正常放行），并在长会话收口阶段联动校验交接四要素与 `/goal` 结束标记 |
 | `hooks/handoff_gate.py` | 长会话收口状态机：反重力侧按压缩频次、轨迹体积与读图负载执行 `normal -> advisory -> drain -> freeze` 迁移（支持 R8 暂缓宽限）；Codex 侧默认运行 `advisory` 提醒模式（可选 `enforce`） |
 | `agents/readonly-reader.md` | 反重力只读通读子代理（默认 `inherit` 跟随主对话模型与独立窗口），负责长文献、大源码与算例日志的忠实摘录和行号定位 |
 | `agents/readonly-auditor.md` | 反重力只读审查子代理（默认 `inherit`），负责逐行核对公式符号、边界条件、数值容差与运行证据 |

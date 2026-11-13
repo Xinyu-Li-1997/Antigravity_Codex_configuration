@@ -9,9 +9,9 @@ Antigravity 适配保留原有遥测与门禁；Codex 独立入口默认仅观�
    normal -> advisory -> drain -> freeze（或 R8 暂缓 overridden）。
 2. Stage-1 (advisory)：纯提醒不阻断，在 PreInvocation 提醒主控注意上下文预算与大体积读图消耗。
 3. Stage-2 (drain -> freeze)：
-   - 严禁新开委派（invoke_subagent / define_subagent / swarm / schedule / browser_* / cae_harness 派工 / git push）；
+   - 严禁新开委派（invoke_subagent / define_subagent / run_workflow / swarm / schedule / browser_* / cae_harness 派工 / git push）；
    - drain 排空窗口（默认 4 次模型调用 + 8 次写/运行动作）内允许完成正在进行中的原子收口与本地校验；
-   - freeze 冻结期仅放行：非图片只读核对、后台任务/子代理查询管理（manage_task / manage_subagents）、交接文档编写与本地 git add/commit；
+   - freeze 冻结期仅放行：read_file / view_file 非图片只读核对、后台任务/子代理查询管理（manage_task / manage_subagents）、已登记跨表面文件工具的交接文档编写与本地 git add/commit；
    - Stop 门禁验收交接完整性（并在开启 /goal 时强制校验 <!-- GOAL_CANCELLED --> 标记），每回合至多阻断 1 次。
 """
 
@@ -103,15 +103,32 @@ PROMPT_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
-DELEGATION_TOOLS = {"invoke_subagent", "define_subagent", "swarm", "schedule"}
+DELEGATION_TOOLS = {"invoke_subagent", "define_subagent", "swarm", "schedule", "run_workflow"}
 AGY_TOOL_ALIASES = {
     "view_file": "read_file",
     "write_to_file": "write_file",
     "replace_file_content": "edit_file",
     "multi_replace_file_content": "edit_file",
+    "sed_file": "edit_file",
+    "notebook_edit": "edit_file",
 }
-AGY_INSPECTION_TOOLS = {"list_dir", "list_directory", "view_file_outline", "view_code_item", "grep_search",
-                        "find_by_name", "search_files", "manage_task", "manage_subagents", "ask_question", "finish"}
+AGY_INSPECTION_TOOLS = {
+    "list_dir",
+    "list_directory",
+    "view_file_outline",
+    "view_code_item",
+    "grep_search",
+    "find_by_name",
+    "search_files",
+    "read_url_content",
+    "read_board",
+    "list_resources",
+    "read_resource",
+    "manage_task",
+    "manage_subagents",
+    "ask_question",
+    "finish",
+}
 MEDIA_TOOLS = {"generate_image", "imagegen", "view_image", "open_image"}
 
 READONLY_BINARIES = {
@@ -580,6 +597,39 @@ def _extract_cmd_substitutions(clause: str) -> List[str]:
     return subs
 
 
+def _git_branch_is_readonly(subargs: List[str]) -> bool:
+    """仅放行明确的列举选项，未知选项和创建/修改分支均按写操作处理。"""
+    flags = {"-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--list", "-l",
+             "--show-current", "--no-abbrev", "--abbrev", "--color", "--no-color", "--column",
+             "--no-column", "-i", "--ignore-case"}
+    selectors = {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at"}
+    valued = {"--sort", "--format"}
+    equals = selectors | valued | {"--abbrev", "--color", "--column"}
+    mutations = {"--unset-upstream", "--set-upstream-to", "-u", "--track", "--no-track",
+                 "--edit-description", "-f", "--force", "-d", "-D", "-m", "-M", "-c", "-C",
+                 "--delete", "--move", "--copy"}
+    if any(arg.split("=", 1)[0] in mutations or (arg.startswith("-u") and not arg.startswith("--")) for arg in subargs):
+        return False
+    explicit_list = "--list" in subargs or "-l" in subargs
+    idx = 0
+    while idx < len(subargs):
+        arg = subargs[idx]
+        if arg in selectors | valued:
+            has_value = idx + 1 < len(subargs) and not subargs[idx + 1].startswith("-")
+            if arg in valued and not has_value:
+                return False
+            idx += 2 if has_value else 1
+            continue
+        if arg in flags or ("=" in arg and arg.split("=", 1)[0] in equals):
+            idx += 1
+            continue
+        if explicit_list and not arg.startswith("-"):
+            idx += 1
+            continue
+        return False
+    return True
+
+
 def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0) -> str:
     """
     将 run_command 分类为：
@@ -654,10 +704,7 @@ def _classify_run_command(cmd_str: str, is_daemon: bool = False, _depth: int = 0
             writes_output = any(arg == "--output" or arg.startswith("--output=") for arg in subargs)
             if subcmd in GIT_READONLY_SUBCMDS and not has_redir and not writes_output:
                 continue
-            branch_lists = not subargs or all(arg.startswith("-") for arg in subargs) or "--list" in subargs
-            if (subcmd == "branch" and branch_lists
-                    and not any(f in subargs for f in ("-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy"))
-                    and not has_redir):
+            if subcmd == "branch" and _git_branch_is_readonly(subargs) and not has_redir:
                 continue
             if subcmd in GIT_LOCAL_COMMIT_SUBCMDS and not has_redir:
                 has_git_commit_or_add = True
@@ -1017,7 +1064,7 @@ def _build_drain_message(gate_state: Dict[str, Any], tel: Dict[str, Any]) -> str
         f"【长会话强收口门禁 · Stage-2 drain】触发源：{', '.join(gate_state.get('triggers') or ['pressure'])} "
         f"（{_format_telemetry_brief(tel)}）。\n"
         f"- 当前进入原子收口排空期（剩余模型调用 {gate_state['drainInvocationsRemaining']} 次 / 写或运行动作 {gate_state['drainActionsRemaining']} 次）：\n"
-        "  1. 禁止新开 subagent/swarm/schedule/browser/cae_harness 派工、禁止读图及 `git push`；\n"
+        "  1. 禁止新开 subagent/run_workflow/swarm/schedule/browser/cae_harness 派工、禁止读图及 `git push`；\n"
         "  2. 仅完成手头未闭环的局部收尾与本地验收，`git add`/`git commit`；\n"
         "  3. 全量整理当前已验证进展、未尽事项与可直接粘贴的【新对话提示词】写入交接文档或在终局回复给出，随后立即停机。"
         + goal_line
@@ -1293,10 +1340,20 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
     transcript_str = payload.get("transcriptPath")
     transcript_path = user_words.resolve_compact_transcript_path(Path(transcript_str).expanduser()) if transcript_str else None
 
-    # 对 read_file 图片读取实时累计计数并检查是否当场突破 Stage-2
+    # 对 read_file / view_file 图片读取实时累计计数并检查是否当场突破 Stage-2
     is_image_read = False
     if tool_name == "read_file":
-        file_arg = str(args.get("AbsolutePath") or args.get("Path") or args.get("path") or "").strip()
+        file_arg = str(
+            args.get("AbsolutePath")
+            or args.get("absolute_path")
+            or args.get("FilePath")
+            or args.get("Path")
+            or args.get("path")
+            or args.get("TargetFile")
+            or args.get("target_file")
+            or args.get("file_path")
+            or ""
+        ).strip()
         if is_image_path(file_arg):
             is_image_read = True
             record_image_read(gate_state, file_arg, cwd=cwd, workspace_paths=workspace_paths, increment_calls=True)
@@ -1351,7 +1408,19 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
 
     # 4. write_file / edit_file：交接文档始终放行；非交接修改在 drain 扣减预算，在 freeze 阻断
     if tool_name in ("write_file", "edit_file"):
-        write_arg = str(args.get("Path") or args.get("path") or args.get("TargetFile") or args.get("file_path") or "").strip()
+        write_arg = str(
+            args.get("Path")
+            or args.get("path")
+            or args.get("AbsolutePath")
+            or args.get("absolute_path")
+            or args.get("FilePath")
+            or args.get("TargetFile")
+            or args.get("target_file")
+            or args.get("file_path")
+            or args.get("NotebookPath")
+            or args.get("notebook_path")
+            or ""
+        ).strip()
         if _is_handoff_target(write_arg, conversation_id, cwd, workspace_paths):
             if boundary_blocked:
                 if changed:
@@ -1394,14 +1463,14 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
         save_gate_state(state_dir, conversation_id, gate_state)
         return None
 
-    # 5. send_message：仅允许在 drain 消耗 1 次动作通知收尾，freeze 冻结阻断
-    if tool_name == "send_message":
+    # 5. send_message / post_message / swarm_wait：仅允许在 drain 消耗 1 次动作通知收尾，freeze 冻结阻断
+    if tool_name in ("send_message", "post_message", "swarm_wait"):
         if phase == "freeze" or int(gate_state.get("drainActionsRemaining", 0)) <= 0:
             gate_state["phase"] = "freeze"
             save_gate_state(state_dir, conversation_id, gate_state)
             return {
                 "decision": "deny",
-                "reason": "【user-guard 长会话交接门禁 (freeze)】已冻结，禁止再通过 `send_message` 唤醒或继续驱动子代理。请直接整理交接并停机。",
+                "reason": f"【user-guard 长会话交接门禁 (freeze)】已冻结，禁止再通过 `{tool_name}` 唤醒或等待后台子代理。请直接整理交接并停机。",
             }
         if consume_drain_action(gate_state):
             gate_state["enteredFreezeAtStep"] = tel["latestStep"]

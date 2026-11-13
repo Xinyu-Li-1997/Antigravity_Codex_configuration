@@ -48,9 +48,9 @@
 
 | 执行层 | 运行位置 | 上下文窗口形态 | 模型与思考挡位由谁决定 |
 | --- | --- | --- | --- |
-| **前端交互主会话** | 反重力或 Codex 当前桌面／终端窗口 | 当前主会话窗口 | 用户在前端界面自选，后台脚本绝不反向篡改 |
+| **前端交互主会话** | 反重力或 Codex 当前桌面／终端窗口 | 当前主会话窗口 | 用户在前端界面自选，运行期钩子与 `cae-harness` 绝不反向修改（升级安装默认亦保留已选模型） |
 | **宿主内置复合模式** | 宿主内部（如反重力 `Orchestrator`） | 单一会话内多模型交替共享同一个窗口（容量不叠加） | 宿主固定编排，不支持外部传 `--effort` 调挡 |
-| **本侧原生只读子代理** | 反重力 `invoke_subagent` 或 Codex 原生子代理 | 每个子代理拥有独立的子会话大上下文窗口 | 反重力侧默认 `inherit` 完全跟随主会话模型与挡位，不受 `cae-harness` 影响 |
+| **本侧原生只读子代理／工作流** | 反重力 `invoke_subagent`、`run_workflow` 或 Codex 原生子代理 | 每个子代理拥有独立的子会话大上下文窗口 | 反重力侧默认 `inherit` 完全跟随主会话模型与挡位（10+ 同构目录只读盘点可用 `run_workflow` 扇出），不受 `cae-harness` 影响 |
 | **`cae-harness` 跨端 CLI** | 按需启动的 `codex exec` 或 `agy` 独立无头进程 | 全新隔离会话，自动下发所选模型声明的最大上下文窗口 | 由 `cae-harness` 按任务性质独立读取运行侧模型目录选定，不受前端主控模型影响 |
 
 ```mermaid
@@ -71,8 +71,8 @@ flowchart TB
 
 1. **反重力主控统筹 + 原生 `inherit` 子代理并行读文献／审代码**：
    日常课题推进推荐在反重力前端选择单模型 **`Gemini 4 Carbon (High)`**。相比在同一窗口内交替调用模型的 `Orchestrator (Carbon)`，纯 `Carbon (High)` 单轮持续推理更稳，且通过 `invoke_subagent` 唤起的 `readonly-reader`、`readonly-auditor`、`readonly-collaborator` 会自动继承 `Carbon (High)` 并各自获得独立的约 `1M` 标称上下文窗口，适合并行通读多篇参考文献或跨几十个源文件摘录边界条件与算子实现。
-2. **硬核数理推导与核心求解器编码交给 `cae-harness` 调 Codex（默认满血旗舰 + 按需省流）**：
-   遇到雅可比矩阵推导、DGSEM／WENO 离散守恒与熵稳定证明、CFL 步长分析或核心求解器模块编写与门禁测试时，通过 `cae-harness` 派发 Codex 无头任务：
+2. **硬核数理推导、核心编码与门禁审查工作流优先交由 Codex 端攻坚（默认满血旗舰 + 按需省流）**：
+   双端均可用时，凡涉及雅可比矩阵推导、DGSEM／WENO 离散守恒与熵稳定证明、CFL 步长分析、核心求解器模块编写、严苛边界／安装脱敏核查与门禁测试，**优先通过 `cae-harness` 发起 Codex 无头工作流**（发挥其深度推理、高保持率长上下文与 `workspace-write` 工程沙箱优势），改完跑过门禁后交回反重力总控做最终验收：
    - **数学推导、路线论证与高复杂度数理审查（`math`／`direction`）**：自动优选深度推理旗舰 **`Astra`**（`gpt-6-astra`）；
    - **求解器代码实现、常规审查、大型代码审计与验证门禁（`code`／`review`／`audit`／`gate`）**：自动优选最新代工程旗舰 **`Sol`**（`gpt-6.1-sol`，多代并存时自动取最新代）；
    - **默认满血（选项 A）与按需省流（选项 B）**：除纯文字润色（`polish` 短篇保持 `medium`、长篇保持 `high` 防过度发挥）外，默认一律启用所选旗舰模型的**单模型纯思考最高挡 `max`**（跳过内部二次派生的 `ultra` 挡防套娃烧穿配额），并显式下发模型声明最大上下文窗口（当前目录为 **`872,000` token**）。**只有当用户明确或模糊提出降挡、省额度、省 token 时**，脚本才切换为分级省流模式（常规任务用 `high`，表面格式／拼写微查启用轻量模型 + `low`）。
@@ -94,8 +94,9 @@ flowchart TB
 | Codex：`GPT-6.1-Terra` | 多模态图表理解、界面交互与边界明确的代码修改 | 同上六挡 | 本机目录声明默认 `500,000`、最大 `872,000` token |
 | Codex：`GPT-6-Luna` | 仅在用户要求降挡／省 token 且属表面拼写／格式微查时启用 | 目录支持至 `max`（不含 `ultra`） | 本机目录声明默认 `272,000`、最大 `872,000` token |
 | 反重力：`Gemini 4 Carbon`／`Argon` | 推荐前端主会话总控、长文献综合与跨模块架构把关 | 当前 CLI 目录提供 `low/medium/high`，单模型最高可用挡为 `high` | Google 官方公布 API 窗口 `1,048,576` token；客户端受自动检查点策略管理 |
-| 反重力：`Gemini 4 Hydrogen` | 快速辅助编码与按需省流模式下的表面格式微查 | 当前 CLI 目录提供 `low/medium/high/xhigh` | `/context` 面板显示约 `1.0M`，CLI 单条消息长度与检查点阈值另算 |
+| 反重力：`Gemini 4 Hydrogen`／`Gemini 3.8 Flash` | 快速辅助编码与按需省流模式下的表面格式微查 | `Hydrogen` 提供 `low/medium/high/xhigh`（前端 `Extra` 即 `xhigh`） | `/context` 面板显示约 `1.0M`，CLI 单条消息长度与检查点阈值另算 |
 | 反重力：`Orchestrator (Carbon/Argon)` | 单一窗口内由 Carbon/Argon 规划审阅、Hydrogen 实施 | 固定复合配置，不可传 `--effort`；并非多子代理并发 | 内部子模型共享同一会话窗口，总容量不会叠加 |
+| 反重力第三方托管：`Claude Sonnet/Opus 5.5 (thinking)` | 长周期稀缺配额第三方模型（`cae-harness` 默认排除，仅在显式点名时调用） | 托管推理模式（注：`Claude 4.6` 与 `GPT-OSS-120b` 于 `2026-11-18` 下线，切换后在仓库根目录运行 `python -B template/user-guard/skills/cae-harness/scripts/cae_harness.py probe --discover-models` 刷新本地目录缓存） | 受托管平台配额与会话检查点策略管理 |
 
 参考文档：[OpenAI Codex 模型说明](https://learn.chatgpt.com/docs/models)、[Antigravity 模型说明](https://antigravity.google/docs/models)、[Gemini 4 Hydrogen 与 Orchestrator 公告](https://antigravity.google/blog/gemini-4-hydrogen-in-google-antigravity)、[Google Gemini 窗口规格表](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/migrate)。
 
@@ -200,6 +201,8 @@ python -B install.py --dry-run --yes
 ```text
 Antigravity_Codex_configuration/
 ├── README.md                                 # 仓库总入口：痛点定位、三套部署模式、协作架构与快速上手
+├── CHANGELOG.md                              # 项目版本演进与宿主协议适配更新日志
+├── LICENSE                                   # Apache License 2.0 开源许可证
 ├── AGENTS.md                                 # 供反重力与 Codex 助手共读的四步本机自举配置与维护规范
 ├── install.py / install.ps1 / install.sh     # 跨平台安装器：探测预演、TOML 无损合并、越界链接防护与幂等同步
 ├── docs/
@@ -208,6 +211,7 @@ Antigravity_Codex_configuration/
 ├── template/
 │   ├── user-guard/                           # 反重力原生插件及双端同源核心模板
 │   │   ├── plugin.json / hooks.json / README.md
+│   │   ├── assets/logo.svg                   # 极简插件矢量图标（通过官方 --strict 校验）
 │   │   ├── rules/AGENTS.md                   # 双端共用的 R0–R11 全局工程与科学计算规则
 │   │   ├── hooks/*.py                        # 原话归档回溯、目录硬边界、防空转刷屏与长会话交接 5 个模块
 │   │   ├── agents/readonly-*.md              # 反重力三个 inherit 只读子代理（通读、审计、数理推导与润色）
