@@ -3,15 +3,21 @@ name: cae-harness
 description: >-
   Delegate bounded engineering and research tasks between Codex and Antigravity.
   Use for independent cross-platform reviews, large code audit planning, or
-  delegated code changes with an explicit verification command. Supports review,
-  direction, polish, math, and code tasks.
+  delegated code changes with an explicit verification command. Assess local
+  CLI and model metadata before choosing a backend for an independent task.
 ---
 
 # Codex 与反重力双向协作
 
 偏代码工程由 Codex 总控，反重力参与方向校正、技术表述润色和独立验收。偏科研主题由反重力总控，Codex 承担其中部分高质量编码和数学工作。任务结果交回实际发起方，由当前总控核实证据、整合成果和推进交付。
 
-本技能的后端为 `agy` 与 `codex`，作为**两级协同体系中的二级并发执行层**（前端一级交互总控可由用户优先使用纯旗舰或 `Orchestrator` 混动路由器，与本技能二级并发选路互不冲突）。默认策略（`--tier auto`、`:default`）在运行期动态解析对侧模型元数据，实行**“模型因地制宜按专长选路、思考挡位按任务性质分级”**：自动区分旗舰深思家族（无前缀/非轻量主力）、同代轻量高速家族（如 `flash`、`hydrogen`、`lite`、`mini`、`fast` 标签）以及混动路由器（默认不作为 `:default` 后台无头选路目标）；数理推导（`math`）与路线攻坚（`direction`）优先调度深度推理专长模型并启用**单模型纯思考最高挡**（`max`／`xhigh`，后台无头子任务默认跳过内部二次派生委派挡位 `ultra` 以防套娃裂变）；大窗口代码实现（`code`）、全量审计（`audit`）与门禁闭环（`gate`）调度大上下文工程主力模型（常规任务采用 `high` 挡，含高阶数值格式／守恒性／并发根因特征或门禁失败排错重试轮自动升至 `max` 挡）；短篇纯文字润色（`polish`）采用 `medium` 挡（长篇 `high` 挡）；单文件拼写／注释表面核查或显式省额度指令调度轻量高速模型（`low` 挡）；宿主内长周期稀缺配额池的内置第三方模型默认不纳入后台自动消耗。除自适应 `:default` 外，完全支持**显式精确模型**（如 `--engine "agy:Orchestrator (Carbon)"`）、**模糊别名直达**（如 `--engine agy:carbon`、`agy:orchestrator-argon`、`codex:fast`）、自然语言显式点名模型或 `--tier ultra|max|xhigh|high|medium|low`。跨平台调用启动独立进程，任务单应提供最新用户决定、输入文件、工作目录、允许改动范围和验收要求。`codex` 子任务启用 `--ephemeral` 无持久会话模式，`agy` 子任务写入独立的无头 CLI 存储而不污染桌面端或 IDE 侧边栏对话框及项目树；完整结构化回执（含实际选定模型、推理挡位与选挡依据）统一归还发起方主对话。
+前端交互遵循用户显式选定的模型和挡位。技能只负责通过 `agy` 和 `codex` 发起的 CLI 子任务。Codex 原生 `spawn_agent` 由总控按当前可用模型和挡位显式调度。
+
+- 数理推导（`math`）、路线分析（`direction`）及复杂数值格式、守恒性或并发根因复核，优先使用适合深度推理的模型和可用的单模型最高挡（如 `max` 或 `xhigh`）。后台默认跳过用于二次自动派生的 `ultra`。
+- 大窗口编码（`code`）、全量审计（`audit`）与指定命令验收（`gate`）优先选择适合大上下文的工程模型。常规编码、审查和长篇技术润色采用 `high`，短篇纯文字润色采用 `medium`，表面核查可选轻量模型和 `low`。
+- 自动策略为 `--tier auto` 和 `<后端>:default`。默认排除混动路由器与占用长周期稀缺配额的内置第三方模型。可用 `--engine <后端>:<目录中的模型名或别名>` 和 `--tier ultra|max|xhigh|high|medium|low` 显式指定。
+
+任务单应提供用户最新定论、输入材料、工作目录、允许改动范围与验收要求。Codex 子任务使用 `--ephemeral`，反重力子任务使用独立的无头 CLI 存储。回执含选定模型、推理挡位和选挡依据，交回实际发起方。
 
 ## 调用入口
 
@@ -19,10 +25,11 @@ description: >-
 
 ```sh
 python -B scripts/cae_harness.py probe
+python -B scripts/cae_harness.py assess --caller codex
 python -B scripts/cae_harness.py task --help
 ```
 
-`probe` 默认读取程序路径和本侧配置。`probe --discover-models` 会执行模型列表查询，按需要使用。程序发现、配置或缓存元数据、认证状态和实际调用验证分别判断。使用预算字段时同时核对其来源和验证状态。
+`probe` 默认只读程序路径、本侧配置与模型缓存；`probe --discover-models` 调用 `agy models` 查询反重力模型目录并刷新缓存。`assess` 只读输出 CLI 发现情况、目录来源与采集时效、声明的上下文容量与挡位、未知项及场景选路建议（加 `--discover-models` 仅用于本次评估，不写配置或缓存），不凭缓存宣称模型实际性能。认证、执行性能和任务适用性以受控运行的证据为准，未实测项标为未验证。使用预算字段时核对其来源、时间和验证状态。
 
 ## 独立任务
 
@@ -43,7 +50,7 @@ python -B scripts/cae_harness.py task --caller antigravity --engine codex:defaul
 
 反重力的一般只读任务使用 `readonly-collaborator`，专门的源码审计使用 `readonly-auditor`。使用这些角色前，核对运行侧 `user-guard` 插件已经包含对应角色。
 
-写入任务明确列出 `--write-scope`，可重复指定。子任务一律受项目目录硬边界约束（`codex exec` 强制启用 `-s workspace-write -c approval_policy="never"`，`agy` 启用 `--sandbox` 并联动 `PreToolUse` 钩子硬阻断越界写入），严禁在 `--target` 目标项目目录之外的业务目录或全局配置中创建、修改或删除任何文件与目录（含严禁在父目录或外部目录创建 `.codex-worktrees` / `git worktree`；系统标准临时目录与运行时记忆缓存除外）。范围检查同时比较执行前后的工作区文件状态，越界会报告失败；异常后的文件差异由总控查阅处理，脚本保留实际变更供核对。
+写入任务用 `--write-scope` 列出授权文件，可重复指定。Codex 写入任务使用 `-s workspace-write -c approval_policy="never"`，反重力任务使用 `--sandbox`，并由已启用的 `PreToolUse` 钩子检查可识别的越界动作。除约定的临时目录和运行时缓存外，子任务的业务写入限于 `--target`。执行前后比较工作区文件状态，报告检测到的越界变更，由总控核对实际差异。
 
 ```sh
 python -B scripts/cae_harness.py task --caller antigravity --engine codex:default --kind code --target "<项目目录>" --task-file "<UTF-8任务单>" --write-scope "src/*.py" --verify-cmd "python -B -m unittest discover -s tests"
@@ -66,4 +73,4 @@ python -B scripts/cae_harness.py gate --caller antigravity --worker codex:defaul
 
 标准错误流提供生命周期事件，标准输出返回最终 JSON。父会话保留本次进程句柄以等待结果或取消本次任务，按回执状态处理成功、部分完成、无效输出、额度耗尽（`quota_exhausted`，退出码 `5`）、超时和失败。当某一方触发额度上限时，脚本会立即熔断同批次后续重试并将恢复参考时间记入本侧运行缓存；冷却期内再次触发调用时会在发起前直接拦截（`preflight_blocked: true`），此时当前总控必须明确提示用户并交由用户二选一：**① 先不发起跨端调用（改由当前总控在本侧直接完成）**，或 **② 已充值／额度恢复后附带 `--retry-quota` 重新发起**（成功后自动清除冷却记录）。审查结果由总控核对源文件或原始记录后采纳。
 
-安装与 Windows／WSL 同步由仓库安装器负责。先在临时目标目录验证同一提交，再在当前任务合适的间隙更新用户目录。安装后的技能入口及后端程序由各侧运行环境解析。WSL 优先调用本侧已登录原生 CLI；当 WSL 缺少原生 `codex` 或原生 `agy` 未登录时，自动回退调用 Windows 侧已登录的 `codex.exe`／`agy.exe`：`/mnt/<盘符>` 共享目录支持只读与授权写入任务，WSL 纯 Linux 文件系统路径自动通过 Windows `%TEMP%` 临时只读镜像支持审计与只读协作，代码写入任务需在 `/mnt/<盘符>` 目录执行或在 WSL 登录原生 CLI。
+Windows 与 WSL 分别从同一版本安装。在临时目录验证后更新本侧用户配置。WSL 优先使用本侧已登录的原生 CLI，具备互操作条件时可回退到 Windows CLI。使用 Windows CLI 处理 WSL 项目时，`/mnt/<盘符>` 的共享目录可用于授权写入。纯 Linux 路径的只读任务可使用 Windows 临时镜像，代码写入须使用共享目录或已登录的 WSL 原生 CLI。可用方向以实际探测和回执为准。

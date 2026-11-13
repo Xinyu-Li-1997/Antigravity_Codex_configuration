@@ -5,9 +5,9 @@
 ================================================================================
 功能特性：
 1. 支持三种部署形态，自动探测本机已安装客户端并按需适配（--app auto|both|antigravity|codex）：
-   - 单反重力独立模式：部署 ~/.gemini/config/plugins/user-guard 全套插件（含双模压缩恢复与反重力专有两阶段长会话交接停机门禁）、CLI 最高挡模型与可选 Zotero MCP；
+   - 单反重力独立模式：部署 ~/.gemini/config/plugins/user-guard 全套插件（含双模压缩恢复与两阶段长会话交接停机门禁）、CLI 默认模型补缺与可选 Zotero MCP；
    - 单 Codex 独立模式：部署 ~/.codex/AGENTS.md（保留自定义本机硬件段）、agents/readonly-*.toml 只读子代理、
-     hooks/ 原话压缩恢复钩子与 hooks.json（保持已有信任哈希）、config.toml 安全沙箱与基线、单模型最高挡基线（默认跳过套娃自动委派 ultra）及可选 Zotero MCP；
+     hooks/ 原话压缩恢复和长会话交接钩子、config.toml 安全沙箱和默认模型补缺及可选 Zotero MCP；
    - 双端完整协作模式：同时部署上述两套独立工作流，并同步双端共享的 cae-harness 跨平台派工与验收技能。
 2. 当本机仅检测到单客户端时，清晰提示是否先安装另一方；选择不安装（或非交互 --yes）即单独配置当前客户端，零报错闭环。
 3. 提供 --probe-apps 纯只读环境探测 JSON 输出，供 Codex 或反重力读取仓库后自动引导自举配置。
@@ -24,8 +24,14 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:
+    import tomllib
+except ImportError:  # Python 3.9 和 3.10
+    tomllib = None
 
 # 全平台强制标准流为 UTF-8
 for _stream_name in ("stdin", "stdout", "stderr"):
@@ -431,80 +437,139 @@ def _select_agy_frontier_max_label(models: List[Dict[str, str]]) -> Optional[str
     tiered: List[Tuple[str, str, str]] = []
     for item in models:
         m = re.match(r"^(.+)-(minimal|low|medium|high|xhigh|max|ultra)$", item["slug"].lower())
-        if m:
+        if m and m.group(2) != "ultra":
             tiered.append((m.group(1), m.group(2), item["display_name"]))
     if not tiered:
-        return models[0]["display_name"] if models else None
+        return next(
+            (item["display_name"] for item in models if not item["slug"].lower().endswith("-ultra")),
+            None,
+        )
     primary_family = next(
         (fam for fam, _, _ in tiered if not (set(re.split(r"[^a-z0-9]+", fam)) & skip_tokens)),
         tiered[0][0],
     )
     variants = {tier: label for fam, tier, label in tiered if fam == primary_family}
-    non_ultra = {tier: label for tier, label in variants.items() if tier != "ultra"} or variants
-    best_tier = max(non_ultra, key=EFFORT_ORDER.index)
-    return non_ultra[best_tier]
+    best_tier = max(variants, key=EFFORT_ORDER.index)
+    return variants[best_tier]
 
 
-def _sync_codex_frontier_max(codex_root: Path, dry_run: bool = False) -> None:
+def _sync_codex_frontier_max(
+    codex_root: Path, dry_run: bool = False, *, overwrite: bool = False,
+) -> None:
     cfg_path = codex_root / "config.toml"
     cache_path = codex_root / "models_cache.json"
-    if not cfg_path.is_file() or not cache_path.is_file():
-        return
     try:
-        cache = json.loads(cache_path.read_text(encoding="utf-8-sig"))
-        models = [m for m in cache.get("models", []) if isinstance(m, dict) and m.get("slug")]
-        visible = [m for m in models if m.get("visibility") != "hide"] or models
-        if not visible:
-            return
-        frontier = min(visible, key=lambda m: (int(m.get("priority") or 9999), 0))
-        slug = str(frontier["slug"])
-        raw_levels = [
-            lvl
-            for lvl in frontier.get("supported_reasoning_levels", [])
-            if isinstance(lvl, dict) and lvl.get("effort") in EFFORT_ORDER
-        ]
-        non_delegating = [
-            lvl.get("effort")
-            for lvl in raw_levels
-            if "delegation" not in str(lvl.get("description") or "").lower()
-            and lvl.get("effort") != "ultra"
-        ]
-        max_effort = max(non_delegating, key=EFFORT_ORDER.index) if non_delegating else None
-        raw_lines = cfg_path.read_text(encoding="utf-8").splitlines()
-    except Exception:
+        raw_text = cfg_path.read_text(encoding="utf-8") if cfg_path.is_file() else ""
+        parsed = tomllib.loads(raw_text) if tomllib is not None else None
+    except (OSError, ValueError) as exc:
+        print(f"[!] 无法读取 {cfg_path} 的模型设置，已保留原文件: {exc}", file=sys.stderr)
         return
 
+    raw_lines = raw_text.splitlines()
     split_idx = next((i for i, line in enumerate(raw_lines) if line.lstrip().startswith("[")), len(raw_lines))
     header, body = raw_lines[:split_idx], raw_lines[split_idx:]
-    cur_model = cur_effort = None
-    model_idx = effort_idx = None
-    for idx, line in enumerate(header):
-        m_mod = re.match(r'^\s*model\s*=\s*["\']([^"\']+)["\']', line)
-        if m_mod:
-            cur_model, model_idx = m_mod.group(1), idx
-        m_eff = re.match(r'^\s*model_reasoning_effort\s*=\s*["\']([^"\']+)["\']', line)
-        if m_eff:
-            cur_effort, effort_idx = m_eff.group(1), idx
+    values: Dict[str, str] = {}
+    lines: Dict[str, Tuple[int, str, str]] = {}
+    keys = ("model", "model_reasoning_effort")
+    for key in keys:
+        assignments = []
+        for idx, line in enumerate(header):
+            match = re.match(rf"^(\s*(?:{key}|'{key}'|\"{key}\")\s*=\s*)(.*)$", line)
+            if match:
+                assignments.append((idx, match))
+        if len(assignments) > 1:
+            print(f"[!] {cfg_path} 的 {key} 存在多个顶层赋值，已保留原文件。", file=sys.stderr)
+            return
+        if assignments:
+            idx, assignment = assignments[0]
+            literal = re.fullmatch(r'''("(?:[^"\\]|\\.)*"|'[^']*')(\s*(?:#.*)?)''', assignment[2])
+            if literal:
+                lines[key] = (idx, assignment[1], literal[2])
+                if parsed is None:
+                    values[key] = literal[1][1:-1]
+        if parsed is not None and key in parsed:
+            if not isinstance(parsed[key], str):
+                print(f"[!] {cfg_path} 的 {key} 不是字符串，已保留原文件。", file=sys.stderr)
+                return
+            values[key] = parsed[key]
+        elif assignments and key not in values:
+            print(f"[!] 无法读取 {cfg_path} 的 {key}，已保留原文件。", file=sys.stderr)
+            return
 
-    if cur_model == slug and (not max_effort or cur_effort == max_effort):
-        print(f"[*] Codex 本机默认模型已处于单模型最高挡: {slug} ({cur_effort or 'default'})")
-        return
-    if dry_run:
-        print(f"[Dry-Run] 将更新 {cfg_path} 默认模型挡位 -> {slug} ({max_effort or 'default'})")
+    cur_model = values.get("model", "").strip()
+    cur_effort = values.get("model_reasoning_effort", "").strip()
+    if cur_model and cur_effort and not overwrite:
+        print("[*] 保留 Codex 已配置的默认模型和推理挡位。")
         return
 
-    if model_idx is not None:
-        header[model_idx] = f'model = "{slug}"'
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8-sig"))
+        models = [m for m in cache["models"] if isinstance(m, dict) and isinstance(m.get("slug"), str) and m["slug"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        print(f"[*] 未读取到有效的 Codex 模型目录 {cache_path}，默认模型设置保持原样。")
+        return
+
+    def supported_levels(model: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw_levels = model.get("supported_reasoning_levels")
+        if not isinstance(raw_levels, list):
+            return []
+        return [level for level in raw_levels if isinstance(level, dict) and level.get("effort") in EFFORT_ORDER]
+
+    if cur_model and not overwrite:
+        selected = next((m for m in models if m["slug"] == cur_model), None)
     else:
-        header.insert(0, f'model = "{slug}"')
-    if max_effort:
-        if effort_idx is not None:
-            header[effort_idx] = f'model_reasoning_effort = "{max_effort}"'
+        visible = [m for m in models if m.get("visibility") != "hide"] or models
+        if cur_effort and not overwrite:
+            visible = [m for m in visible if any(level["effort"] == cur_effort for level in supported_levels(m))]
+        selected = min(
+            visible,
+            key=lambda m: m["priority"] if type(m.get("priority")) is int else 9999,
+            default=None,
+        )
+    if selected is None:
+        print("[*] Codex 模型目录未找到与现有模型设置匹配的条目，已保留原配置。")
+        return
+
+    slug = selected["slug"]
+    efforts = [
+        level["effort"] for level in supported_levels(selected)
+        if level["effort"] != "ultra" and "delegation" not in str(level.get("description") or "").lower()
+    ]
+    effort = cur_effort if cur_effort and not overwrite else max(efforts, key=EFFORT_ORDER.index, default="")
+    if not effort:
+        print(f"[*] Codex 模型 {slug} 缺少可用的非委派推理挡位元数据，未补齐挡位。")
+        if overwrite and cur_effort:
+            return
+
+    updates = {key: val for key, val in zip(keys, (slug, effort)) if val and val != values.get(key, "").strip()}
+    if not updates:
+        return
+    if any(key in values and key not in lines for key in updates):
+        print(f"[!] {cfg_path} 含无法安全更新的模型赋值，已保留原文件。", file=sys.stderr)
+        return
+    description = ", ".join(f"{key}={val}" for key, val in updates.items())
+    if dry_run:
+        print(f"[Dry-Run] 将写入 {cfg_path} 的模型设置: {description}")
+        return
+
+    missing_lines = []
+    for key, val in updates.items():
+        quoted = json.dumps(val, ensure_ascii=False)
+        if key in lines:
+            idx, prefix, suffix = lines[key]
+            header[idx] = prefix + quoted + suffix
         else:
-            insert_at = (model_idx + 1) if model_idx is not None else 1
-            header.insert(insert_at, f'model_reasoning_effort = "{max_effort}"')
-    cfg_path.write_text("\n".join(header + body) + "\n", encoding="utf-8")
-    print(f"[+] 已配置 Codex 本机默认单模型最高挡: {slug} ({max_effort or 'default'})")
+            missing_lines.append(f"{key} = {quoted}")
+    updated = "\n".join(missing_lines + header + body) + "\n"
+    if tomllib is not None:
+        try:
+            tomllib.loads(updated)
+        except ValueError as exc:
+            print(f"[!] Codex 模型设置合并后无法解析，已保留 {cfg_path}: {exc}", file=sys.stderr)
+            return
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(updated, encoding="utf-8")
+    print(f"[+] 已写入 Codex 默认模型设置: {description}")
 
 
 def _sync_codex_workspace_boundary(codex_root: Path, dry_run: bool = False) -> None:
@@ -747,149 +812,245 @@ def _sync_codex_agents(codex_template_dir: Path, codex_root: Path, dry_run: bool
         print(f"[+] 已同步 Codex 只读子代理至 {dst_agents_dir}: {', '.join(updated_names)}")
 
 
-def _is_existing_codex_hook_valid(hooks_json_path: Path, expected_loader: Path) -> bool:
-    """检查已有 Codex hooks.json 是否已挂载指向本目录有效 session_context_loader.py 的恢复钩子（避免无故破坏已有 trusted_hash）"""
-    if not hooks_json_path.is_file():
-        return False
+def _reject_duplicate_json_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"JSON 键重复: {key}")
+        result[key] = value
+    return result
+
+
+def _codex_hook_tokens(handler: Dict[str, Any]) -> List[str]:
+    if handler.get("type") != "command" or not isinstance(handler.get("command"), str):
+        return []
     try:
-        data = json.loads(hooks_json_path.read_text(encoding="utf-8"))
-        groups = data.get("hooks", {}).get("SessionStart", [])
-        if not isinstance(groups, list):
-            return False
-        expected_resolved = expected_loader.resolve()
-        for grp in groups:
-            if not isinstance(grp, dict) or grp.get("matcher") != "^(compact|resume)$":
+        return [token.strip('"') for token in shlex.split(handler["command"], posix=(os.name != "nt"))]
+    except ValueError:
+        return []
+
+
+def _codex_managed_hook(handler: Dict[str, Any], codex_root: Path) -> Tuple[Optional[str], List[str]]:
+    tokens = _codex_hook_tokens(handler)
+    for idx, token in enumerate(tokens[1:], start=1):
+        script = Path(token).expanduser()
+        if script.name not in {"session_context_loader.py", "handoff_gate.py"}:
+            continue
+        if not script.is_absolute() or script.resolve() != codex_root / "hooks" / script.name:
+            continue
+        args = tokens[idx + 1:]
+        executable = Path(tokens[0]).stem.lower()
+        if not re.fullmatch(r"(?:python(?:\d+(?:\.\d+)*w?)?|py)", executable) and Path(tokens[0]) != Path(sys.executable):
+            continue
+        if script.name == "session_context_loader.py" and args[:2] == ["--client", "codex"]:
+            return "loader", tokens[:idx]
+        if (
+            script.name == "handoff_gate.py" and len(args) == 8
+            and tokens[idx - 4:idx] == ["-X", "utf8", "-I", "-B"]
+            and (idx == 5 or (idx == 6 and executable == "py" and tokens[1] == "-3"))
+            and args[:3] == ["--client", "codex", "--mode"] and args[3] in {"advisory", "enforce"}
+            and args[4] == "--compact-limit" and args[5].isdigit() and args[6] == "--state-dir"
+        ):
+            state_dir = Path(args[7]).expanduser()
+            if state_dir.is_absolute() and state_dir.resolve() == codex_root / "hooks" / "state" / "handoff":
+                return "gate", tokens[:idx]
+    return None, []
+
+
+def _read_codex_hooks(path: Path, raw: Optional[bytes]) -> Dict[str, Any]:
+    if raw is None:
+        return {"hooks": {}}
+    try:
+        doc = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=_reject_duplicate_json_keys)
+        if not isinstance(doc, dict) or ("hooks" in doc and not isinstance(doc["hooks"], dict)):
+            raise ValueError("顶层和 hooks 字段必须是对象")
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"无法安全合并 {path}，原文件已保留: {exc}") from exc
+    return doc
+
+
+def _plan_codex_hooks(
+    hooks_path: Path, template_path: Path, py_cmd: str, mode: str, compact_limit: int,
+) -> Optional[Tuple[Optional[bytes], Dict[str, Any]]]:
+    if _is_link_or_junction(hooks_path):
+        raise ValueError(f"Codex 钩子注册表是链接，请先核对: {hooks_path}")
+    codex_root = hooks_path.parent.resolve()
+    try:
+        original = hooks_path.read_bytes()
+    except FileNotFoundError:
+        original = None
+    doc = _read_codex_hooks(hooks_path, original)
+    defaults = _read_codex_hooks(template_path, template_path.read_bytes())["hooks"]
+    events = doc.setdefault("hooks", {})
+    codex_path = codex_root.as_posix()
+
+    changed = False
+    for event, groups in defaults.items():
+        matcher = groups[0].get("matcher")
+        desired = {}
+        for handler in groups[0]["hooks"]:
+            kind = "gate" if "handoff_gate.py" in handler["command"] else "loader"
+            if kind == "gate" and mode == "off":
                 continue
-            for h in grp.get("hooks", []):
-                if not isinstance(h, dict) or h.get("type") != "command":
+            command = handler["command"].replace("--mode advisory --compact-limit 0", f"--mode {mode} --compact-limit {compact_limit}")
+            script_start = command.index('"~/.codex/')
+            quote_path = (lambda path: '"' + path + '"') if os.name == "nt" else shlex.quote
+            script_command = re.sub(
+                r'"~/.codex/([^"\n]+)"',
+                lambda match: quote_path(codex_path + '/' + match.group(1)),
+                command[script_start:],
+            )
+            command = f'{py_cmd} {script_command}'
+            desired[kind] = {**handler, "command": command}
+
+        if not desired and event not in events:
+            continue
+        existing = events.get(event, [])
+        if not isinstance(existing, list) or any(
+            not isinstance(group, dict) or not isinstance(group.get("hooks"), list)
+            or any(not isinstance(handler, dict) for handler in group["hooks"])
+            for group in existing
+        ):
+            raise ValueError(f"无法安全合并 {hooks_path} 的 {event}，原文件已保留。事件须包含钩子组列表及各组的 handler 对象列表。")
+
+        retained = set()
+        first_matching_group = None
+        merged = []
+        for group in existing:
+            matching = group.get("matcher") == matcher
+            handlers = []
+            for handler in group["hooks"]:
+                kind, python = _codex_managed_hook(handler, codex_root)
+                if kind is None or (kind == "loader" and event != "SessionStart"):
+                    handlers.append(handler)
                     continue
-                cmd = str(h.get("command") or "").strip()
-                if "--client codex" not in cmd:
-                    continue
-                tokens = [t.strip('"') for t in shlex.split(cmd, posix=(os.name != "nt"))]
-                script_idx = next((i for i, t in enumerate(tokens) if t.endswith("session_context_loader.py")), -1)
-                if script_idx <= 0:
-                    continue
-                py_tokens = tokens[:script_idx]
-                py_exec_tokens = [t for t in py_tokens if not t.startswith("-")]
-                if not py_exec_tokens or not _is_working_python_cmd(py_exec_tokens[:2] if Path(py_exec_tokens[0]).stem.lower() == "py" else py_exec_tokens[:1]):
-                    continue
-                cand_script = Path(tokens[script_idx]).expanduser()
-                if cand_script.resolve() == expected_resolved:
-                    return True
-    except Exception:
-        return False
-    return False
+                if matching and kind in desired and kind not in retained:
+                    updated_handler = handler
+                    if kind == "gate":
+                        updated_handler = {**handler, "command": desired[kind]["command"]}
+                    elif handler["command"] != desired[kind]["command"]:
+                        if not _is_working_python_cmd(python):
+                            updated_handler = {**handler, "command": desired[kind]["command"]}
+                    handlers.append(updated_handler)
+                    retained.add(kind)
+            if handlers or not group["hooks"]:
+                updated_group = {**group, "hooks": handlers}
+                if matching and first_matching_group is None:
+                    first_matching_group = updated_group
+                merged.append(updated_group)
+
+        missing = [handler for kind, handler in desired.items() if kind not in retained]
+        if missing:
+            if first_matching_group is None:
+                first_matching_group = {} if matcher is None else {"matcher": matcher}
+                first_matching_group["hooks"] = []
+                merged.append(first_matching_group)
+            first_matching_group["hooks"].extend(missing)
+        if merged != existing:
+            if merged:
+                events[event] = merged
+            else:
+                events.pop(event, None)
+            changed = True
+    return (original, doc) if changed else None
 
 
 def _sync_codex_hooks(
     user_guard_hooks_dir: Path,
     codex_root: Path,
-    py_cmd: str,
+    plan: Optional[Tuple[Optional[bytes], Dict[str, Any]]],
     dry_run: bool = False,
+    *,
+    mode: str = "advisory",
+    compact_limit: int = 0,
 ) -> None:
-    """
-    同步统一无污染的压缩恢复钩子脚本 (session_context_loader.py, user_words.py) 至 <codex_root>/hooks/，
-    并在 <codex_root>/hooks.json 中无损注册 SessionStart (^(compact|resume)$) 钩子（已有有效注册时保持字节不变以保护 trusted_hash）。
-    """
+    """同步 Codex 原话恢复和长会话交接脚本，逐条合并已登记的 handler。"""
+    hooks_path = codex_root / "hooks.json"
     dst_hooks_dir = codex_root / "hooks"
-    hook_scripts = ("session_context_loader.py", "user_words.py")
+    hook_scripts = ["session_context_loader.py", "user_words.py"]
+    if mode != "off":
+        hook_scripts.append("handoff_gate.py")
+    for target in (dst_hooks_dir, *(dst_hooks_dir / name for name in hook_scripts)):
+        if _is_link_or_junction(target):
+            raise ValueError(f"Codex 钩子脚本或目录是链接，请先核对: {target}")
     scripts_updated: List[str] = []
 
-    for s_name in hook_scripts:
-        src_file = user_guard_hooks_dir / s_name
-        dst_file = dst_hooks_dir / s_name
-        if not src_file.is_file():
-            continue
-        src_bytes = src_file.read_bytes()
+    for name in hook_scripts:
+        src_bytes = (user_guard_hooks_dir / name).read_bytes()
+        dst_file = dst_hooks_dir / name
         if dst_file.is_file() and dst_file.read_bytes() == src_bytes:
             continue
-        scripts_updated.append(s_name)
+        scripts_updated.append(name)
         if not dry_run:
             dst_hooks_dir.mkdir(parents=True, exist_ok=True)
             dst_file.write_bytes(src_bytes)
 
-    # 清理 hooks/__pycache__ 缓存，完整保留 hooks/state 与 hooks/logs
     pycache_dir = dst_hooks_dir / "__pycache__"
-    if pycache_dir.is_dir():
+    if pycache_dir.is_dir() and not _is_link_or_junction(pycache_dir):
         if dry_run:
             print(f"  [Dry-Run CLEAN] 将清理 Codex 钩子字节码缓存: {pycache_dir}")
         else:
             shutil.rmtree(pycache_dir, ignore_errors=True)
 
     if scripts_updated:
-        if dry_run:
-            print(f"[Dry-Run] 将同步更新 Codex 压缩恢复钩子脚本至 {dst_hooks_dir}: {', '.join(scripts_updated)}")
-        else:
-            print(f"[+] 已同步 Codex 压缩恢复钩子脚本至 {dst_hooks_dir}: {', '.join(scripts_updated)}")
+        action = "将同步" if dry_run else "已同步"
+        prefix = "[Dry-Run]" if dry_run else "[+]"
+        print(f"{prefix} {action} Codex 钩子脚本至 {dst_hooks_dir}: {', '.join(scripts_updated)}")
+
+    if plan is None:
+        print("[*] Codex 钩子注册表已是最新状态，保留现有文件字节。")
+    elif dry_run:
+        print(f"[Dry-Run] 将合并 Codex 钩子注册表 {hooks_path}（交接模式 {mode}，压缩次数阈值 {compact_limit}）")
     else:
-        print("[*] Codex 压缩恢复钩子脚本已是最新状态。")
-
-    hooks_json_path = codex_root / "hooks.json"
-    expected_loader = dst_hooks_dir / "session_context_loader.py"
-    if _is_existing_codex_hook_valid(hooks_json_path, expected_loader):
-        print("[*] Codex hooks.json 原话恢复钩子已就绪（保持现有配置与信任哈希不变）。")
-        return
-
-    codex_posix = codex_root.resolve().as_posix()
-    loader_posix = f"{codex_posix}/hooks/session_context_loader.py"
-    state_posix = f"{codex_posix}/hooks/state/session-context"
-    log_posix = f"{codex_posix}/hooks/logs/session-context.jsonl"
-    desired_cmd = f'{py_cmd} "{loader_posix}" --client codex --state-dir "{state_posix}" --log "{log_posix}"'
-    desired_group = {
-        "matcher": "^(compact|resume)$",
-        "hooks": [
-            {
-                "type": "command",
-                "command": desired_cmd,
-                "timeout": 45,
-                "statusMessage": "恢复本会话用户原话",
-            }
-        ],
-    }
-
-    hooks_doc: Dict[str, Any] = {"hooks": {}}
-    if hooks_json_path.is_file():
+        original, hooks_doc = plan
+        hooks_path.parent.mkdir(parents=True, exist_ok=True)
+        content = json.dumps(hooks_doc, indent=2, ensure_ascii=False) + "\n"
+        temp_path = None
         try:
-            loaded = json.loads(hooks_json_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                hooks_doc = loaded
-        except Exception:
-            pass
-
-    events_map = hooks_doc.setdefault("hooks", {})
-    if not isinstance(events_map, dict):
-        events_map = {}
-        hooks_doc["hooks"] = events_map
-    ss_list = events_map.setdefault("SessionStart", [])
-    if not isinstance(ss_list, list):
-        ss_list = []
-        events_map["SessionStart"] = ss_list
-
-    # 替换旧的 session_context_loader 条目或追加新条目，保留其它用户自定义钩子
-    replaced = False
-    for idx, grp in enumerate(ss_list):
-        if isinstance(grp, dict) and any(
-            isinstance(h, dict) and "session_context_loader.py" in str(h.get("command") or "")
-            for h in (grp.get("hooks") or [])
-        ):
-            ss_list[idx] = desired_group
-            replaced = True
-            break
-    if not replaced:
-        ss_list.append(desired_group)
-
-    if dry_run:
-        print(f"[Dry-Run] 将在 {hooks_json_path} 中配置 Codex SessionStart (compact|resume) 原话恢复钩子")
-        return
-
-    hooks_json_path.parent.mkdir(parents=True, exist_ok=True)
-    hooks_json_path.write_text(json.dumps(hooks_doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"[+] 已配置 Codex 原话恢复钩子注册表: {hooks_json_path}")
+            with tempfile.NamedTemporaryFile(dir=hooks_path.parent, mode="w", encoding="utf-8", delete=False) as temp:
+                temp_path = Path(temp.name)
+                temp.write(content)
+            current = hooks_path.read_bytes() if hooks_path.exists() else None
+            if _is_link_or_junction(hooks_path) or current != original:
+                raise ValueError(f"{hooks_path} 在安装期间发生变更，请重新运行安装器。")
+            if current is not None:
+                temp_path.chmod(stat.S_IMODE(hooks_path.stat().st_mode))
+            temp_path.replace(hooks_path)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+        print(f"[+] 已合并 Codex 钩子注册表 {hooks_path}（交接模式 {mode}，压缩次数阈值 {compact_limit}）")
 
 
-def configure_agy_frontier_max_default(gemini_root: Path, dry_run: bool = False) -> None:
-    """动态探测当前账号可用反重力模型目录，将反重力 CLI 默认配置对齐至最先进模型最高挡位。"""
+def configure_agy_frontier_max_default(
+    gemini_root: Path, dry_run: bool = False, *, overwrite: bool = False,
+) -> None:
+    """使用反重力模型目录补齐 CLI 默认模型，或按显式选项覆盖。"""
+    cli_dir = gemini_root / "antigravity-cli"
+    settings_path = cli_dir / "settings.json"
+    cache_path = cli_dir / "cache" / "cae_models_cache.json"
+    settings_data: Dict[str, Any] = {}
+    if settings_path.is_file():
+        try:
+            settings_data = json.loads(settings_path.read_text(encoding="utf-8-sig"), object_pairs_hook=_reject_duplicate_json_keys)
+            if not isinstance(settings_data, dict):
+                raise ValueError("顶层必须是对象")
+        except (OSError, ValueError) as exc:
+            print(f"[!] 无法读取 {settings_path} 的模型设置，已保留原文件: {exc}", file=sys.stderr)
+            return
+    current_model = settings_data.get("model")
+    if not overwrite and not (isinstance(current_model, str) and current_model.strip()):
+        desktop_config = gemini_root / "config" / "config.json"
+        if desktop_config.is_file():
+            try:
+                desktop_data = json.loads(desktop_config.read_text(encoding="utf-8-sig"))
+                desktop_settings = desktop_data.get("userSettings", {}) if isinstance(desktop_data, dict) else {}
+                current_model = desktop_settings.get("model") if isinstance(desktop_settings, dict) else None
+            except (OSError, ValueError):
+                print(f"[!] 无法读取 {desktop_config} 的模型设置，已保留原配置。", file=sys.stderr)
+                return
+    keep_model = isinstance(current_model, str) and current_model.strip() and not overwrite
+
     agy_exe_name = "agy.exe" if os.name == "nt" else "agy"
     raw_which = shutil.which("agy")
     agy_bin = (
@@ -914,41 +1075,36 @@ def configure_agy_frontier_max_default(gemini_root: Path, dry_run: bool = False)
             pass
     if not models:
         models = _load_wsl_windows_agy_cache()
+    if models and not dry_run:
+        cache_content = json.dumps({"models": models}, indent=2, ensure_ascii=False) + "\n"
+        if not cache_path.is_file() or cache_path.read_bytes() != cache_content.encode("utf-8"):
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(cache_content.encode("utf-8"))
 
-    if models:
-        frontier_label = _select_agy_frontier_max_label(models)
-        cli_dir = gemini_root / "antigravity-cli"
-        settings_path = cli_dir / "settings.json"
-        cache_path = cli_dir / "cache" / "cae_models_cache.json"
-        settings_data: Dict[str, Any] = {}
-        if settings_path.is_file():
-            try:
-                loaded = json.loads(settings_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    settings_data = loaded
-            except Exception:
-                pass
-        if frontier_label:
-            if dry_run:
-                print(f"[Dry-Run] 将配置 {settings_path} 默认最高挡模型 -> {frontier_label}")
-            else:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                cache_path.write_text(json.dumps({"models": models}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-                if settings_data.get("model") == frontier_label:
-                    print(f"[*] Antigravity CLI 本机默认模型已处于最高挡: {frontier_label}")
-                else:
-                    settings_data["model"] = frontier_label
-                    settings_path.parent.mkdir(parents=True, exist_ok=True)
-                    settings_path.write_text(json.dumps(settings_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-                    print(f"[+] 已配置 Antigravity CLI 本机默认最高挡模型: {frontier_label}")
+    if keep_model:
+        print("[*] 保留 Antigravity CLI 已配置的默认模型。")
+        return
+    frontier_label = _select_agy_frontier_max_label(models)
+    if not frontier_label:
+        print("[*] 未取得 Antigravity CLI 默认模型的可用元数据，已保留原配置。")
+        return
+    if current_model == frontier_label:
+        print(f"[*] Antigravity CLI 的默认模型已是 {frontier_label}。")
+    elif dry_run:
+        print(f"[Dry-Run] 将写入 {settings_path} 的默认模型: {frontier_label}")
+    else:
+        settings_data["model"] = frontier_label
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(settings_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"[+] 已写入 Antigravity CLI 的默认模型: {frontier_label}")
 
 
-def configure_frontier_max_defaults(gemini_root: Path, dry_run: bool = False) -> None:
-    """保持兼容入口：同时对齐反重力与 Codex 默认最高挡模型"""
-    configure_agy_frontier_max_default(gemini_root, dry_run=dry_run)
+def configure_frontier_max_defaults(gemini_root: Path, dry_run: bool = False, *, overwrite: bool = False) -> None:
+    """兼容入口，同时处理反重力和 Codex 默认模型设置。"""
+    configure_agy_frontier_max_default(gemini_root, dry_run=dry_run, overwrite=overwrite)
     configured_codex = os.environ.get("CODEX_HOME", "").strip()
     codex_root = Path(configured_codex).expanduser() if configured_codex else Path.home() / ".codex"
-    _sync_codex_frontier_max(codex_root, dry_run=dry_run)
+    _sync_codex_frontier_max(codex_root, dry_run=dry_run, overwrite=overwrite)
 
 
 def rewrite_hooks_json_commands(hooks_json_path: Path, py_cmd: str) -> None:
@@ -1254,10 +1410,19 @@ def main() -> None:
     parser.add_argument("--no-codex-skill", action="store_true", help="跳过 Codex cae-harness 技能安装")
     parser.add_argument("--no-codex-rules", action="store_true", help="跳过 Codex 全局 AGENTS.md 核心总纲同步")
     parser.add_argument("--no-codex-agents", action="store_true", help="跳过 Codex 只读子代理 (agents/*.toml) 同步")
-    parser.add_argument("--no-codex-hooks", action="store_true", help="跳过 Codex 压缩恢复钩子 (hooks.json + hooks/) 同步")
-    parser.add_argument("--no-model-config", action="store_true", help="跳过本机默认最高挡模型对齐")
+    parser.add_argument("--no-codex-hooks", action="store_true", help="跳过 Codex 钩子 (hooks.json + hooks/) 同步")
+    parser.add_argument("--codex-handoff-mode", choices=("advisory", "enforce", "off"), default="advisory",
+                        help="Codex 长会话交接模式：提示（默认）、门禁或关闭")
+    parser.add_argument("--codex-handoff-compactions", type=int, default=0,
+                        help="Codex 交接使用的压缩次数阈值；0 表示不按次数触发（默认）")
+    model_options = parser.add_mutually_exclusive_group()
+    model_options.add_argument("--no-model-config", action="store_true", help="跳过默认模型设置")
+    model_options.add_argument("--sync-model-defaults", action="store_true", help="用本机模型目录覆盖已有默认模型与挡位")
     parser.add_argument("--no-sandbox-config", action="store_true", help="跳过 Codex 项目目录边界硬约束配置（workspace-write + on-request）")
     args = parser.parse_args()
+
+    if args.codex_handoff_compactions < 0:
+        parser.error("--codex-handoff-compactions 必须为非负整数")
 
     if args.probe_apps:
         print(json.dumps(detect_installed_apps(), indent=2, ensure_ascii=False))
@@ -1351,6 +1516,15 @@ def main() -> None:
         parser.error(str(exc))
 
     py_cmd = detect_hook_python_command()
+    codex_hooks_plan = None
+    if full_codex_sync and codex_root is not None and not args.no_codex_hooks:
+        try:
+            codex_hooks_plan = _plan_codex_hooks(
+                codex_root / "hooks.json", codex_template_dir / "hooks.json", py_cmd,
+                args.codex_handoff_mode, args.codex_handoff_compactions,
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
     mode_desc = (
         "双端完整配置（反重力 + Codex 独立工作流及双向协作）"
         if (install_ag and install_cx)
@@ -1393,7 +1567,7 @@ def main() -> None:
             configure_user_zotero_mcp(config_root, zotero_exe, dry_run=args.dry_run)
         is_default_plugin_target = target_plugin_dir == (default_config_root / "plugins" / "user-guard").resolve()
         if is_default_plugin_target and not args.no_model_config:
-            configure_agy_frontier_max_default(config_root.parent, dry_run=args.dry_run)
+            configure_agy_frontier_max_default(config_root.parent, dry_run=args.dry_run, overwrite=args.sync_model_defaults)
 
     # 2. 部署 Codex 侧
     if install_cx:
@@ -1407,7 +1581,13 @@ def main() -> None:
             if not args.no_codex_agents:
                 _sync_codex_agents(codex_template_dir, codex_root, dry_run=args.dry_run)
             if not args.no_codex_hooks:
-                _sync_codex_hooks(template_dir / "hooks", codex_root, py_cmd, dry_run=args.dry_run)
+                try:
+                    _sync_codex_hooks(
+                        template_dir / "hooks", codex_root, codex_hooks_plan, dry_run=args.dry_run,
+                        mode=args.codex_handoff_mode, compact_limit=args.codex_handoff_compactions,
+                    )
+                except (OSError, ValueError) as exc:
+                    parser.error(str(exc))
             _sync_codex_standalone_baseline(
                 codex_root,
                 include_sandbox=(not args.no_sandbox_config),
@@ -1416,7 +1596,7 @@ def main() -> None:
             if zotero_exe:
                 configure_codex_zotero_mcp(codex_root, zotero_exe, dry_run=args.dry_run)
             if not args.no_model_config:
-                _sync_codex_frontier_max(codex_root, dry_run=args.dry_run)
+                _sync_codex_frontier_max(codex_root, dry_run=args.dry_run, overwrite=args.sync_model_defaults)
 
     if args.dry_run:
         print("\n[+] Dry-Run 演练检查完成，未修改磁盘文件。")

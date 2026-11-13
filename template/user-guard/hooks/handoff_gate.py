@@ -1,7 +1,9 @@
 """
-handoff_gate.py - 反重力专有长会话两阶段「原子收口 + 交接停机」硬门禁引擎 (user-guard)
+handoff_gate.py - 长会话交接策略与 Antigravity / Codex 宿主适配 (user-guard)
 
-职责（仅 Antigravity 侧启用，Codex 侧不依赖本模块）：
+Antigravity 适配保留原有遥测与门禁；Codex 独立入口默认仅观测和提醒，
+仅在显式 enforce 模式及显式压缩次数策略或用户交接指令下进入排空。
+以下检查点、图片和 /goal 规则只用于 Antigravity：
 1. 结合增量会话遥测（压缩检查点数、近期检查点间隔坍塌、transcript 体积、多模态读图数/字节数）、
    UI 截断告警与显式 R8 用户暂缓指令，维护四态状态机：
    normal -> advisory -> drain -> freeze（或 R8 暂缓 overridden）。
@@ -13,7 +15,9 @@ handoff_gate.py - 反重力专有长会话两阶段「原子收口 + 交接停�
    - Stop 门禁验收交接完整性（并在开启 /goal 时强制校验 <!-- GOAL_CANCELLED --> 标记），每回合至多阻断 1 次。
 """
 
+import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -196,8 +200,18 @@ def save_gate_state(state_dir: Path, conversation_id: str, gate_state: Dict[str,
     user_words.atomic_write_json(_gate_state_path(state_dir, conversation_id), gate_state)
 
 
+def consume_drain_action(gate_state: Dict[str, Any]) -> bool:
+    """共用阶段策略：完成一次获准的收尾动作后扣预算，用尽即冻结。"""
+    remaining = max(0, int(gate_state.get("drainActionsRemaining", 0)) - 1)
+    gate_state["drainActionsRemaining"] = remaining
+    if remaining == 0:
+        gate_state["phase"] = "freeze"
+    return remaining == 0
+
+
 @contextlib.contextmanager
-def _gate_state_lock(state_dir: Path, conversation_id: str, timeout_sec: float = 1.5) -> Iterator[None]:
+def _gate_state_lock(state_dir: Path, conversation_id: str, timeout_sec: float = 1.5,
+                     strict: bool = False) -> Iterator[None]:
     """轻量会话级独占文件锁，防止并发 PreToolUse / PreInvocation / Stop 发生状态读-改-写覆盖丢失"""
     state_dir.mkdir(parents=True, exist_ok=True)
     safe_cid = re.sub(r"[^A-Za-z0-9_.-]+", "_", conversation_id) or "unknown"
@@ -220,6 +234,8 @@ def _gate_state_lock(state_dir: Path, conversation_id: str, timeout_sec: float =
             time.sleep(0.005)
         except OSError:
             break
+    if strict and not acquired:
+        raise TimeoutError("未取得会话状态锁，本次不更新门禁状态")
     try:
         yield
     finally:
@@ -1215,9 +1231,7 @@ def check_pre_tool_use(payload: Dict[str, Any], state_dir: Path) -> Optional[Dic
                             "禁止继续修改业务文件，请整理交接提示词并停机。"
                         ),
                     }
-                gate_state["drainActionsRemaining"] = rem_actions - 1
-                if gate_state["drainActionsRemaining"] == 0:
-                    gate_state["phase"] = "freeze"
+                if consume_drain_action(gate_state):
                     gate_state["enteredFreezeAtStep"] = tel["latestStep"]
                 save_gate_state(state_dir, conversation_id, gate_state)
                 return None
@@ -1231,9 +1245,7 @@ def check_pre_tool_use(payload: Dict[str, Any], state_dir: Path) -> Optional[Dic
                         "decision": "deny",
                         "reason": "【user-guard 长会话交接门禁 (freeze)】已冻结，禁止再通过 `send_message` 唤醒或继续驱动子代理。请直接整理交接并停机。",
                     }
-                gate_state["drainActionsRemaining"] -= 1
-                if gate_state["drainActionsRemaining"] == 0:
-                    gate_state["phase"] = "freeze"
+                if consume_drain_action(gate_state):
                     gate_state["enteredFreezeAtStep"] = tel["latestStep"]
                 save_gate_state(state_dir, conversation_id, gate_state)
                 return None
@@ -1277,9 +1289,7 @@ def check_pre_tool_use(payload: Dict[str, Any], state_dir: Path) -> Optional[Dic
                         "decision": "deny",
                         "reason": "【user-guard 长会话交接门禁 (drain -> freeze)】排空运行预算已耗尽，禁止再启动新命令，请完成交接停机。",
                     }
-                gate_state["drainActionsRemaining"] = rem_actions - 1
-                if gate_state["drainActionsRemaining"] == 0:
-                    gate_state["phase"] = "freeze"
+                if consume_drain_action(gate_state):
                     gate_state["enteredFreezeAtStep"] = tel["latestStep"]
                 save_gate_state(state_dir, conversation_id, gate_state)
                 return None
@@ -1396,3 +1406,238 @@ def check_stop_handoff(
             }
     except Exception:
         return None
+
+
+# Codex 使用官方事件字段；不读取 Antigravity 的检查点、图片体积或目标终止标记。
+CODEX_EVENTS = {"SessionStart", "PostCompact", "UserPromptSubmit", "PreToolUse", "Stop"}
+CODEX_DRAIN_ACTIONS = 4  # 显式严格模式的收尾动作预算，不表示模型容量。
+CODEX_HANDOFF_REQUEST_RE = re.compile(
+    r"^(?:/handoff|(?:请)?(?:立即)?(?:整理|准备|完成|做好|开始)交接(?:并|后)(?:停机|停止|结束当前对话))[。！!\s]*$",
+    re.IGNORECASE,
+)
+CODEX_OVERRIDE_REQUEST_RE = re.compile(
+    r"^(?:请)?" + OVERRIDE_POSITIVE_RE.pattern
+    + r"(?:[，,；;、\s]+(?:请)?" + OVERRIDE_POSITIVE_RE.pattern + r")*[。.!！\s]*$",
+    re.IGNORECASE,
+)
+CODEX_READ_TOOLS = {
+    "read_file", "list_dir", "list_directory", "search_files", "get_goal",
+    "list_agents", "wait_agent", "interrupt_agent", "wait", "request_user_input",
+    "request_user_input_async", "list_mcp_resources", "read_mcp_resource",
+}
+CODEX_DELEGATION_TOOLS = {"spawn_agent", "agent", "followup_task", "send_message", "create_thread"}
+
+
+def _codex_notice(phase: str, count: int, mode: str) -> str:
+    prefix = f"【Codex 长会话交接：{phase}】已登记 {count} 个可去重的压缩事件；模式 {mode}。"
+    if phase == "overridden":
+        return prefix + "已按用户明确指令继续；宽限到其后第 3 个新压缩事件，再按已配置策略评估。"
+    if phase in ("drain", "freeze"):
+        return (prefix + "请收尾当前小步，核对用户原话与最新裁定，整理已验证进展、Git/工作区状态、"
+                "未完成事项及可复制的新对话提示词。结束当前回合不等于取消目标循环或终止后台任务；"
+                "须如实登记其状态，不得把未完成目标标成完成。"
+                + ("当前仅提醒，不阻断工具。" if mode == "advisory" else "暂停新派工和推送；冻结后仅允许核对与交接。"))
+    return prefix + "先核对压缩恢复的原话与当前状态，再继续工作；本提醒不表示上下文已失效。"
+
+
+def _codex_context(event: str, message: str) -> Dict[str, Any]:
+    if event in ("SessionStart", "UserPromptSubmit", "PreToolUse"):
+        return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": message}}
+    return {"systemMessage": message}
+
+
+def _codex_compaction_key(payload: Dict[str, Any], transcript: Path) -> str:
+    """优先使用可辨识的 compacted 记录；未知轨迹格式按回合保守去重，可能少计而不多计。"""
+    try:
+        with transcript.open("rb") as stream:
+            size = stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, size - 256 * 1024))
+            data = stream.read()
+        rows = data.splitlines()
+        if size > len(data):
+            rows = rows[1:]
+        for raw in reversed(rows):
+            try:
+                entry = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(entry, dict) and entry.get("type") == "compacted":
+                return "record:" + hashlib.sha256(raw).hexdigest()
+    except OSError:
+        pass
+    turn_id = str(payload.get("turn_id") or "")
+    # 没有唯一事件或回合标识时仅提醒，不使用文件大小猜测压缩次数。
+    return "turn:" + turn_id + ":" + str(payload.get("trigger") or "unknown") if turn_id else ""
+
+
+def _codex_handoff_patch_only(command: str, cwd: str) -> bool:
+    """冻结期仅豁免项目内的交接文档补丁；移动源和目标均须满足条件。"""
+    paths = re.findall(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$", command, re.MULTILINE)
+    if not paths or not cwd:
+        return False
+    base = Path(cwd).resolve()
+    for raw in paths:
+        path = Path(raw.strip())
+        resolved = (path if path.is_absolute() else base / path).resolve()
+        if (not resolved.is_relative_to(base) or resolved.suffix.lower() not in (".md", ".txt", ".rst")
+                or not HANDOFF_FILENAME_RE.search(resolved.name)):
+            return False
+    return True
+
+
+def _codex_tool_kind(payload: Dict[str, Any]) -> str:
+    raw_name = str(payload.get("tool_name") or "")
+    name = re.split(r"[.:]|__", raw_name)[-1].lower()
+    args = payload.get("tool_input")
+    args = args if isinstance(args, dict) else {}
+    if name in CODEX_DELEGATION_TOOLS or name in ("view_image", "imagegen"):
+        return "blocked_always"
+    if name in CODEX_READ_TOOLS:
+        return "readonly_inspect"
+    if name in ("bash", "exec_command", "run_command"):
+        return _classify_run_command(str(args.get("command") or args.get("cmd") or args.get("CommandLine") or ""))
+    if name in ("apply_patch", "edit", "write"):
+        command = str(args.get("command") or args.get("patch") or "")
+        if _codex_handoff_patch_only(command, str(payload.get("cwd") or "")):
+            return "handoff_document"
+    # 未识别工具不赋予只读豁免；严格模式 drain 中计入预算，freeze 中拒绝。
+    return "mutating_other"
+
+
+def _codex_handoff_reply_present(text: str) -> bool:
+    """仅检查交接结构，不替代总控对进度和证据的语义核验。"""
+    return (_reply_has_handoff_prompt(text)
+            and bool(re.search(r"已验证|已完成|进展|verified|completed", text, re.IGNORECASE))
+            and bool(re.search(r"未完成|待办|下一步|剩余|remaining|next steps", text, re.IGNORECASE))
+            and bool(re.search(r"git|提交|工作区|workspace", text, re.IGNORECASE)))
+
+
+def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "advisory",
+                         compact_limit: int = 0) -> Dict[str, Any]:
+    """Codex 原生协议入口。advisory 永不阻断；enforce 只采用显式策略。"""
+    event = str(payload.get("hook_event_name") or "")
+    sid = str(payload.get("session_id") or "")
+    if event not in CODEX_EVENTS or mode == "off":
+        return {}
+    if mode not in ("advisory", "enforce") or isinstance(compact_limit, bool) or compact_limit < 0:
+        raise ValueError("无效的 Codex 交接策略")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", sid):
+        return {"systemMessage": "Codex 长会话门禁未启用：会话标识缺失或不合法。"}
+    if payload.get("agent_id") and str(payload["agent_id"]) != sid:
+        return {}
+    raw_transcript = str(payload.get("transcript_path") or "")
+    if not raw_transcript:
+        return {"systemMessage": "Codex 长会话门禁仅提示：缺少轨迹，无法确认主会话身份。"}
+    transcript = Path(raw_transcript)
+    meta, error = user_words.read_codex_rollout_meta(transcript)
+    if meta and meta.get("source_kind") == "subagent":
+        return {}
+    if error or not meta or meta.get("id") != sid:
+        return {"systemMessage": "Codex 长会话门禁仅提示：轨迹与主会话身份未核实，本次不更新状态。"}
+    state_dir = Path(state_dir)
+    with _gate_state_lock(state_dir, sid, strict=True):
+        state_path = _gate_state_path(state_dir, sid)
+        if state_path.exists():
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict) or state.get("client") != "codex" or state.get("version") != 1:
+                raise ValueError("Codex 门禁状态格式不兼容，保留原文件")
+        else:
+            state = {"client": "codex", "version": 1, "conversationId": sid, "phase": "normal",
+                     "compactionKeys": [], "compactionCount": 0, "observedEvents": [],
+                     "drainActionsRemaining": CODEX_DRAIN_ACTIONS, "overrideUntilCount": -1,
+                     "lastUserEvent": "", "stopCorrectionRequested": False, "handoffRecorded": False}
+        if event not in state["observedEvents"]:
+            state["observedEvents"].append(event)
+        state.update(mode=mode, compactLimit=compact_limit, lastModel=str(payload.get("model") or "unknown"))
+        if event == "PostCompact":
+            key = _codex_compaction_key(payload, transcript)
+            if key and key not in state["compactionKeys"]:
+                state["compactionKeys"].append(key)
+                state["compactionKeys"] = state["compactionKeys"][-512:]
+                state["compactionCount"] += 1
+            state["compactionIdentity"] = "rollout_record" if key.startswith("record:") else "turn_fallback" if key else "unknown"
+            if state["phase"] == "normal":
+                state["phase"] = "advisory"
+        count = state["compactionCount"]
+        if state["phase"] == "overridden" and count >= state["overrideUntilCount"]:
+            state["phase"] = "advisory"
+        enter_drain = (mode == "enforce" and compact_limit > 0 and count >= compact_limit
+                       and state["phase"] in ("normal", "advisory"))
+        user_event_is_new = False
+        prompt = str(payload.get("prompt") or "").strip() if event == "UserPromptSubmit" else ""
+        if prompt and not payload.get("stop_hook_active"):
+            turn = str(payload.get("turn_id") or "")
+            user_key = turn + ":" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            user_event_is_new = user_key != state["lastUserEvent"]
+            if user_event_is_new:
+                state["lastUserEvent"] = user_key
+                # 只处理短而明确的用户指令，引用长文中的相同短语不改变门禁。
+                if len(prompt) <= 160 and CODEX_OVERRIDE_REQUEST_RE.fullmatch(prompt):
+                    state.update(phase="overridden", overrideUntilCount=count + OVERRIDE_SNOOZE_CPS,
+                                 stopCorrectionRequested=False, handoffRecorded=False)
+                    enter_drain = False
+                elif CODEX_HANDOFF_REQUEST_RE.fullmatch(prompt):
+                    enter_drain = state["phase"] not in ("drain", "freeze")
+        if enter_drain:
+            state.update(phase="drain", drainActionsRemaining=CODEX_DRAIN_ACTIONS,
+                         stopCorrectionRequested=False, handoffRecorded=False)
+        phase = state["phase"]
+        notice = _codex_notice(phase, count, mode)
+        response: Dict[str, Any] = {}
+        if event in ("PostCompact", "SessionStart"):
+            if event == "PostCompact" or payload.get("source") == "compact" or phase in ("drain", "freeze", "overridden"):
+                response = _codex_context(event, notice)
+        elif event == "UserPromptSubmit" and user_event_is_new and (phase in ("drain", "freeze", "overridden")):
+            response = _codex_context(event, notice)
+        elif event == "PreToolUse" and mode == "enforce" and phase in ("drain", "freeze"):
+            tool_id = str(payload.get("tool_use_id") or "")
+            previous = state.setdefault("toolDecisions", {})
+            if tool_id and tool_id in previous:
+                return previous[tool_id]
+            kind = _codex_tool_kind(payload)
+            if kind == "blocked_always" or (phase == "freeze" and kind == "mutating_other"):
+                response = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                            "permissionDecisionReason": notice}}
+            elif kind == "mutating_other":
+                consume_drain_action(state)
+                response = _codex_context(event, notice)
+            if tool_id:
+                previous[tool_id] = response
+                state["toolDecisions"] = dict(list(previous.items())[-512:])
+        elif event == "Stop" and mode == "enforce" and phase in ("drain", "freeze"):
+            reply = str(payload.get("last_assistant_message") or "")
+            if _codex_handoff_reply_present(reply):
+                state.update(phase="freeze", handoffRecorded=True)
+                response = {"continue": False, "stopReason": "已记录交接结构，结束当前回合；目标与后台任务状态须由用户/总控另行核对。"}
+            elif payload.get("stop_hook_active") or state["stopCorrectionRequested"]:
+                state["phase"] = "freeze"
+                response = {"continue": False, "stopReason": "交接要素仍不完整，已停止本轮自动补正以防循环；请人工核对未完成事项。",
+                            "systemMessage": "交接未通过结构检查，不能报告为已完成。"}
+            else:
+                state["stopCorrectionRequested"] = True
+                response = {"decision": "block", "reason": notice + "请补齐交接后结束；本次仅补正一次。"}
+        save_gate_state(state_dir, sid, state)
+        return response
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Codex 长会话交接事件适配；反重力使用既有模块接口")
+    parser.add_argument("--client", choices=("codex",), required=True)
+    parser.add_argument("--mode", choices=("advisory", "enforce", "off"), default="advisory")
+    parser.add_argument("--compact-limit", type=int, default=0)
+    parser.add_argument("--state-dir", default=str(HOOKS_DIR / "state" / "handoff"))
+    args = parser.parse_args()
+    try:
+        payload = json.loads(sys.stdin.read())
+        if not isinstance(payload, dict):
+            raise ValueError("事件必须为 JSON 对象")
+        response = handle_codex_handoff(payload, Path(args.state_dir), args.mode, args.compact_limit)
+    except Exception as exc:
+        # 状态/协议异常时不伪装已受保护，不在失败的钩子中无限继续。
+        sys.stderr.write(f"Codex handoff hook: {exc}\n")
+        response = {"systemMessage": "Codex 长会话门禁本次处理失败，未更新保护状态；请检查钩子错误。"}
+    sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+
+
+if __name__ == "__main__":
+    main()

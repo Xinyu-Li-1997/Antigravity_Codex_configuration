@@ -1,5 +1,6 @@
 """双向编排的离线回归，所有模型调用均使用替身。"""
 import contextlib
+import datetime
 import importlib.util
 import io
 import json
@@ -91,6 +92,128 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(result['codex']['verified_status'], 'unverified')
         self.assertIsNone(result['agy']['configured_window_tokens'])
         self.assertNotIn('supports_true_1m', result['codex'])
+
+    def test_probe_context_metadata_belongs_to_selected_model(self):
+        cache = {'models': [{'slug': 'catalog-first', 'priority': 1, 'context_window': 500000},
+                            {'slug': 'user-choice', 'priority': 2, 'context_window': 200000}]}
+        (self.root / 'models_cache.json').write_text(json.dumps(cache), encoding='utf-8')
+        with patch.object(harness, '_find_binary', return_value='fake'), \
+             patch.object(harness, '_codex_home', return_value=(self.root, False)), \
+             patch.dict(os.environ, {'CAE_AGY_HOME': str(self.root)}, clear=True):
+            for slug, expected in (('user-choice', 200000), ('unknown-choice', None)):
+                (self.root / 'config.toml').write_text(f'model = "{slug}"\n', encoding='utf-8')
+                result = harness.probe_backends()['codex']
+                self.assertEqual(result['cached_default_window_tokens'], expected)
+                self.assertEqual(result['context_metadata_model'], slug if expected else None)
+
+    def test_assess_reads_catalogs_and_preserves_frontend_and_cache(self):
+        codex_root, agy_root = self.root / 'codex', self.root / 'agy'
+        codex_root.mkdir()
+        cli = agy_root / 'antigravity-cli'
+        (cli / 'cache').mkdir(parents=True)
+        (agy_root / 'config').mkdir()
+        (codex_root / 'cache').mkdir()
+        files = {
+            codex_root / 'config.toml': 'model = "interactive-choice"\nmodel_reasoning_effort = "ultra"\n',
+            codex_root / 'models_cache.json': json.dumps({'fetched_at': '2020-01-01T08:00:00+08:00', 'models': [
+                {'slug': 'code-model', 'priority': 1, 'context_window': 500000, 'supported_efforts': ['high', 'xhigh', 'ultra']},
+                {'slug': 'math-model', 'priority': 2, 'description': 'Frontier intelligence for the most demanding work.',
+                 'supported_efforts': ['high', 'max', 'ultra']},
+                {'slug': 'fast-model', 'priority': 3, 'description': 'Lightweight model', 'supported_efforts': ['low']},
+            ]}),
+            codex_root / 'cache' / 'cae_quota_state.json': '{"exhausted": true, "cooldown_until_epoch": 1}',
+            cli / 'settings.json': '{"model": "Interactive CLI Choice"}',
+            agy_root / 'config' / 'config.json': '{"userSettings": {"model": "Interactive Desktop Choice"}}',
+            cli / 'cache' / 'cae_models_cache.json': '{"models": [{"slug": "vendor-fast-low"}, {"slug": "vendor-core-high"}]}',
+        }
+        for path, contents in files.items():
+            path.write_text(contents, encoding='utf-8')
+        with patch.dict(os.environ, {'CAE_CODEX_HOME': str(codex_root), 'CAE_AGY_HOME': str(agy_root)}, clear=True), \
+             patch.object(harness, '_find_binary', side_effect=['native-codex', 'native-agy']), \
+             patch.object(harness, 'run_process') as runner, patch.object(harness, 'invoke_engine') as invoke:
+            code, report = self.capture(harness.cmd_assess, self.args('assess', '--caller', 'codex'))
+        runner.assert_not_called()
+        invoke.assert_not_called()
+        self.assertEqual(code, 0)
+        self.assertFalse(report['runtime_verified'])
+        self.assertFalse(report['controls_native_spawn_agent'])
+        codex, agy = (report['backends'][name] for name in ('codex', 'agy'))
+        self.assertEqual((codex['caller_relation'], agy['caller_relation']), ('local', 'counterpart'))
+        self.assertEqual(codex['model'], 'interactive-choice')
+        self.assertEqual(agy['configured_model_source'], str(cli / 'settings.json'))
+        self.assertEqual(agy['config_files']['desktop']['path'], str(agy_root / 'config' / 'config.json'))
+        self.assertEqual(codex['model_catalog']['fetched_at'], '2020-01-01T00:00:00+00:00')
+        self.assertEqual(codex['model_catalog']['freshness'], 'stale')
+        self.assertEqual(agy['model_catalog']['freshness'], 'unknown')
+        self.assertIsNone(agy['model_catalog']['age_seconds'])
+        math = report['recommendations']['codex']['math']
+        self.assertEqual((math['model'], math['reasoning_effort'], math['tier_reason'], math['profile_source'], math['effort_source']),
+                         ('math-model', 'max', 'task_specialty_math_max', 'specialty_deep_reasoning', 'catalog_declared'))
+        surface = report['recommendations']['codex']['surface_review']
+        self.assertEqual((surface['model'], surface['reasoning_effort']), ('fast-model', 'low'))
+        self.assertEqual(set(path for path in self.root.rglob('*') if path.is_file()), set(files))
+        for path, contents in files.items():
+            self.assertEqual(path.read_text(encoding='utf-8'), contents)
+
+    def test_catalog_freshness_uses_collection_time_only(self):
+        cache = self.root / 'cache.json'
+        now = datetime.datetime(2026, 1, 8, tzinfo=datetime.timezone.utc)
+        self.assertEqual(harness._catalog_metadata(cache, {}, [], 'cache', now)['freshness'], 'missing')
+        cache.write_text('{}', encoding='utf-8')
+        self.assertEqual(harness._catalog_metadata(cache, {}, [], 'cache', now)['freshness'], 'empty_or_unreadable')
+        for stamp, expected, age in (
+            (None, 'unknown', None), ('2026-01-08T00:00:00', 'unknown', None),
+            ('2026-01-08T00:00:01Z', 'future_timestamp', None), ('2026-01-08T00:00:00Z', 'within_assessment_window', 0),
+            ('2026-01-07T23:59:59.509331500Z', 'within_assessment_window', 0),
+            ('2026-01-01T00:00:00Z', 'stale', harness.CATALOG_MAX_AGE_SECONDS),
+        ):
+            with self.subTest(stamp=stamp):
+                catalog = harness._catalog_metadata(cache, {'fetched_at': stamp}, [{}], 'cache', now)
+                self.assertEqual((catalog['freshness'], catalog['age_seconds']), (expected, age))
+
+    def test_assess_discovery_uses_cli_listing_without_refreshing_cache(self):
+        cache = self.root / '.gemini' / 'antigravity-cli' / 'cache' / 'cae_models_cache.json'
+        cache.parent.mkdir(parents=True)
+        cache.write_text('{"models": [{"slug": "cached-high"}]}', encoding='utf-8')
+        response = subprocess.CompletedProcess(['agy', 'models'], 0, 'vendor-core-xhigh\tVendor Core (XHigh)\n', '')
+        with patch.dict(os.environ, {}, clear=True), patch.object(harness.Path, 'home', return_value=self.root), \
+             patch.object(harness, '_find_binary', side_effect=[None, 'agy']), \
+             patch.object(harness, 'run_process', return_value=response) as runner:
+            code, report = self.capture(harness.cmd_assess, self.args('assess', '--discover-models'))
+        self.assertEqual(code, 0)
+        runner.assert_called_once_with(['agy', 'models'], Path.cwd(), timeout_sec=30)
+        agy = report['backends']['agy']
+        self.assertEqual(agy['verified_status'], 'model_listing_only')
+        self.assertEqual(agy['model_catalog']['timestamp_source'], 'cli_query_time_utc')
+        self.assertEqual(agy['cached_model_catalog']['freshness'], 'unknown')
+        self.assertEqual(cache.read_text(encoding='utf-8'), '{"models": [{"slug": "cached-high"}]}')
+
+    def test_non_delegating_profile_does_not_inherit_or_guess_ultra(self):
+        engines = backends()
+        engines['codex'].update(model='only-delegating', reasoning_effort='ultra', models=[
+            {'slug': 'only-delegating', 'priority': 1, 'supported_efforts': ['ultra']},
+            {'slug': 'eligible', 'priority': 2, 'supported_efforts': ['high']},
+        ])
+        engines['agy']['models'] = [{'slug': 'vendor-first-ultra'}, {'slug': 'vendor-second-high'}]
+        self.assertEqual(harness.resolve_execution_profile(engines, 'codex:default', 'max')['model'], 'eligible')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'agy:default', 'max')['model'], 'vendor-second-high')
+        self.assertEqual(harness.resolve_execution_profile(engines, 'agy:default', 'ultra')['model'], 'vendor-first-ultra')
+        unverified = harness.resolve_execution_profile(engines, 'codex:unlisted', 'high')
+        self.assertEqual((unverified['cli_effort'], unverified['effort_source']), ('high', 'unverified_request'))
+        unverified = harness.resolve_execution_profile(engines, 'agy:unlisted-high', 'high')
+        self.assertEqual(unverified['effort_source'], 'unverified_request')
+        for name in engines:
+            engines[name]['models'].pop()
+            blocked = harness.resolve_execution_profile(engines, name + ':default', 'max')
+            self.assertIsNone(blocked['cli_effort'])
+            self.assertEqual(blocked['effort_source'], 'no_non_delegating_effort')
+            with patch.object(harness, 'probe_backends', return_value=engines), patch.object(harness, 'invoke_engine') as invoke:
+                with self.assertRaises(harness.HarnessError):
+                    harness.cmd_task(self.args('task', '--engine', name + ':default', '--kind', 'math',
+                                               '--target', str(self.root), '--task', '检查结果'))
+                invoke.assert_not_called()
+        with patch.dict(os.environ, {'CAE_DEFAULT_TIER': 'ultra'}, clear=True):
+            self.assertEqual(harness.select_task_tier(text='不要使用 ultra，检查结果')[0], 'high')
 
     def test_explicit_model_has_own_budget_cap(self):
         engines = backends(700000)

@@ -9,6 +9,61 @@
             "command": "python3 -X utf8 -I -B \"~/.codex/hooks/session_context_loader.py\" --client codex --state-dir \"~/.codex/hooks/state/session-context\" --log \"~/.codex/hooks/logs/session-context.jsonl\"",
             "timeout": 45,
             "statusMessage": "恢复本会话用户原话"
+          },
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.codex/hooks/handoff_gate.py\" --client codex --mode advisory --compact-limit 0 --state-dir \"~/.codex/hooks/state/handoff\"",
+            "timeout": 10,
+            "statusMessage": "检查长会话交接状态"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.codex/hooks/handoff_gate.py\" --client codex --mode advisory --compact-limit 0 --state-dir \"~/.codex/hooks/state/handoff\"",
+            "timeout": 10,
+            "statusMessage": "检查长会话交接状态"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.codex/hooks/handoff_gate.py\" --client codex --mode advisory --compact-limit 0 --state-dir \"~/.codex/hooks/state/handoff\"",
+            "timeout": 10,
+            "statusMessage": "检查长会话交接状态"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.codex/hooks/handoff_gate.py\" --client codex --mode advisory --compact-limit 0 --state-dir \"~/.codex/hooks/state/handoff\"",
+            "timeout": 10,
+            "statusMessage": "检查长会话交接状态"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.codex/hooks/handoff_gate.py\" --client codex --mode advisory --compact-limit 0 --state-dir \"~/.codex/hooks/state/handoff\"",
+            "timeout": 10,
+            "statusMessage": "检查长会话交接状态"
           }
         ]
       }

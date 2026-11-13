@@ -561,7 +561,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             codex_dir = Path(tmp) / ".codex"
             codex_dir.mkdir()
             (codex_dir / "config.toml").write_text(
-                'model = "older-model"\nmodel_reasoning_effort = "medium"\n\n[projects."demo"]\ntrust_level = "trusted"\n',
+                'model = "older-model"\nmodel_reasoning_effort = "ultra"\n\n[projects."demo"]\ntrust_level = "trusted"\n',
                 encoding="utf-8",
             )
             (codex_dir / "models_cache.json").write_text(
@@ -578,15 +578,56 @@ class TestEndToEndIntegration(unittest.TestCase):
                                     {"effort": "max", "description": "Maximum reasoning depth"},
                                     {"effort": "ultra", "description": "Maximum reasoning with automatic task delegation"},
                                 ],
-                            }
+                            },
+                            {
+                                "slug": "older-model",
+                                "priority": 2,
+                                "supported_reasoning_levels": [{"effort": "medium"}],
+                            },
+                            {"slug": "missing-metadata", "priority": 3, "supported_reasoning_levels": None},
                         ]
                     }
                 ),
                 encoding="utf-8",
             )
+            cfg = codex_dir / "config.toml"
+            initial = cfg.read_bytes()
             with contextlib.redirect_stdout(io.StringIO()):
-                INSTALLER._sync_codex_frontier_max(codex_dir, dry_run=False)
-            updated = (codex_dir / "config.toml").read_text(encoding="utf-8")
+                INSTALLER._sync_codex_frontier_max(codex_dir)
+            self.assertEqual(cfg.read_bytes(), initial)
+
+            for slug in ("custom-unknown", "missing-metadata"):
+                with self.subTest(slug=slug):
+                    cfg.write_text(f'model = "{slug}"\n', encoding="utf-8")
+                    original = cfg.read_bytes()
+                    with contextlib.redirect_stdout(io.StringIO()) as report:
+                        INSTALLER._sync_codex_frontier_max(codex_dir)
+                    self.assertEqual(cfg.read_bytes(), original)
+                    self.assertNotIn("已写入", report.getvalue())
+
+            cfg.write_text('"model" = "older-model" # 用户模型\nmodel_reasoning_effort = "" # 待补齐\n', encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                INSTALLER._sync_codex_frontier_max(codex_dir)
+            self.assertEqual(cfg.read_text(encoding="utf-8"),
+                             '"model" = "older-model" # 用户模型\nmodel_reasoning_effort = "medium" # 待补齐\n')
+
+            cfg.write_bytes(initial)
+            cmd = [sys.executable, "-B", "-X", "utf8", str(REPO_ROOT / "install.py"), "--app", "codex",
+                   "--codex-home", str(codex_dir), "--skip-test", "--no-zotero"]
+            result = subprocess.run(cmd + ["--sync-model-defaults", "--no-model-config"],
+                                    capture_output=True, text=True, encoding="utf-8", timeout=15)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(cfg.read_bytes(), initial)
+            cfg.write_text('model = "older-model"\n', encoding="utf-8")
+            result = subprocess.run(cmd + ["--no-model-config"], capture_output=True,
+                                    text=True, encoding="utf-8", timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("model_reasoning_effort", cfg.read_text(encoding="utf-8"))
+            cfg.write_bytes(initial)
+            result = subprocess.run(cmd + ["--sync-model-defaults"], capture_output=True,
+                                    text=True, encoding="utf-8", timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            updated = cfg.read_text(encoding="utf-8")
             self.assertIn('model = "frontier-top"', updated)
             self.assertIn('model_reasoning_effort = "max"', updated)
             self.assertNotIn('model_reasoning_effort = "ultra"', updated)
@@ -609,10 +650,43 @@ class TestEndToEndIntegration(unittest.TestCase):
                 encoding="utf-8",
             )
             with contextlib.redirect_stdout(io.StringIO()):
-                INSTALLER._sync_codex_frontier_max(codex_dir, dry_run=False)
+                INSTALLER._sync_codex_frontier_max(codex_dir, overwrite=True)
             updated_high = (codex_dir / "config.toml").read_text(encoding="utf-8")
             self.assertIn('model = "frontier-high-only"', updated_high)
             self.assertIn('model_reasoning_effort = "high"', updated_high)
+            cfg.unlink()
+            with contextlib.redirect_stdout(io.StringIO()):
+                INSTALLER._sync_codex_frontier_max(codex_dir)
+            self.assertIn('model = "frontier-high-only"', cfg.read_text(encoding="utf-8"))
+            self.assertIn('model_reasoning_effort = "high"', cfg.read_text(encoding="utf-8"))
+
+    def test_12_agy_default_model_preservation_and_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gemini_root = Path(tmp) / ".gemini"
+            cli_dir = gemini_root / "antigravity-cli"
+            cli_dir.mkdir(parents=True)
+            settings = cli_dir / "settings.json"
+            settings.write_bytes(b'{"model":"Account custom (Ultra)","other":true}\n')
+            source = settings.read_bytes()
+            models = [{"slug": "alpha-core-high", "display_name": "Alpha Core (High)"},
+                      {"slug": "alpha-core-ultra", "display_name": "Alpha Core (Ultra)"}]
+            with mock.patch.object(INSTALLER.shutil, "which", return_value=None), \
+                    mock.patch.object(INSTALLER.Path, "home", return_value=Path(tmp)), \
+                    mock.patch.object(INSTALLER, "_load_wsl_windows_agy_cache", return_value=models), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                INSTALLER.configure_agy_frontier_max_default(gemini_root)
+                self.assertEqual(settings.read_bytes(), source)
+                INSTALLER.configure_agy_frontier_max_default(gemini_root, overwrite=True)
+                self.assertEqual(json.loads(settings.read_bytes()), {"model": "Alpha Core (High)", "other": True})
+                settings.unlink()
+                desktop_settings = gemini_root / "config" / "config.json"
+                desktop_settings.parent.mkdir()
+                desktop_settings.write_bytes(b'{"userSettings":{"model":"Orchestrator (Core)"}}\n')
+                INSTALLER.configure_agy_frontier_max_default(gemini_root)
+                self.assertFalse(settings.exists())
+                desktop_settings.unlink()
+                INSTALLER.configure_agy_frontier_max_default(gemini_root)
+                self.assertEqual(json.loads(settings.read_bytes())["model"], "Alpha Core (High)")
 
     def test_13_installer_codex_workspace_boundary_sync(self) -> None:
         """验证安装器将 Codex 沙箱收紧为 workspace-write + on-request + network_access=true，幂等且保留下游表。"""
@@ -832,7 +906,7 @@ class TestEndToEndIntegration(unittest.TestCase):
         self.assertEqual(plan_wsl, (True, False))
 
     def test_17_handoff_gate_subprocess_pipeline_and_codex_isolation(self) -> None:
-        """通过真实 OS 子进程串联验证长会话交接门禁三点联动，并确保单 Codex 安装不含 handoff_gate.py"""
+        """分别执行反重力门禁和独立 Codex 提示钩子的子进程。"""
         hooks_cfg = json.loads((ACTIVE_PLUGIN_DIR / "hooks.json").read_text(encoding="utf-8"))["user-guard-lifecycle"]
         pre_cmd = hooks_cfg["PreInvocation"][0]["command"]
         ptu_cmd = hooks_cfg["PreToolUse"][0]["hooks"][0]["command"]
@@ -848,10 +922,8 @@ class TestEndToEndIntegration(unittest.TestCase):
             tp = brain_dir / ".system_generated" / "logs" / "transcript.jsonl"
             tp.parent.mkdir(parents=True)
 
-            env = os.environ.copy()
+            env = {key: value for key, value in os.environ.items() if not key.startswith("USER_GUARD_")}
             env["PLUGIN_DATA"] = str(plugin_data)
-            env.pop("USER_GUARD_STATE_DIR", None)
-            env.pop("USER_GUARD_LOGS_DIR", None)
 
             def run_sub(raw_cmd: str, payload_dict: dict) -> dict:
                 proc = subprocess.run(
@@ -916,7 +988,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             out_stop_ok = run_sub(stop_cmd, {"conversationId": conv_id, "terminationReason": "NO_TOOL_CALL", "transcriptPath": str(tp)})
             self.assertEqual(out_stop_ok["decision"], "allow")
 
-            # 验证单 Codex 安装不复制 handoff_gate.py 且保持解耦独立运行
+            # 运行单 Codex 安装生成的默认提示钩子。
             codex_only_home = root / "codex_only"
             proc_cx = subprocess.run(
                 [
@@ -939,8 +1011,127 @@ class TestEndToEndIntegration(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(proc_cx.returncode, 0, proc_cx.stderr)
-            self.assertFalse((codex_only_home / "hooks" / "handoff_gate.py").exists())
+            self.assertTrue((codex_only_home / "hooks" / "handoff_gate.py").is_file())
             self.assertTrue((codex_only_home / "hooks" / "session_context_loader.py").is_file())
+            self.assertFalse((codex_only_home / "hooks" / "status_guard.py").exists())
+            self.assertFalse((codex_only_home / "hooks" / "reply_repeat_guard.py").exists())
+            codex_hooks = json.loads((codex_only_home / "hooks.json").read_text(encoding="utf-8"))["hooks"]
+            self.assertEqual(set(codex_hooks), {"SessionStart", "PostCompact", "UserPromptSubmit", "PreToolUse", "Stop"})
+            sid = "isolated-codex-handoff"
+            rollout = codex_only_home / f"rollout-{sid}.jsonl"
+            rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": sid, "source": "cli"}}) + "\n", encoding="utf-8")
+            codex_env = {key: value for key, value in env.items() if key != "PLUGIN_DATA"}
+            for event, extra, output_key in (
+                ("PostCompact", {"turn_id": "turn-1", "trigger": "auto"}, "systemMessage"),
+                ("SessionStart", {"source": "compact"}, "hookSpecificOutput"),
+            ):
+                handler = next(h for h in codex_hooks[event][0]["hooks"] if "handoff_gate.py" in h["command"])
+                self.assertIn("--mode advisory --compact-limit 0", handler["command"])
+                result = subprocess.run(
+                    _build_subprocess_cmd(handler["command"]),
+                    input=json.dumps({"hook_event_name": event, "session_id": sid, "cwd": str(root),
+                                      "transcript_path": str(rollout), **extra}),
+                    capture_output=True, text=True, encoding="utf-8", cwd=codex_only_home, env=codex_env, timeout=15,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                outcome = json.loads(result.stdout)
+                self.assertNotIn("decision", outcome)
+                self.assertIn(output_key, outcome)
+                self.assertIn("Codex 长会话", json.dumps(outcome, ensure_ascii=False))
+            self.assertTrue(any((codex_only_home / "hooks" / "state" / "handoff").glob("*.json")))
+            self.assertFalse((plugin_data / "state" / "handoff" / f"{sid}.json").exists())
+
+    def test_18_codex_hook_upgrade_preserves_handlers_and_rejects_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_root = Path(tmp) / "codex with spaces"
+            codex_root.mkdir()
+            hooks_path = codex_root / "hooks.json"
+            loader_path = codex_root / "hooks" / "session_context_loader.py"
+            loader_path.parent.mkdir()
+            loader_path.write_bytes((TEMPLATE_DIR / "hooks" / loader_path.name).read_bytes())
+            state_dir = (loader_path.parent / "state" / "session-context").as_posix()
+            valid = {"type": "command", "command": f'"{sys.executable}" -B "{loader_path.as_posix()}" --client codex --state-dir "{state_dir}"',
+                     "timeout": 33, "statusMessage": "保留已有设置"}
+            sibling = {"type": "command", "command": "custom-session-start"}
+            other_group = {"matcher": "startup", "hooks": [{"type": "command", "command": "custom-startup"}]}
+            other_event = [{"hooks": [{"type": "command", "command": "custom-notification"}]}]
+            other_gate = {"type": "command", "command": f'"{sys.executable}" "{(Path(tmp) / "custom" / "handoff_gate.py").as_posix()}"'}
+            shared_path_gate = {"type": "command", "command": (
+                f'"{sys.executable}" -B "{(loader_path.parent / "handoff_gate.py").as_posix()}" '
+                f'--client codex --mode enforce --compact-limit 1 --state-dir "{(loader_path.parent / "state" / "handoff").as_posix()}"'
+            )}
+            legacy = {"hooks": {"SessionStart": [{"matcher": "^(compact|resume)$", "hooks": [valid, sibling]}, other_group],
+                                "Notification": other_event, "Stop": [{"hooks": [other_gate, shared_path_gate]}]}}
+            hooks_path.write_text(json.dumps(legacy), encoding="utf-8")
+            cmd = [sys.executable, "-B", "-X", "utf8", str(REPO_ROOT / "install.py"), "--app", "codex",
+                   "--codex-home", str(codex_root), "--no-zotero", "--skip-test"]
+
+            def install(*options):
+                return subprocess.run(cmd + list(options), capture_output=True, text=True, encoding="utf-8", timeout=20)
+
+            result = install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            upgraded_bytes = hooks_path.read_bytes()
+            upgraded = json.loads(upgraded_bytes)["hooks"]
+            self.assertEqual(upgraded["SessionStart"][0]["hooks"][:2], [valid, sibling])
+            self.assertEqual(upgraded["SessionStart"][1], other_group)
+            self.assertEqual(upgraded["Notification"], other_event)
+            self.assertEqual(upgraded["Stop"][0]["hooks"][:2], [other_gate, shared_path_gate])
+            self.assertTrue({"PostCompact", "UserPromptSubmit", "PreToolUse"} <= set(upgraded))
+            result = install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(hooks_path.read_bytes(), upgraded_bytes)
+
+            result = install("--codex-handoff-mode", "enforce", "--codex-handoff-compactions", "2")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b"--mode enforce --compact-limit 2", hooks_path.read_bytes())
+            result = install("--codex-handoff-mode", "off")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(hooks_path.read_bytes()), legacy)
+
+            for malformed in (b"{bad json", b'{"hooks":{"SessionStart":{}}}', b'{"hooks":{},"hooks":{}}'):
+                with self.subTest(malformed=malformed):
+                    hooks_path.write_bytes(malformed)
+                    result = install()
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("无法安全合并", result.stderr)
+                    self.assertEqual(hooks_path.read_bytes(), malformed)
+
+
+    def test_20_codex_loader_upgrade_checks_old_python_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "codex"
+            root.mkdir()
+            loader = (root / "hooks" / "session_context_loader.py").as_posix()
+            old = {"type": "command", "command": f'"{sys.executable}" -B "{loader}" --client codex',
+                   "timeout": 33, "statusMessage": "custom status"}
+            sibling = {"type": "command", "command": "custom-hook"}
+            path = root / "hooks.json"
+            path.write_text(json.dumps({"hooks": {"SessionStart": [{"matcher": "^(compact|resume)$", "hooks": [old, sibling]}]}}), encoding="utf-8")
+            with mock.patch.object(INSTALLER, "_is_working_python_cmd", return_value=False) as check:
+                plan = INSTALLER._plan_codex_hooks(path, REPO_ROOT / "template/codex/hooks.json", "python -X utf8 -I -B", "advisory", 0)
+            check.assert_called_once_with([sys.executable, "-B"])
+            handlers = plan[1]["hooks"]["SessionStart"][0]["hooks"]
+            self.assertNotEqual(handlers[0]["command"], old["command"])
+            self.assertEqual(handlers[0]["timeout"], 33)
+            self.assertEqual(handlers[0]["statusMessage"], "custom status")
+            self.assertEqual(handlers[1], sibling)
+
+    @unittest.skipIf(os.name == "nt", "POSIX Shell 路径转义")
+    def test_21_posix_codex_hook_special_path_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "codex$cash`tick' space"
+            root.mkdir()
+            path = root / "hooks.json"
+            template = REPO_ROOT / "template/codex/hooks.json"
+            cmd = "python3 -X utf8 -I -B"
+            first = INSTALLER._plan_codex_hooks(path, template, cmd, "advisory", 0)
+            path.write_text(json.dumps(first[1]), encoding="utf-8")
+            self.assertIsNone(INSTALLER._plan_codex_hooks(path, template, cmd, "advisory", 0))
+            disabled = INSTALLER._plan_codex_hooks(path, template, cmd, "off", 0)
+            remaining = [handler for groups in disabled[1]["hooks"].values() for group in groups for handler in group["hooks"]]
+            self.assertEqual(len(remaining), 1)
+            self.assertIn("session_context_loader.py", remaining[0]["command"])
 
 
 if __name__ == "__main__":

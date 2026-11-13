@@ -617,6 +617,149 @@ class TestLifecycleCompactionEngine(unittest.TestCase):
         self.assertEqual(handoff_gate.load_gate_state(state_dir, conv_r8)["phase"], "overridden")
 
 
+class TestCodexHandoffAdapter(unittest.TestCase):
+    """Codex 独立协议、保守默认值和严格模式的可观察状态转换。"""
+
+    def setUp(self):
+        import handoff_gate
+        self.gate = handoff_gate
+        self.tmp = tempfile.TemporaryDirectory(prefix="codex-handoff-test-")
+        self.root = Path(self.tmp.name)
+        self.state_dir = self.root / "state"
+        self.transcript = self.root / "rollout.jsonl"
+        self.sid = "codex-handoff-main"
+        _append_jsonl(self.transcript, {"type": "session_meta", "payload": {
+            "id": self.sid, "cwd": str(self.root), "source": "cli"}})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def call(self, event, mode="advisory", limit=0, **extra):
+        payload = {"session_id": self.sid, "transcript_path": str(self.transcript),
+                   "cwd": str(self.root), "hook_event_name": event, "turn_id": "turn-1", **extra}
+        return self.gate.handle_codex_handoff(payload, self.state_dir, mode, limit)
+
+    def state(self):
+        return json.loads((self.state_dir / (self.sid + "_handoff_gate.json")).read_text(encoding="utf-8"))
+
+    def test_advisory_never_blocks_and_compaction_events_are_not_double_counted(self):
+        first = self.call("PostCompact", trigger="auto")
+        self.assertIn("Codex 长会话", first["systemMessage"])
+        self.call("PostCompact", trigger="auto")
+        start = self.call("SessionStart", source="compact")
+        self.assertIn("additionalContext", start["hookSpecificOutput"])
+        self.assertEqual(self.state()["compactionCount"], 1)
+        for index in range(2, 21):
+            self.call("PostCompact", turn_id=f"turn-{index}", trigger="auto")
+        self.assertEqual(self.call("PreToolUse", tool_name="spawn_agent", tool_input={}), {})
+        self.assertEqual(self.call("Stop", last_assistant_message="尚未交接"), {})
+        self.assertEqual(self.state()["phase"], "advisory")
+
+    def test_strict_without_explicit_limit_does_not_invent_capacity_threshold(self):
+        for index in range(5):
+            self.call("PostCompact", mode="enforce", turn_id=f"turn-{index}")
+        self.assertEqual(self.call("PreToolUse", mode="enforce", tool_name="spawn_agent"), {})
+        self.assertEqual(self.state()["phase"], "advisory")
+
+    def test_record_identity_counts_two_compactions_in_one_turn(self):
+        for stamp in ("2026-01-01T00:00:01Z", "2026-01-01T00:00:02Z"):
+            _append_jsonl(self.transcript, {"type": "compacted", "timestamp": stamp, "payload": {"message": "summary"}})
+            self.call("PostCompact", mode="enforce", limit=2)
+            self.call("PostCompact", mode="enforce", limit=2)
+        self.assertEqual(self.state()["compactionCount"], 2)
+        self.assertEqual(self.state()["compactionIdentity"], "rollout_record")
+        self.assertEqual(self.state()["phase"], "drain")
+
+    def test_strict_budget_idempotence_and_tool_protocol(self):
+        self.call("PostCompact", mode="enforce", limit=1)
+        denied = self.call("PreToolUse", mode="enforce", limit=1, tool_name="spawn_agent")
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        mcp_denied = self.call("PreToolUse", mode="enforce", limit=1, tool_name="mcp__codex_app__create_thread")
+        self.assertEqual(mcp_denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        push = self.call("PreToolUse", mode="enforce", limit=1, tool_name="Bash",
+                         tool_input={"command": 'echo "$(git push origin main)"'})
+        self.assertEqual(push["hookSpecificOutput"]["permissionDecision"], "deny")
+        for index in range(self.gate.CODEX_DRAIN_ACTIONS):
+            args = {"tool_name": "Bash", "tool_input": {"command": "python -B verify.py"}, "tool_use_id": str(index)}
+            first = self.call("PreToolUse", mode="enforce", limit=1, **args)
+            self.assertEqual(first, self.call("PreToolUse", mode="enforce", limit=1, **args))
+        self.assertEqual(self.state()["phase"], "freeze")
+        self.assertEqual(self.state()["drainActionsRemaining"], 0)
+        blocked = self.call("PreToolUse", mode="enforce", limit=1, tool_name="Bash", tool_input={"command": "python build.py"})
+        self.assertEqual(blocked["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(self.call("PreToolUse", mode="enforce", limit=1, tool_name="Bash", tool_input={"command": "git status --short"}), {})
+        self.assertEqual(self.call("PreToolUse", mode="enforce", limit=1, tool_name="get_goal"), {})
+
+    def test_frozen_patch_exemption_is_only_for_in_project_handoff_documents(self):
+        self.call("UserPromptSubmit", mode="enforce", prompt="请整理交接并停机")
+        state = self.state()
+        state["phase"] = "freeze"
+        self.gate.save_gate_state(self.state_dir, self.sid, state)
+        good = "*** Begin Patch\n*** Add File: docs/handoff.md\n+handoff\n*** End Patch"
+        self.assertEqual(self.call("PreToolUse", mode="enforce", tool_name="apply_patch", tool_input={"command": good}), {})
+        for path in ("src/handoff.py", "../handoff.md", "docs/ordinary.md"):
+            patch = good.replace("docs/handoff.md", path)
+            result = self.call("PreToolUse", mode="enforce", tool_name="apply_patch", tool_input={"command": patch})
+            self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+        mixed = good.replace("*** End Patch", "*** Update File: solver.py\n@@\n-old\n+new\n*** End Patch")
+        result = self.call("PreToolUse", mode="enforce", tool_name="apply_patch", tool_input={"command": mixed})
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_stop_correction_is_bounded_and_never_claims_goal_cancelled(self):
+        self.call("UserPromptSubmit", mode="enforce", prompt="请整理交接并停机")
+        first = self.call("Stop", mode="enforce", last_assistant_message="尚未整理")
+        self.assertEqual(first["decision"], "block")
+        second = self.call("Stop", mode="enforce", turn_id="continuation-turn", last_assistant_message="仍未整理")
+        self.assertFalse(second["continue"])
+        self.assertFalse(self.state()["handoffRecorded"])
+        reply = ("已验证：现有离线测试通过。Git 工作区保留尚未提交的改动。未完成：真实宿主的事件验收。\n"
+                 "新对话提示词\n```text\n请读用户原话和当前源码，先核对工作区，继续未完成的真实宿主验收；后台任务尚待核对。\n```")
+        final = self.call("Stop", mode="enforce", last_assistant_message=reply)
+        self.assertFalse(final["continue"])
+        self.assertTrue(self.state()["handoffRecorded"])
+        self.assertNotIn("GOAL_CANCELLED", json.dumps(final))
+
+    def test_user_override_is_per_turn_and_does_not_trigger_from_quoted_history(self):
+        self.call("PostCompact", mode="enforce", limit=1)
+        self.call("UserPromptSubmit", mode="enforce", limit=1,
+                  prompt='历史材料：“先别交接，继续当前对话”。请分析这句话。')
+        self.assertEqual(self.state()["phase"], "drain")
+        self.call("UserPromptSubmit", mode="enforce", limit=1, prompt="先别交接，继续当前对话")
+        self.assertEqual(self.state()["phase"], "overridden")
+        for index in range(2, 5):
+            self.call("PostCompact", mode="enforce", limit=1, turn_id=f"turn-{index}")
+        self.assertEqual(self.state()["phase"], "drain")
+        self.call("UserPromptSubmit", mode="enforce", limit=1, turn_id="turn-5", prompt="先别交接，继续当前对话")
+        self.assertEqual(self.state()["phase"], "overridden")
+        self.call("UserPromptSubmit", mode="enforce", limit=1, turn_id="turn-6", prompt="历史材料：请整理交接并停机。这是以前的原话，请分析。")
+        self.assertEqual(self.state()["phase"], "overridden")
+
+    def test_subagent_missing_identity_and_malformed_state_do_not_contaminate_parent(self):
+        self.assertEqual(self.call("PostCompact", agent_id="child-agent"), {})
+        self.assertFalse(self.state_dir.exists())
+        self.assertIn("systemMessage", self.call("PostCompact", session_id="../escape"))
+        self.assertFalse(self.state_dir.exists())
+        self.assertIn("systemMessage", self.call("PostCompact", transcript_path=""))
+        self.assertFalse(self.state_dir.exists())
+        self.call("PostCompact")
+        state_path = self.state_dir / (self.sid + "_handoff_gate.json")
+        state_path.write_text("{bad", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.call("PostCompact")
+        self.assertEqual(state_path.read_text(encoding="utf-8"), "{bad")
+
+    def test_concurrent_compactions_and_strict_lock_timeout(self):
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda n: self.call("PostCompact", turn_id=f"parallel-{n}"), range(32)))
+        self.assertEqual(self.state()["compactionCount"], 32)
+        with self.gate._gate_state_lock(self.state_dir, self.sid, strict=True):
+            with self.assertRaises(TimeoutError):
+                with self.gate._gate_state_lock(self.state_dir, self.sid, timeout_sec=0.03, strict=True):
+                    self.fail("未取得锁时不得进入状态更新")
+        self.assertEqual(list(self.state_dir.glob("*.lock")), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
