@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -60,6 +61,7 @@ HARDWARE_PATTERNS = (
     re.compile(r"\b(?:Apple\s+)?M[1-4]\s+(?:Pro|Max|Ultra)\b", re.I),
 )
 UUID_PATTERN = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
+POSIX_DEVICE_PATTERN = re.compile("/de" + r"v/(?:null|zero|full|random|urandom|tty|stdin|stdout|stderr|fd|shm|pts)\b", re.I)
 
 
 def _path_spelling_variants(paths):
@@ -85,8 +87,11 @@ def _sensitive_findings(content, home_variants=(), user_name="", hostname=""):
     low = content.casefold()
     if any(len(path) >= 6 and path.casefold() in low for path in home_variants):
         findings.append("本机路径")
+    token_text = POSIX_DEVICE_PATTERN.sub("", content)
     for label, value in (("用户名", user_name), ("主机名", hostname)):
-        if len(value) >= 3 and value.casefold() not in ALLOWED_PLACEHOLDERS and value.casefold() in low:
+        if (len(value) >= 3
+                and value.casefold() not in ALLOWED_PLACEHOLDERS | {"localhost"}
+                and re.search(rf"(?<![A-Za-z0-9_]){re.escape(value)}(?![A-Za-z0-9_])", token_text, re.I)):
             findings.append(label)
     for pattern in HARDCODED_HOME_PATTERNS:
         for match in pattern.finditer(content):
@@ -249,7 +254,7 @@ class TestEndToEndIntegration(unittest.TestCase):
         """扫描仓库文本中与个人路径、具体硬件型号和常见凭据匹配的内容。"""
         home_variants = _path_spelling_variants((Path.home(), REPO_ROOT))
         user_name = getpass.getuser()
-        hostname = os.environ.get("COMPUTERNAME", "")
+        hostname = os.environ.get("COMPUTERNAME") or socket.gethostname()
         checked_count = 0
         for path in REPO_ROOT.rglob("*"):
             if not path.is_file() or ".git" in path.parts or "__pycache__" in path.parts:
@@ -304,6 +309,9 @@ class TestEndToEndIntegration(unittest.TestCase):
         for path in _path_spelling_variants(("Q:/Private/Checkout",)):
             self.assertTrue(_sensitive_findings(path.upper(), home_variants=(path,)))
         self.assertTrue(_sensitive_findings(private_user, user_name=private_user.upper()))
+        self.assertTrue(_sensitive_findings("owner: " + "d" + "ev", user_name="D" + "EV"))
+        self.assertTrue(_sensitive_findings("/home/" + "d" + "ev/work"))
+        self.assertEqual(_sensitive_findings("2>/dev/null\ndeveloper guide", user_name="d" + "ev"), [])
         self.assertTrue(_sensitive_findings("private" + "host", hostname="PRIVATE" + "HOST"))
         uuid = "-".join(("a" * 8, "b" * 4, "4" + "c" * 3, "8" + "d" * 3, "e" * 12))
         self.assertTrue(_sensitive_findings(uuid))
