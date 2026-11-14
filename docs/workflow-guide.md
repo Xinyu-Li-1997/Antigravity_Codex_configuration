@@ -1,6 +1,6 @@
 # 反重力与 Codex 工程及科研协作实践指南
 
-本文面向日常从事计算流体力学（CFD）、有限元分析（FEA）、偏微分方程（PDE）数值求解器与高性能科学计算的开发者，说明 `user-guard` 与共享技能 `cae-harness` 在课题推进、公式推导、求解器编码、跨模块审计及门禁验收中的实战配合方法。命令行参数细则见 [`cae-harness` 技能说明](../template/user-guard/skills/cae-harness/SKILL.md)，部署方法见[仓库总 README](../README.md)。
+本文面向日常从事计算流体力学（CFD）、有限元分析（FEA）、偏微分方程（PDE）数值求解器与高性能科学计算的开发者，说明 `user-guard` 与共享技能 `cae-harness` 在课题推进、公式推导、求解器编码、跨模块审计及门禁验收中的实战配合方法。命令行参数细则见 [`cae-harness` 技能说明](../template/user-guard/skills/cae-harness/SKILL.md)，底层钩子协议见[架构设计与生命周期钩子规范](architecture-and-hooks.md)，部署方法见[仓库总 README](../README.md)。
 
 ---
 

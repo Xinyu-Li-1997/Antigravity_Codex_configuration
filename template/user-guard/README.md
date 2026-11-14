@@ -6,7 +6,7 @@
 
 | 路径 | 组件职责 |
 | --- | --- |
-| `plugin.json` | 反重力原生插件元信息清单（遵循官方 v1 Schema，当前版本 `1.7.4`） |
+| `plugin.json` | 反重力原生插件元信息清单（遵循官方 v1 Schema，作为全仓唯一版本号真源） |
 | `assets/logo.svg` | 插件矢量图标，满足 `agy plugin validate --strict` 零提示规范 |
 | `hooks.json` | 反重力生命周期钩子注册表，挂载 `SessionStart`、`PreInvocation`、`PreToolUse` 与 `Stop` 四类同步命令事件 |
 | `rules/AGENTS.md` | 双端精炼共用的 `R0–R11` 全局规则：文件精简、中文与 CAE/CFD 规范术语、双端选模配窗与额度回退、阶段收口双端把关、反过度工程（`R3.3`）、项目目录硬边界与公开脱敏（`R4`）、防无声放大、验收红线及压缩交接对齐 |
@@ -26,4 +26,4 @@
 2. **默认满血旗舰 + 按需分级省流**：`cae-harness` 默认选用旗舰专长模型（Codex 数学推导与路线论证选 `Astra`，编码、审查、审计与门禁选最新代 `Sol`；反重力 CLI 选 `Carbon`），启用单模型纯思考最高挡（Codex `max`、反重力 `Carbon` `high`；纯文字润色 `polish` 短篇 `medium`、长篇 `high`；默认跳过二次派生的 `ultra` 挡）及所选模型声明最大上下文窗口（当前 Codex 目录为 `872,000` token）。仅当用户明确或模糊提出降挡、省额度、省 token 时，才切换为分级省流模式。
 3. **额度耗尽自动回退**：调用时附带 `--fallback-on-quota`，若对侧在预检或启动阶段触发额度熔断（`quota_exhausted`）且尚未改动工作区文件，自动切回发起方本侧匹配模型与最高可用挡位完成任务。
 
-命令行细则见 [`cae-harness` 技能说明](skills/cae-harness/SKILL.md)，完整安装与架构文档见[仓库总 README](../../README.md)与[架构设计及生命周期钩子规范](../../docs/架构设计与生命周期钩子规范.md)。
+命令行细则见 [`cae-harness` 技能说明](skills/cae-harness/SKILL.md)，完整安装与架构文档见[仓库总 README](../../README.md)与[架构设计及生命周期钩子规范](../../docs/architecture-and-hooks.md)。

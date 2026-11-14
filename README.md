@@ -4,6 +4,11 @@
 
 全仓脚本仅依赖 Python 3.11+ 标准库（零第三方依赖，面向 Windows 与 WSL2／Linux 环境）。
 
+> **English Overview** — `Antigravity_Codex_configuration` provides unified engineering guardrails, lifecycle hooks, strictly read-only subagents, and the cross-client headless orchestrator (`cae-harness`) for **Google Antigravity** and **OpenAI Codex**, tailored to **AI-assisted CAE / CFD / FEA / PDE numerical solver development** and scientific computing (**Python 3.11+ standard library only**, zero third-party packages, targeting Windows and WSL2/Linux):
+> - **Deterministic Guardrails & Compaction Recovery**: Restores user specifications from local session transcripts across context compaction and resumption (explicitly flagging any truncated segments), enforces workspace write boundaries (Antigravity Python AST & shell static guards plus unchanged solver-log suppression; Codex `workspace-write` sandboxing plus `cae-harness` snapshot diffs), manages long-session handoffs (Antigravity `normal -> advisory -> drain -> freeze` state machine; Codex `advisory` mode by default, optional `enforce`), and pairs `R3.6` numerical tolerance (`rtol`/`atol`) and empirical order of convergence (EOC) redlines with `cae-harness` (`task` / `gate` `--verify-cmd` and `--write-scope` checks; `task` / `audit` / `gate` `--fallback-on-quota` failover).
+> - **Standalone or Bidirectional Deployment**: Supports standalone Antigravity (`--app antigravity`), standalone Codex (`--app codex`), or full bidirectional collaboration (`--app both`). Preview non-destructively via `python -B install.py --probe-apps` and `python -B install.py --dry-run --yes`.
+> - **Language Scope**: Machine contracts (`plugin.json`, JSON Schemas, CLI flags, exit codes, and repository file paths) follow standard English conventions, whereas built-in prompt rules (`R0–R11`), subagent instructions, and interactive phrasing guards are authored for **Simplified Chinese** scientific and engineering workflows.
+
 ---
 
 ## 一、为什么需要这套配置（解决 AI-CAE 研发的真实痛点）
@@ -107,7 +112,7 @@ flowchart TB
 
 1. **目录／API 声明最大窗口**：模型支持的最大上下文容量（如 Codex 目录声明 `872,000` token、Gemini 4 API 公布 `1,048,576` token）。`cae-harness` 启动 Codex 时显式下发 `-c model_context_window=<最大声明窗口>`。
 2. **单条消息入口上限**：客户端单次 RPC 请求允许送入的字符／字节数。`2026-11-13` 受控实测显示：Codex `turn/start` 单条消息上限为 `1,048,576` 字符；反重力 CLI `1.5.8` 单条消息达 44～66 万字节时出现入口截断标记，改为每轮约 13 万 UTF-8 字节分批送入则无截断（超长源码应让模型在目录内按文件读取，而非硬塞进单条提示词）。
-3. **宿主自动检查点（压缩）触发点**：客户端在累积多少 token 后自动把早期对话折叠成摘要。实测 Codex `GPT-6.1-Sol` 分轮累积至 `808,892` 输入 token（占 `828,400` 有效窗口的 **97.65%**）时未触发压缩，首中尾 6 处随机口令 **6/6 全部精确命中**；反重力 CLI `1.5.8` `Hydrogen` 累积至 `241,625` token 时 **6/6 全中**，继续追加至 `290,028` token 时触发自动检查点压缩（压缩后降至 `14,063` token，早期随机细节凭摘要无法找回）。完整测试记录见[架构设计与生命周期钩子规范](docs/架构设计与生命周期钩子规范.md)。
+3. **宿主自动检查点（压缩）触发点**：客户端在累积多少 token 后自动把早期对话折叠成摘要。实测 Codex `GPT-6.1-Sol` 分轮累积至 `808,892` 输入 token（占 `828,400` 有效窗口的 **97.65%**）时未触发压缩，首中尾 6 处随机口令 **6/6 全部精确命中**；反重力 CLI `1.5.8` `Hydrogen` 累积至 `241,625` token 时 **6/6 全中**，继续追加至 `290,028` token 时触发自动检查点压缩（压缩后降至 `14,063` token，早期随机细节凭摘要无法找回）。完整测试记录见[架构设计与生命周期钩子规范](docs/architecture-and-hooks.md)。
 4. **分片审计输入预算**：`cae-harness audit` 扣除系统提示词、文件清单与 JSON Schema 开销并预留安全余量后的单批源码上限（可通过 `--codex-input-budget`、`--agy-input-budget` 调整）。
 5. **实际阅读覆盖**：子任务真正读完了哪些文件与行号，以结构化回执和总控抽查为准。发生上下文压缩后，严格按 `R9` 重读原话归档核对缺口，绝不盲目重跑已经落盘的代码修改。
 
@@ -141,7 +146,7 @@ python -B template/user-guard/skills/cae-harness/scripts/cae_harness.py task --c
 
 > **Windows 版 Codex 反向调用 `agy.exe` 的沙箱权限说明**：反重力主会话直接启动 `codex` 可正常访问宿主机 `.codex` 目录；但若在 Windows 版 Codex 的受限工作区沙箱内反向启动 `agy.exe`，沙箱默认只放行当前项目目录与 `%TEMP%`，会阻止 `agy.exe` 向 `~/.gemini/antigravity-cli` 写入状态锁导致卡死超时。确需从 Windows Codex 反向调 `agy` 时，须通过放行 `~/.gemini` 写权限的宿主通道运行，并将 `--timeout` 设为 `300` 秒以上。
 
-更多实战技巧与参数细节见[工程及科研协作实践指南](docs/反重力全域工程化最佳实践指南.md)与 [`cae-harness` 技能手册](template/user-guard/skills/cae-harness/SKILL.md)。
+更多实战技巧与参数细节见[工程及科研协作实践指南](docs/workflow-guide.md)与 [`cae-harness` 技能手册](template/user-guard/skills/cae-harness/SKILL.md)。
 
 ---
 
@@ -195,7 +200,7 @@ python -B install.py --dry-run --yes
    ```sh
    python -B -X utf8 -m unittest discover -s tests -p "test_*.py" -v
    ```
-4. **宿主实测与隐私脱敏扫描**：涉及宿主钩子协议或模型选路改动时，补充受控实测并记入[架构设计与生命周期钩子规范](docs/架构设计与生命周期钩子规范.md)；确认不含个人用户名路径、具体硬件型号或密钥凭据后，经用户批准再提交推送或同步生产配置。
+4. **宿主实测与隐私脱敏扫描**：涉及宿主钩子协议或模型选路改动时，补充受控实测并记入[架构设计与生命周期钩子规范](docs/architecture-and-hooks.md)；确认不含个人用户名路径、具体硬件型号或密钥凭据后，经用户批准再提交推送或同步生产配置。
 
 ---
 
@@ -203,14 +208,15 @@ python -B install.py --dry-run --yes
 
 ```text
 Antigravity_Codex_configuration/
-├── README.md                                 # 仓库总入口：痛点定位、三套部署模式、协作架构与快速上手
+├── README.md                                 # 仓库总入口：痛点定位、英文导引、三套部署模式与快速上手
 ├── CHANGELOG.md                              # 项目版本演进与宿主协议适配更新日志
 ├── LICENSE                                   # Apache License 2.0 开源许可证
 ├── AGENTS.md                                 # 供反重力与 Codex 助手共读的四步本机自举配置与维护规范
 ├── install.py / install.ps1 / install.sh     # 跨平台安装器：探测预演、TOML 无损合并、越界链接防护与幂等同步
+├── .github/workflows/ci.yml                  # 跨平台自动回归门禁（Windows + Ubuntu 三模式沙箱与离线测试）
 ├── docs/
-│   ├── 反重力全域工程化最佳实践指南.md        # 日常科研与数值求解器开发实战配合指南
-│   └── 架构设计与生命周期钩子规范.md          # 代码分区总览、钩子事件协议、状态机算法与受控实测记录
+│   ├── workflow-guide.md                     # 日常科研与数值求解器开发实战配合指南
+│   └── architecture-and-hooks.md             # 代码分区总览、钩子事件协议、状态机算法与受控实测记录
 ├── template/
 │   ├── user-guard/                           # 反重力原生插件及双端同源核心模板
 │   │   ├── plugin.json / hooks.json / README.md

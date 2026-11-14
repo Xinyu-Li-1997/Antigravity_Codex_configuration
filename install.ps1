@@ -52,7 +52,7 @@ function Find-WorkingPython {
 $python = Find-WorkingPython "python.exe"
 $launcher = if (-not $python) { Find-WorkingPython "py.exe" @("-3") }
 if (-not $python -and -not $launcher) {
-    Write-Error "[!] Python 3.11+ not found in PATH." -ErrorAction Continue
+    Write-Error "[!] 错误：未在 PATH 中找到可执行的 Python 3.11+。" -ErrorAction Continue
     exit 1
 }
 

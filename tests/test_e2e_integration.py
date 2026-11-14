@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -302,7 +303,8 @@ class TestEndToEndIntegration(unittest.TestCase):
         hostname = os.environ.get("COMPUTERNAME") or socket.gethostname()
         checked_count = 0
         for path in REPO_ROOT.rglob("*"):
-            if not path.is_file() or any(p in path.parts for p in (".git", "__pycache__", ".pytest_cache")):
+            rel_parts = path.relative_to(REPO_ROOT).parts
+            if not path.is_file() or any(p in rel_parts for p in (".git", "__pycache__", ".pytest_cache")):
                 continue
             rel_name = path.relative_to(REPO_ROOT).as_posix()
             try:
@@ -2055,6 +2057,142 @@ class TestEndToEndIntegration(unittest.TestCase):
                 self.assertNotIn(name, ALLOWED_PLACEHOLDERS)
                 self.assertEqual(_sensitive_findings(name + " = Path(tmp)", user_name=name), [])
                 self.assertIn("未脱敏主目录", _sensitive_findings("/home/" + name + "/work", user_name=name))
+
+    def test_41_repository_ascii_paths_links_and_single_version_source(self) -> None:
+        """校验受控源文件均为纯 ASCII 路径、Markdown 本地相对链接目标存在且文档不重复硬编码插件版本号。"""
+        ci_workflow = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        self.assertTrue(ci_workflow.is_file(), "须包含跨平台离线回归 GitHub Actions 工作流")
+        ci_bytes = ci_workflow.read_bytes()
+        self.assertFalse(ci_bytes.startswith(b"\xef\xbb\xbf"))
+        self.assertNotIn(b"\r", ci_bytes)
+
+        plugin_version = json.loads((ACTIVE_PLUGIN_DIR / "plugin.json").read_text(encoding="utf-8"))["version"]
+        plugin_readme = (ACTIVE_PLUGIN_DIR / "README.md").read_text(encoding="utf-8")
+        self.assertIsNone(
+            re.search(r"当前版本\s*`?\d+\.\d+\.\d+", plugin_readme),
+            "插件子目录 README 不应重复硬编码静态版本号，须以 plugin.json 为唯一真源",
+        )
+
+        def extract_md_targets(markdown_text: str) -> list[str]:
+            stripped = re.sub(r"(?m)^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[ \t]*$", "", markdown_text, flags=re.DOTALL)
+            stripped = re.sub(r"(`+)([^`]*?)\1", "", stripped)
+            targets: list[str] = []
+            idx = 0
+            while True:
+                open_pos = stripped.find("](", idx)
+                if open_pos == -1:
+                    break
+                pos = open_pos + 2
+                while pos < len(stripped) and stripped[pos] in " \t":
+                    pos += 1
+                if pos >= len(stripped):
+                    break
+                if stripped[pos] == "<":
+                    end_angle = stripped.find(">", pos + 1)
+                    if end_angle == -1 or "\n" in stripped[pos + 1 : end_angle]:
+                        idx = open_pos + 2
+                        continue
+                    dest = stripped[pos + 1 : end_angle]
+                    close_paren = stripped.find(")", end_angle + 1)
+                    if close_paren != -1 and "\n" not in stripped[end_angle + 1 : close_paren]:
+                        targets.append(dest)
+                        idx = close_paren + 1
+                        continue
+                else:
+                    depth = 0
+                    buf: list[str] = []
+                    cur = pos
+                    closed = False
+                    while cur < len(stripped) and stripped[cur] not in "\r\n":
+                        ch = stripped[cur]
+                        if ch == "\\" and cur + 1 < len(stripped):
+                            buf.append(stripped[cur + 1])
+                            cur += 2
+                            continue
+                        if ch == "(":
+                            depth += 1
+                            buf.append(ch)
+                        elif ch == ")":
+                            if depth > 0:
+                                depth -= 1
+                                buf.append(ch)
+                            else:
+                                targets.append("".join(buf))
+                                idx = cur + 1
+                                closed = True
+                                break
+                        elif ch in " \t" and depth == 0:
+                            rest = cur
+                            while rest < len(stripped) and stripped[rest] not in "\r\n)":
+                                if stripped[rest] == "\\" and rest + 1 < len(stripped):
+                                    rest += 2
+                                    continue
+                                rest += 1
+                            if rest < len(stripped) and stripped[rest] == ")":
+                                targets.append("".join(buf))
+                                idx = rest + 1
+                                closed = True
+                            break
+                        else:
+                            buf.append(ch)
+                        cur += 1
+                    if closed:
+                        continue
+                idx = open_pos + 2
+            return targets
+
+        sample_targets = extract_md_targets(
+            "[a](docs/a(b).md#sec) [b](<https://example.com>) [c](missing.md 'title') `[skip](nope.md)`"
+        )
+        self.assertEqual(sample_targets, ["docs/a(b).md#sec", "https://example.com", "missing.md"])
+
+        repo_files: list[Path] = []
+        if (REPO_ROOT / ".git").exists():
+            git_proc = subprocess.run(
+                ["git", "-c", "core.quotepath=false", "ls-files", "--cached", "--others", "--exclude-standard"],
+                cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8", check=False,
+            )
+            if git_proc.returncode == 0:
+                repo_files = [REPO_ROOT / line for line in git_proc.stdout.splitlines() if line and (REPO_ROOT / line).is_file()]
+        if not repo_files:
+            ignored_parts = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "env", "build", "dist", "htmlcov", ".idea", ".vscode"}
+            ignored_prefixes = ("template/user-guard/hooks/state/", "template/user-guard/hooks/logs/")
+            for p in REPO_ROOT.rglob("*"):
+                rel_parts = p.relative_to(REPO_ROOT).parts
+                rel_str = p.relative_to(REPO_ROOT).as_posix()
+                if any(part in ignored_parts for part in rel_parts) or rel_str.startswith(ignored_prefixes) or p.suffix == ".log":
+                    continue
+                self.assertFalse(p.is_symlink() and not p.exists(), f"仓库包含悬空符号链接: {rel_str}")
+                if p.is_file():
+                    repo_files.append(p)
+
+        repo_resolved = REPO_ROOT.resolve()
+        version_token_re = re.compile(rf"(?<![\d.]){re.escape(plugin_version)}(?![\d.])")
+        checked_md_count = 0
+        for path in repo_files:
+            rel_posix = path.relative_to(REPO_ROOT).as_posix()
+            self.assertTrue(rel_posix.isascii(), f"仓库文件路径须为纯 ASCII 以免跨平台转义: {rel_posix}")
+            if path.suffix.lower() != ".md":
+                continue
+            checked_md_count += 1
+            md_text = path.read_text(encoding="utf-8")
+            if rel_posix != "CHANGELOG.md":
+                self.assertIsNone(
+                    version_token_re.search(md_text),
+                    f"{rel_posix} 不应硬编码当前插件版本号 {plugin_version}，须以 plugin.json 为唯一真源",
+                )
+            for raw_target in extract_md_targets(md_text):
+                target = urllib.parse.unquote(raw_target.split("#", 1)[0].split("?", 1)[0].strip())
+                if not target or target.startswith("//") or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", target):
+                    continue
+                self.assertFalse(target.startswith("/"), f"{rel_posix} 本地链接不应使用根前导斜杠: {raw_target}")
+                resolved = (path.parent / target).resolve()
+                self.assertTrue(
+                    resolved == repo_resolved or repo_resolved in resolved.parents,
+                    f"{rel_posix} 本地链接越出仓库根目录: {raw_target}",
+                )
+                self.assertTrue(resolved.exists(), f"{rel_posix} 存在失效的本地链接: {raw_target}")
+        self.assertGreaterEqual(checked_md_count, 6)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
