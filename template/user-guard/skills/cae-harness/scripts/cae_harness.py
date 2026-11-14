@@ -26,12 +26,9 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import uuid
 from pathlib import Path
-try:
-    import tomllib
-except ImportError:  # Python 3.9 / 3.10
-    tomllib = None
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -135,12 +132,6 @@ _SESSION_QUOTA_BLOCKED = {}
 _CODEX_TOML_KEYS = {'model', 'model_reasoning_effort', 'model_context_window', 'model_auto_compact_token_limit'}
 
 
-_TOML_LINE_TOKEN = re.compile(r'''"""(?:\\[\s\S]|(?!"{3})[\s\S])*"""|'{3}[\s\S]*?'{3}|"(?:\\.|[^"\\\n])*"|'[^'\n]*'|#[^\n]*|[\[\]{}\n]''')
-
-
-_TOML_INTEGER = re.compile(r'(?:[+-]?(?:0|[1-9](?:_?[0-9])*)|0x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0o[0-7](?:_?[0-7])*|0b[01](?:_?[01])*)')
-
-
 _CUE_BOUNDARIES = re.compile(r'[，。；、,;.!?！？\n]+|\b(?:but|however|instead)\b|但是|而是|而只', re.I)
 
 
@@ -239,71 +230,9 @@ def _read_json(path):
         return {}
 
 
-def _toml_simple_string(raw):
-    if re.fullmatch(r"'[^'\r\n]*'", raw):
-        return raw[1:-1]
-    if not re.fullmatch(r'"(?:[^"\\\x00-\x1f]|\\(?:["\\btnfr]|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}))*"', raw):
-        return None
-    try:
-        def unescape(match):
-            value = match.group()
-            return chr(int(value[2:], 16)) if value[1] == 'U' else json.loads('"' + value + '"')
-
-        return re.sub(r'\\(?:U[0-9a-fA-F]{8}|u[0-9a-fA-F]{4}|.)', unescape, raw[1:-1])
-    except (ValueError, OverflowError):
-        return None
-
-
-def _toml_scalar_subset(text):
-    """3.9/3.10 fallback: read only the supported top-level scalar keys."""
-    result, seen = {}, set()
-    parts, pos, depth = [], 0, 0
-    for token in _TOML_LINE_TOKEN.finditer(text + '\n'):
-        raw = token.group()
-        parts.append(text[pos:token.start()])
-        pos = token.end()
-        if raw.startswith('#'):
-            continue
-        if raw.startswith(('"""', "'''")):
-            parts.append('<multiline_string>')
-            continue
-        if raw == '[' and not depth and not ''.join(parts).strip():
-            break  # First table; following bare keys are not top level.
-        if raw in ('[', '{'):
-            depth += 1
-        elif raw in (']', '}'):
-            depth -= 1
-        if depth < 0:
-            return {}
-        if raw != '\n' or depth:
-            parts.append(raw)
-            continue
-        line = ''.join(parts)
-        parts.clear()
-        match = re.fullmatch(r'''\s*([A-Za-z0-9_-]+|"(?:\\.|[^"\\])*"|'[^']*')\s*=\s*(.*?)\s*''', line)
-        if not match:
-            continue
-        key, value = match.groups()
-        key = _toml_simple_string(key) if key.startswith(('"', "'")) else key
-        if key not in _CODEX_TOML_KEYS:
-            continue
-        if key in seen:
-            return {}
-        seen.add(key)
-        if _TOML_INTEGER.fullmatch(value):
-            result[key] = int(value, 0) if value.startswith(('0x', '0o', '0b')) else int(value)
-        else:
-            parsed = _toml_simple_string(value)
-            if parsed is not None:
-                result[key] = parsed
-    return result
-
-
 def _top_level_toml(path):
     try:
         text = path.read_text(encoding='utf-8-sig')
-        if tomllib is None:
-            return _toml_scalar_subset(text)
         config = tomllib.loads(text)
         return {key: config[key] for key in _CODEX_TOML_KEYS if key in config}
     except (OSError, ValueError):
@@ -1198,9 +1127,7 @@ def _catalog_metadata(path, data, models, source, now):
     stamp = None
     if isinstance(fetched_at, str):
         try:
-            # Codex may record nanoseconds. Python 3.9 accepts six fractional digits.
-            iso_timestamp = re.sub(r'\.(\d+)', lambda match: '.' + match.group(1)[:6].ljust(6, '0'), fetched_at)
-            stamp = datetime.datetime.fromisoformat(iso_timestamp.replace('Z', '+00:00'))
+            stamp = datetime.datetime.fromisoformat(fetched_at)
             stamp = stamp.astimezone(datetime.timezone.utc) if stamp.tzinfo is not None else None
         except (ValueError, OverflowError):
             pass

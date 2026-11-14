@@ -33,7 +33,7 @@ description: >-
 
 ## 子命令实战指南
 
-编排脚本位于 [scripts/cae_harness.py](scripts/cae_harness.py)。以下命令假设当前工作目录为技能目录（Windows 用 `python`，WSL／Linux／macOS 用 `python3`）：
+编排脚本位于 [scripts/cae_harness.py](scripts/cae_harness.py)。以下命令假设当前工作目录为技能目录（Windows 用 `python`，WSL2／Linux 用 `python3`）：
 
 ### 1. 环境探测（`probe`）与选路评估（`assess`）
 

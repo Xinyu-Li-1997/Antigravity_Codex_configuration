@@ -1345,31 +1345,21 @@ class TestGuardsOffline(unittest.TestCase):
             result = status_guard.handle_pre_tool_use({**base, "toolCall": {"tool_name": tool, "args": {"Cwd": "sub", key: script}}})
             self.assertEqual(result["decision"], "allow")
 
-    def test_19_ast_python39_compatibility_and_match_captures(self):
-        project = self.tmp_root / "compat-project"
+    def test_19_ast_match_captures(self):
+        project = self.tmp_root / "match-project"
         project.mkdir()
         keys = [status_guard._normalize_cross_env_lexical(str(project))]
 
         def scan(script):
             return status_guard._scan_inline_python_code(script, str(project), keys, keys, False)
 
-        with unittest.mock.patch.object(status_guard, "_AST_MATCH_TYPES", ()), \
-                unittest.mock.patch.object(status_guard, "_AST_TRY_TYPES", (status_guard.ast.Try,)):
-            for script in ("open('../outside/x', 'w')", "try:\n    open('../outside/x', 'w')\nexcept Exception:\n    pass"):
+        for pattern, guard in (("p", ""), ("[*p]", ""), ("{'key': _, **p}", ""),
+                               ("{'key': p}", " if open(p, 'w')")):
+            script = "p = 'inside'\nmatch unknown:\n    case " + pattern + guard + ":\n        open(p, 'w')"
+            with self.subTest(pattern=pattern, guard=guard):
                 self.assertIsNotNone(scan(script))
-            self.assertIsNone(scan("open('../outside/input', 'r')"))
-        # 语法兼容检查不依赖本机恰好安装 Python 3.9。
-        for path in (Path(status_guard.__file__), Path(__file__)):
-            status_guard.ast.parse(path.read_text(encoding="utf-8-sig"), feature_version=(3, 9))
-        if hasattr(status_guard.ast, "Match"):
-            for pattern, guard in (("p", ""), ("[*p]", ""), ("{'key': _, **p}", ""),
-                                   ("{'key': p}", " if open(p, 'w')")):
-                script = "p = 'inside'\nmatch unknown:\n    case " + pattern + guard + ":\n        open(p, 'w')"
-                with self.subTest(pattern=pattern, guard=guard):
-                    self.assertIsNotNone(scan(script))
-            self.assertIsNone(scan("p = 'inside'\nmatch unknown:\n    case _:\n        open(p, 'w')"))
-        if hasattr(status_guard.ast, "TryStar"):
-            self.assertIsNotNone(scan("p = 'inside'\ntry:\n    pass\nexcept* Exception as p:\n    open(p, 'w')"))
+        self.assertIsNone(scan("p = 'inside'\nmatch unknown:\n    case _:\n        open(p, 'w')"))
+        self.assertIsNotNone(scan("p = 'inside'\ntry:\n    pass\nexcept* Exception as p:\n    open(p, 'w')"))
 
     def test_20_ast_string_replace_path_targets_and_links(self):
         project = self.tmp_root / "path-project"

@@ -1,4 +1,4 @@
-# Enforce consistent line endings across Windows, WSL2, Linux, and macOS
+# Enforce consistent line endings across Windows, WSL2, and Linux
 * text=auto eol=lf
 *.sh text eol=lf
 *.py text eol=lf

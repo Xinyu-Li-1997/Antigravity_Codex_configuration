@@ -897,8 +897,7 @@ def _collect_boundary_context(
         if item in raw_projects:
             if rk:
                 allowed_resolved_keys.append(rk)
-        elif rk and (rk == nk or (os.name != "nt" and nk == "/tmp" and rk == "/private/tmp")):
-            # macOS 的标准 /tmp 是 /private/tmp 的系统别名。
+        elif rk and rk == nk:
             allowed_resolved_keys.append(rk)
         else:
             # 缓存、轨迹等目录只有物理位置与登记的标准目录一致时才适用例外。
@@ -1042,8 +1041,6 @@ _AST_DYNAMIC = object()
 _AST_CWD = object()
 _AST_DEFINITION = object()
 _AST_MAX_CANDIDATES = 64
-_AST_MATCH_TYPES = (ast.Match,) if hasattr(ast, "Match") else ()
-_AST_TRY_TYPES = (ast.Try, ast.TryStar) if hasattr(ast, "TryStar") else (ast.Try,)
 _AST_MODULE_CALLS = {
     "os": {"chdir", "open", "remove", "unlink", "rmdir", "removedirs", "mkdir", "makedirs", "rename",
            "replace", "renames", "truncate", "symlink", "link", "system"},
@@ -1359,13 +1356,13 @@ def _iter_ast_calls_in_order(node, bindings, active=()):
         for expr in (node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,):
             yield from walk(expr, local)
         return
-    if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.IfExp, ast.BoolOp) + _AST_TRY_TYPES + _AST_MATCH_TYPES):
+    if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.IfExp, ast.BoolOp, ast.Match, ast.Try, ast.TryStar)):
         if isinstance(node, (ast.If, ast.While, ast.IfExp)):
             yield from walk(node.test)
         if isinstance(node, (ast.For, ast.AsyncFor)):
             yield from walk(node.iter)
         branches = []
-        if isinstance(node, _AST_MATCH_TYPES):
+        if isinstance(node, ast.Match):
             yield from walk(node.subject)
             branches = [[case] for case in node.cases]
         elif isinstance(node, ast.BoolOp):
@@ -1379,10 +1376,10 @@ def _iter_ast_calls_in_order(node, bindings, active=()):
             local = _copy_ast_bindings(bindings)
             if isinstance(node, (ast.For, ast.AsyncFor)):
                 _bind_ast_target(node.target, frozenset((_AST_DYNAMIC,)), local)
-            if isinstance(node, _AST_MATCH_TYPES):
+            if isinstance(node, ast.Match):
                 case = branch[0]
                 for pattern in ast.walk(case.pattern):
-                    # MatchAs / MatchStar 使用 name，MatchMapping 使用 rest；3.9 不会进入此分支。
+                    # MatchAs / MatchStar 使用 name，MatchMapping 使用 rest。
                     for field in ("name", "rest"):
                         name = getattr(pattern, field, None)
                         if name:

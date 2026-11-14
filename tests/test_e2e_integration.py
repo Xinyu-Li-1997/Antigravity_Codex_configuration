@@ -116,7 +116,7 @@ def _sensitive_findings(content, home_variants=(), user_name="", hostname=""):
 
 
 def _build_subprocess_cmd(hook_cmd: str) -> list:
-    """将 hooks.json 中的命令安全替换为当前测试 Python 解释器执行，跨 Windows/Linux/macOS 通用"""
+    """将 hooks.json 中的命令安全替换为当前测试 Python 解释器执行，跨 Windows/Linux 通用"""
     tokens = [t.strip('"') for t in shlex.split(hook_cmd, posix=(os.name != "nt"))]
     # 找到第一个 .py 脚本位置，保留 -X utf8 -I -B 及脚本参数
     script_idx = next((i for i, t in enumerate(tokens) if t.endswith(".py")), 1)
@@ -330,7 +330,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             "AMD " + "Ryzen " + "9 " + "9950X", "Threadripper " + "PRO " + "7995WX", "EPYC " + "9654",
             "Apple " + "M4 " + "Max", "RTX " + "5090", "GTX " + "1080", "RTX " + "A6000",
             "A" + "100", "H" + "100", "H" + "200", "V" + "100", "L" + "40S",
-            "Radeon RX " + "7900 " + "XTX", "OMEN " + "16L",
+            "Radeon RX " + "7900 " + "XTX", "OMEN " + "45L",
         )
         credentials = (
             "sk-" + "a" * 32, "AIza" + "a" * 34, "ghp_" + "a" * 32,
@@ -1316,6 +1316,14 @@ class TestEndToEndIntegration(unittest.TestCase):
             )}
             legacy = {"description": "用户原有说明\n第二行", "hooks": {"SessionStart": [{"matcher": "^(compact|resume)$", "hooks": [valid, sibling]}, other_group],
                                 "Notification": other_event, "Stop": [{"hooks": [other_gate, shared_path_gate]}]}}
+            quote = (lambda value: '"' + value + '"') if os.name == "nt" else shlex.quote
+            log = (loader_path.parent / "logs" / "session-context.jsonl").as_posix()
+            expected_loader = {**valid, "command": (
+                f'{quote(sys.executable)} -X utf8 -I -B {quote(loader_path.as_posix())} '
+                f'--client codex --state-dir {quote(state_dir)} --log {quote(log)}'
+            )}
+            expected_legacy = json.loads(json.dumps(legacy))
+            expected_legacy["hooks"]["SessionStart"][0]["hooks"][0] = expected_loader
             hooks_path.write_text(json.dumps(legacy), encoding="utf-8")
             cmd = [sys.executable, "-B", "-X", "utf8", str(self.installer_root / "install.py"), "--app", "codex",
                    "--codex-home", str(codex_root), "--no-zotero", "--skip-test"]
@@ -1327,7 +1335,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             upgraded_bytes = hooks_path.read_bytes()
             upgraded = json.loads(upgraded_bytes)["hooks"]
-            self.assertEqual(upgraded["SessionStart"][0]["hooks"][:2], [valid, sibling])
+            self.assertEqual(upgraded["SessionStart"][0]["hooks"][:2], [expected_loader, sibling])
             self.assertEqual(upgraded["SessionStart"][1], other_group)
             self.assertEqual(upgraded["Notification"], other_event)
             self.assertEqual(upgraded["Stop"][0]["hooks"][:2], [other_gate, shared_path_gate])
@@ -1353,7 +1361,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             disabled_bytes = hooks_path.read_bytes()
             self.assertEqual(json.loads(disabled_bytes), {
-                **legacy, "description": legacy["description"] + "\n[user-guard codex-handoff v1 mode=off compact_limit=2]",
+                **expected_legacy, "description": legacy["description"] + "\n[user-guard codex-handoff v1 mode=off compact_limit=2]",
             })
             result = install()
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -1397,7 +1405,7 @@ class TestEndToEndIntegration(unittest.TestCase):
             invoked = check.call_args.args[0]
             self.assertEqual(Path(invoked[0]), Path(sys.executable))
             self.assertEqual(invoked[1:], ["-X", "utf8", "-I", "-B", "-c",
-                                          "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"])
+                                          "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"])
             self.assertIn("自定义脚本命令", diagnostics.getvalue())
             self.assertEqual(path.read_bytes(), before)
             handlers = json.loads(plan.change.content)["hooks"]["SessionStart"][0]["hooks"]
@@ -1405,6 +1413,53 @@ class TestEndToEndIntegration(unittest.TestCase):
             self.assertEqual(handlers[0]["timeout"], 33)
             self.assertEqual(handlers[0]["statusMessage"], "custom status")
             self.assertEqual(handlers[1:4], [sibling, custom_program, custom_flags])
+
+    def test_20_codex_loader_upgrade_keeps_working_interpreter_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "codex"
+            root.mkdir()
+            path = root / "hooks.json"
+            template = REPO_ROOT / "template/codex/hooks.json"
+            replacement = "python -X utf8 -I -B"
+            baseline = INSTALLER._plan_codex_hooks(path, template, replacement).change.content
+            interpreter = str(Path(sys.executable).resolve())
+            prefixes = [(interpreter, []), ("python.exe" if os.name == "nt" else "python3", [])]
+            if os.name == "nt":
+                prefixes.append(("py.exe", ["-3"]))
+            quote = (lambda value: '"' + value + '"') if os.name == "nt" else shlex.quote
+            script_args = [(root / "hooks" / "session_context_loader.py").as_posix(), "--client", "codex",
+                           "--state-dir", (root / "hooks" / "state" / "session-context").as_posix(),
+                           "--log", (root / "hooks" / "logs" / "session-context.jsonl").as_posix()]
+            for executable, launcher in prefixes:
+                for flags in (["-I", "-B"], INSTALLER.HOOK_PYTHON_FLAGS):
+                    for arg_count in (3, 5, 7):
+                        with self.subTest(executable=executable, flags=flags, arg_count=arg_count):
+                            doc = json.loads(baseline)
+                            old = doc["hooks"]["SessionStart"][0]["hooks"][0]
+                            old.update(command="  ".join([quote(executable), *launcher, *flags,
+                                                         *(quote(arg) for arg in script_args[:arg_count])]),
+                                       timeout=33, statusMessage="用户状态提示", trusted_hash="fixture-trust")
+                            original = b"\xef\xbb\xbf" + json.dumps(doc, ensure_ascii=False, indent=4).replace("\n", "\r\n").encode("utf-8")
+                            path.write_bytes(original)
+                            name = "" if Path(executable).is_absolute() else executable
+                            with mock.patch.object(INSTALLER, "_hook_python_candidates", return_value=[(name, interpreter, launcher)]), \
+                                    mock.patch.object(INSTALLER.shutil, "which", return_value=interpreter), \
+                                    mock.patch.object(INSTALLER, "_is_working_python_cmd", return_value=True) as probe:
+                                plan = INSTALLER._plan_codex_hooks(path, template, replacement)
+                                probe.assert_called_once_with(interpreter, launcher)
+                                self.assertEqual(path.read_bytes(), original)
+                                if flags == INSTALLER.HOOK_PYTHON_FLAGS and arg_count == len(script_args):
+                                    self.assertIsNone(plan.change)
+                                else:
+                                    self.assertIsNotNone(plan.change)
+                                    handler = json.loads(plan.change.content)["hooks"]["SessionStart"][0]["hooks"][0]
+                                    self.assertEqual(INSTALLER._codex_hook_tokens(handler),
+                                                     [executable, *launcher, *INSTALLER.HOOK_PYTHON_FLAGS, *script_args])
+                                    self.assertEqual(handler, {**old, "command": handler["command"]})
+                                    path.write_bytes(plan.change.content)
+                                installed = path.read_bytes()
+                                self.assertIsNone(INSTALLER._plan_codex_hooks(path, template, replacement).change)
+                                self.assertEqual(path.read_bytes(), installed)
 
     @unittest.skipUnless(os.name == "nt", "Windows PATH 的应用执行别名")
     def test_20_shadowed_windows_python_loader_uses_working_launcher(self) -> None:
@@ -1522,19 +1577,6 @@ class TestEndToEndIntegration(unittest.TestCase):
             run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=20)
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual((config.read_bytes(), config.stat().st_mtime_ns), (updated, mtime))
-
-            # 在没有 tomllib 的解释器分支重做同一编辑，保守拒绝不支持的复杂值。
-            config.write_bytes(before)
-            with mock.patch.object(INSTALLER, "tomllib", None), contextlib.redirect_stdout(io.StringIO()):
-                planned = INSTALLER._plan_codex_config(codex, include_sandbox=True, include_model=True,
-                                                       overwrite_model=False, zotero_exe=str(zotero))
-                self.assertEqual(planned.content, updated)
-                complex_config = b'description = """\n[features]\nmultiline\n"""\n'
-                config.write_bytes(complex_config)
-                with self.assertRaisesRegex(ValueError, r"Python 3\.11\+"):
-                    INSTALLER._plan_codex_config(codex, include_sandbox=True, include_model=False,
-                                                overwrite_model=False, zotero_exe=None)
-                self.assertEqual(config.read_bytes(), complex_config)
 
     def test_23_config_errors_abort_both_targets_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1819,7 +1861,7 @@ class TestEndToEndIntegration(unittest.TestCase):
                 INSTALLER.main()
             self.assertNotEqual(cm.exception.code, 0)
 
-    def test_30_repository_python_sources_support_python39_syntax(self) -> None:
+    def test_30_repository_python_sources_support_python311_syntax(self) -> None:
         sources = sorted(
             path for path in REPO_ROOT.rglob("*.py")
             if not any(p in path.parts for p in (".git", "__pycache__", ".pytest_cache")) and path.is_file()
@@ -1830,24 +1872,17 @@ class TestEndToEndIntegration(unittest.TestCase):
         self.assertIn(Path(__file__).resolve(), sources)
         for path in sources:
             with self.subTest(source=path.relative_to(REPO_ROOT).as_posix()):
-                ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 9))
+                ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 11))
 
-    def test_31_fallback_toml_parser_preserves_hashes_inside_strings(self) -> None:
-        source = (
-            'flags = ["--tag=#1", "ok"] # inline comment with ] and "\n'
-            "literal = ['a#b', '#',] # another ] comment\n"
-            'escaped = ["a\\\"#b", "c\\\\#d"] # escaped quotes and slashes\n'
-            'text = "a#b" # scalar comment\n'
-            "count = 3 # integer comment\n"
-            "enabled = true # boolean comment\n"
-        )
-        self.assertEqual(INSTALLER._simple_toml_loads(source), {
-            "flags": ["--tag=#1", "ok"], "literal": ["a#b", "#"],
-            "escaped": ['a"#b', "c\\#d"], "text": "a#b", "count": 3, "enabled": True,
-        })
-        for invalid in ('flags = ["a#b" # missing bracket', 'text = "unterminated # value'):
-            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                INSTALLER._simple_toml_loads(invalid)
+    def test_31_toml_key_parts_preserves_quoted_and_dotted_keys(self) -> None:
+        for source, expected in (
+            ("model", ("model",)),
+            (" mcp_servers . 'zotero.server' ", ("mcp_servers", "zotero.server")),
+            (r'"mcp\u005fservers"."zotero\u002eserver"', ("mcp_servers", "zotero.server")),
+            (r'"quote\"slash\\".model', ('quote"slash\\', "model")),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(INSTALLER._toml_key_parts(source), expected)
 
     def test_32_hook_python_candidates_accept_quoted_windows_path_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1964,26 +1999,6 @@ class TestEndToEndIntegration(unittest.TestCase):
             path.lstat.return_value = mock.Mock(st_file_attributes=0, st_reparse_tag=0)
             self.assertFalse(INSTALLER._is_link_or_junction(path))
 
-    @unittest.skipIf(os.name == "nt", "需要 POSIX 根级路径语义")
-    def test_37_only_standard_private_root_aliases_are_allowed_as_ancestors(self) -> None:
-        for name in ("var", "tmp", "etc"):
-            alias = Path("/") / name
-            target = alias / "folders" / "destination"
-            with self.subTest(alias=alias), \
-                    mock.patch.object(INSTALLER, "_is_link_or_junction", side_effect=lambda path: path == alias), \
-                    mock.patch.object(INSTALLER.Path, "resolve", return_value=Path("/private") / name), \
-                    mock.patch.object(INSTALLER.Path, "lstat", side_effect=FileNotFoundError):
-                self.assertEqual(INSTALLER._validate_path(target, directory=True), target)
-                with self.assertRaisesRegex(ValueError, "安装目标是链接"):
-                    INSTALLER._validate_path(alias, directory=True)
-                with mock.patch.object(INSTALLER.Path, "resolve", return_value=Path("/other") / name):
-                    with self.assertRaisesRegex(ValueError, "祖先链接"):
-                        INSTALLER._validate_path(target, directory=True)
-                nested = alias / "user-alias"
-                with mock.patch.object(INSTALLER, "_is_link_or_junction", side_effect=lambda path: path in (alias, nested)):
-                    with self.assertRaisesRegex(ValueError, "祖先链接"):
-                        INSTALLER._validate_path(nested / "destination", directory=True)
-
     def test_38_codex_gate_policy_update_keeps_working_interpreter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "codex"
@@ -2025,6 +2040,7 @@ class TestEndToEndIntegration(unittest.TestCase):
     def test_39_installer_entrypoints_preserve_required_encodings(self) -> None:
         ps1 = (REPO_ROOT / "install.ps1").read_bytes()
         self.assertTrue(ps1.startswith(b"\xef\xbb\xbf"))
+        self.assertEqual(ps1.count(b"\r\n"), ps1.count(b"\n"))
         ps1.decode("utf-8-sig")
         for name in ("install.py", "install.sh", "tests/test_e2e_integration.py"):
             with self.subTest(name=name):
@@ -2039,19 +2055,6 @@ class TestEndToEndIntegration(unittest.TestCase):
                 self.assertNotIn(name, ALLOWED_PLACEHOLDERS)
                 self.assertEqual(_sensitive_findings(name + " = Path(tmp)", user_name=name), [])
                 self.assertIn("未脱敏主目录", _sensitive_findings("/home/" + name + "/work", user_name=name))
-
-    def test_41_fallback_toml_multiline_strings_require_python311(self) -> None:
-        sources = (
-            'description = """\ntext # value\n"""\n',
-            "description = '''\ntext # value\n'''\n",
-            'flags = ["""a#b""", "ok"] # inline comment\n',
-            "flags = ['''a#b''', 'ok'] # inline comment\n",
-        )
-        with mock.patch.object(INSTALLER, "tomllib", None):
-            for source in sources:
-                with self.subTest(source=source), self.assertRaisesRegex(ValueError, r"Python 3\.11\+"):
-                    INSTALLER._parse_toml(source, REPO_ROOT / "config.toml")
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

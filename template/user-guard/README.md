@@ -6,10 +6,10 @@
 
 | 路径 | 组件职责 |
 | --- | --- |
-| `plugin.json` | 反重力原生插件元信息清单（遵循官方 v1 Schema，当前版本 `1.7.3`） |
+| `plugin.json` | 反重力原生插件元信息清单（遵循官方 v1 Schema，当前版本 `1.7.4`） |
 | `assets/logo.svg` | 插件矢量图标，满足 `agy plugin validate --strict` 零提示规范 |
 | `hooks.json` | 反重力生命周期钩子注册表，挂载 `SessionStart`、`PreInvocation`、`PreToolUse` 与 `Stop` 四类同步命令事件 |
-| `rules/AGENTS.md` | 双端共用的 `R0–R11` 全局规则：文件精简、中文与 CAE/CFD 规范术语、双端选模配窗与额度回退、阶段收口全量回归／润色清淤脱敏把关、项目目录硬边界、防无声放大、验收红线及压缩交接对齐 |
+| `rules/AGENTS.md` | 双端精炼共用的 `R0–R11` 全局规则：文件精简、中文与 CAE/CFD 规范术语、双端选模配窗与额度回退、阶段收口双端把关、反过度工程（`R3.3`）、项目目录硬边界与公开脱敏（`R4`）、防无声放大、验收红线及压缩交接对齐 |
 | `hooks/user_words.py` | 双端共享底层库：UTF-8 标准流重配置、跨平台文件锁、原子写盘、反重力 JSONL 截断回查及 Codex 跨分段 `rollout` 合并与 SHA-256 完整性校验 |
 | `hooks/session_context_loader.py` | 压缩与续接恢复入口：反重力侧按字节游标增量检测 `CHECKPOINT` 并注入用户原话摘要；Codex 侧在 `compact`／`resume` 时归档并注入历史原话 |
 | `hooks/status_guard.py` | `PreToolUse` 守卫：解析跨宿主表面文件修改工具、`run_command` 与 `run_workflow` 动态工作流脚本 AST，拦截未授权的项目外写删（交互会话弹窗 `force_ask`，无头子任务直接 `deny`），并用日志复合指纹阻断无进展重复轮询 |

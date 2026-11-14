@@ -1,4 +1,4 @@
-﻿# Antigravity & Codex 安装入口，兼容 Windows PowerShell 5.1 和 PowerShell 7。
+﻿# Antigravity & Codex Windows 安装入口。
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 
@@ -16,7 +16,7 @@ function Find-WorkingPython {
             $process.StartInfo.FileName = $commandInfo.Source
             $process.StartInfo.Arguments = (@($PrefixArgs) + @(
                 '-I', '-B', '-c',
-                '"import sys; print(''user-guard-python-ok''); raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"'
+                '"import sys; print(''user-guard-python-ok''); raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"'
             )) -join ' '
             $process.StartInfo.UseShellExecute = $false
             $process.StartInfo.CreateNoWindow = $true
@@ -52,7 +52,7 @@ function Find-WorkingPython {
 $python = Find-WorkingPython "python.exe"
 $launcher = if (-not $python) { Find-WorkingPython "py.exe" @("-3") }
 if (-not $python -and -not $launcher) {
-    Write-Error "[!] Python 3.9+ not found in PATH." -ErrorAction Continue
+    Write-Error "[!] Python 3.11+ not found in PATH." -ErrorAction Continue
     exit 1
 }
 

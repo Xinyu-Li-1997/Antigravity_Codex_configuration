@@ -2,7 +2,7 @@
 
 本仓库（`Antigravity_Codex_configuration`）维护 Google Antigravity（反重力）与 OpenAI Codex 共用的科研与工程工作流配置。两套客户端既可各自独立闭环运行，也可通过共享的 `cae-harness` 技能按专长协同攻坚，面向计算流体力学（CFD）、有限元分析（FEA）、偏微分方程（PDE）数值求解器、网格生成与高性能科学计算研发，同时兼容通用软件工程与技术写作。
 
-全仓脚本仅依赖 Python 标准库（要求 Python 3.9+；若需无损合并含复杂表结构的既有 `config.toml`，建议使用 Python 3.11+，遇到无法安全解析的配置时安装器会保留原文件并提示）。
+全仓脚本仅依赖 Python 3.11+ 标准库（零第三方依赖，面向 Windows 与 WSL2／Linux 环境）。
 
 ---
 
@@ -22,7 +22,8 @@
 | 每个新课题都要重复交代中文规范、精简目录与容差红线 | 双端统一部署全局规则 `R0–R11`；具体控制方程与离散参数留在项目内 `AGENTS.md` | 固化通用科研与工程纪律，不覆盖具体算例的物理模型与收敛判据 |
 | 上下文自动压缩或跨天续接后，忘掉首轮假设与中途拍板 | 压缩／恢复钩子自动从本地会话轨迹提取并归档全部用户原话 | 自动提醒模型重读磁盘原话核对；底层轨迹本身被截断时如实标明缺口 |
 | 独立核查时顺手改坏源码，失去第三方复核意义 | 双端对称配置三个严格只读子代理（通读摘录、审计核验、数理推导与润色协作） | 读写权限物理隔离；所有审查发现必须附文件路径与行号交回总控复核 |
-| 严禁放宽 `rtol`／`atol`，区分“改完代码”与“算例跑通” | `R3.6` 验收红线 + 结构化 JSON 回执 + `cae-harness gate` 外部验证命令门禁 | 严格区分“源码存在”“离线测试通过”与“真实宿主／算例实测通过” |
+| 严禁放宽 `rtol`／`atol`，区分“改完代码”与“算例跑通” | `R3.6` 验收红线 + 结构化 JSON 回执 + `cae-harness gate` 外部验证命令门禁 | 仅对当前目标环境与核心验证链路如实标注未实测项，不罗列无关外围平台免责 |
+| 擅自添加老版本回退分支、多余抽象与假想兼容层 | `R3.3` 控制范围与反过度工程红线 + 阶段收口双端清淤把关 | 聚焦当前明确需求与主力环境（Python 3.11+、Windows／WSL2），砍掉冗余样板代码 |
 | 越界修改相邻算例、建外部 `git worktree` 或改乱全局配置 | `R4` 目录硬边界 + Python AST／Shell 子句静态检查 + Codex `workspace-write` 沙箱 | 项目外写删须经用户明确批准；系统标准临时目录与运行缓存正常放行 |
 | 同一个算例残差日志被反复空读、空等套话连续刷屏 | 日志复合指纹门禁 + 回复数值进展识别守卫 | 日志内容有变化或迭代步数／残差有推进才放行，拦截原地空转刷屏 |
 | 会话已频繁压缩丢细节，还在继续派任务铺摊子 | 长会话分级预警、排空（`drain`）、冻结（`freeze`）与交接四要素核验 | 反重力自动收口生成【新对话提示词】；Codex 默认采用 `advisory` 提醒不强停 |
@@ -122,7 +123,7 @@ flowchart TB
 
 ## 五、`cae-harness` 常用命令速查
 
-在仓库根目录可直接调用（Windows 用 `python`，WSL／Linux／macOS 用 `python3`；部署后也可在技能目录内执行）：
+在仓库根目录可直接调用（Windows 用 `python`，WSL2／Linux 用 `python3`；部署后也可在技能目录内执行）：
 
 ```sh
 # 1. 只读评估本机双端模型目录、声明窗口与各任务推荐选路（零写入）
@@ -165,7 +166,7 @@ python -B install.py --dry-run --yes
 
 确认预演无误后执行正式安装：
 - **Windows（PowerShell）**：`powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1`
-- **Linux／macOS／WSL**：`bash install.sh`
+- **WSL2／Linux**：`bash install.sh`
 
 | 安装器常用参数 | 作用说明 |
 | --- | --- |
@@ -190,7 +191,7 @@ python -B install.py --dry-run --yes
    python -B install.py --app antigravity --target-dir "<临时目录>/plugins/user-guard" --no-zotero
    python -B install.py --app both --target-dir "<临时目录>/plugins/user-guard" --codex-home "<临时目录>/codex_home" --no-zotero
    ```
-3. **全量离线单元测试与 Python 3.9+ 语法回归**：
+3. **全量离线单元测试与 Python 3.11+ 语法回归**：
    ```sh
    python -B -X utf8 -m unittest discover -s tests -p "test_*.py" -v
    ```

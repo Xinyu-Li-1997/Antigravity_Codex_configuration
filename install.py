@@ -27,13 +27,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
-
-try:
-    import tomllib
-except ImportError:  # Python 3.9 和 3.10
-    tomllib = None
 
 # 全平台强制标准流为 UTF-8
 for _stream_name in ("stdin", "stdout", "stderr"):
@@ -59,9 +55,6 @@ TOML_KEY = rf"(?:[A-Za-z0-9_-]+|{TOML_STRING})"
 TOML_KEY_PATH = rf"{TOML_KEY}(?:[ \t]*\.[ \t]*{TOML_KEY})*"
 TOML_TABLE = re.compile(rf"^[ \t]*(\[{{1,2}})[ \t]*({TOML_KEY_PATH})[ \t]*(\]{{1,2}})[ \t]*(?:#.*)?$")
 TOML_ASSIGNMENT = re.compile(rf"^([ \t]*({TOML_KEY_PATH})[ \t]*=[ \t]*)(.*)$")
-TOML_ARRAY_TOKEN = re.compile(rf"{TOML_STRING}|[^, \t]+")
-TOML_ESCAPE = re.compile(r'\\(?:(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})|([btnfr"\\]))')
-TOML_ESCAPED_CHAR = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
 HOOK_PYTHON_FLAGS = ["-X", "utf8", "-I", "-B"]
 LEGACY_PYTHON_FLAGS = ([], ["-B"], ["-I", "-B"], HOOK_PYTHON_FLAGS)
 HANDOFF_MARKER = re.compile(r"\[user-guard codex-handoff v1 mode=(advisory|enforce|off) compact_limit=([0-9]+)\]")
@@ -119,12 +112,6 @@ def _validate_path(path: Path, *, directory: bool) -> Path:
             ):
                 raise ValueError(f"Windows 安装路径包含保留名称或非法字符: {ancestor}")
         if _is_link_or_junction(ancestor):
-            if (
-                os.name != "nt" and ancestor != path
-                and ancestor in (Path("/var"), Path("/tmp"), Path("/etc"))
-                and ancestor.resolve() == Path("/private") / ancestor.name
-            ):
-                continue
             if ancestor == path:
                 raise ValueError(f"安装目标是链接或目录联接，请指定真实路径: {ancestor}")
             raise ValueError(f"安装路径含祖先链接或目录联接，请指定真实路径: {ancestor}")
@@ -311,114 +298,19 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False).replace("\x7f", r"\u007f")
 
 
-def _simple_toml_value(source: str) -> Any:
-    """Python 3.9/3.10 支持常见单行值，对其余语法要求使用 tomllib。"""
-    if re.fullmatch(r'"(?:[^"\\\x00-\x08\x0a-\x1f\x7f]|\\(?:[btnfr"\\]|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}))*"', source):
-        def unescape(match: re.Match) -> str:
-            if match[2]:
-                return TOML_ESCAPED_CHAR[match[2]]
-            codepoint = int(match[1][1:], 16)
-            if not 0 <= codepoint <= 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
-                raise ValueError("TOML Unicode 转义无效")
-            return chr(codepoint)
-        return TOML_ESCAPE.sub(unescape, source[1:-1])
-    if re.fullmatch(r"'[^'\x00-\x08\x0a-\x1f\x7f]*'", source):
-        return source[1:-1]
-    if source in {"true", "false"}:
-        return source == "true"
-    if re.fullmatch(r"[+-]?(?:0|[1-9](?:_?[0-9])*)", source):
-        return int(source.replace("_", ""))
-    if re.fullmatch(r"[+-]?(?:0|[1-9][0-9]*)(?:\.[0-9]+(?:[eE][+-]?[0-9]+)?|[eE][+-]?[0-9]+)", source):
-        return float(source)
-    raise ValueError("此 TOML 值需要 Python 3.11+ 才能安全解析")
-
-
 def _toml_key_parts(source: str) -> Tuple[str, ...]:
-    return tuple(_simple_toml_value(key) if key[0] in "\"'" else key for key in re.findall(TOML_KEY, source))
-
-
-def _simple_toml_loads(source: str) -> Dict[str, Any]:
-    if re.search(r"\r(?!\n)|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", source):
-        raise ValueError("TOML 含非法控制字符")
-    data: Dict[str, Any] = {}
-    section: Tuple[str, ...] = ()
-    explicit_tables: Set[Tuple[str, ...]] = set()
-    dotted_tables: Set[Tuple[str, ...]] = set()
-
-    def table(path: Tuple[str, ...]) -> Dict[str, Any]:
-        value = data
-        for key in path:
-            child = value.setdefault(key, {})
-            if not isinstance(child, dict):
-                raise ValueError("TOML 表与已有键冲突")
-            value = child
-        return value
-
-    for number, line in enumerate(source.split("\n"), start=1):
-        line = line.rstrip("\r")
-        if not line.strip(" \t") or line.lstrip(" \t").startswith("#"):
-            continue
-        try:
-            header = TOML_TABLE.fullmatch(line)
-            if header and header[1] == "[" and header[3] == "]":
-                section = _toml_key_parts(header[2])
-                if section in explicit_tables or section in dotted_tables:
-                    raise ValueError("TOML 表重复定义")
-                table(section)
-                explicit_tables.add(section)
-                continue
-            assignment = TOML_ASSIGNMENT.fullmatch(line)
-            if not assignment:
-                raise ValueError("该 TOML 语法需要 Python 3.11+ 才能安全解析")
-            keys = _toml_key_parts(assignment[2])
-            destination = table(section + keys[:-1])
-            if keys[-1] in destination:
-                raise ValueError("TOML 键重复")
-            for index in range(1, len(keys)):
-                path = section + keys[:index]
-                if path in explicit_tables:
-                    raise ValueError("点分键重定义 TOML 表")
-                dotted_tables.add(path)
-            value = assignment[3]
-            cursor = 0
-            while cursor < len(value):
-                if value[cursor] in "\"'":
-                    if value.startswith(('"""', "'''"), cursor):
-                        raise ValueError("多行 TOML 字符串需要 Python 3.11+ 才能安全解析")
-                    string = re.match(TOML_STRING, value[cursor:])
-                    if string is None:
-                        raise ValueError("无法识别 TOML 字符串")
-                    cursor += string.end()
-                elif value[cursor] == "#":
-                    value = value[:cursor]
-                    break
-                else:
-                    cursor += 1
-            value = value.strip(" \t")
-            if value.startswith("[") and value.endswith("]"):
-                body = value[1:-1].strip(" \t")
-                items = []
-                while body:
-                    item = TOML_ARRAY_TOKEN.match(body)
-                    if not item:
-                        raise ValueError("无效的 TOML 数组")
-                    items.append(_simple_toml_value(item[0]))
-                    body = body[item.end():].lstrip(" \t")
-                    if body and not body.startswith(","):
-                        raise ValueError("TOML 数组元素缺少逗号")
-                    body = body[1:].lstrip(" \t")
-                destination[keys[-1]] = items
-            else:
-                destination[keys[-1]] = _simple_toml_value(value)
-        except ValueError as exc:
-            raise ValueError(f"第 {number} 行无法安全解析：{exc}") from exc
-    return data
+    table = tomllib.loads(f"[{source}]\n")
+    parts = []
+    while table:
+        key, table = next(iter(table.items()))
+        parts.append(key)
+    return tuple(parts)
 
 
 def _parse_toml(source: str, path: Path) -> Dict[str, Any]:
     try:
-        return tomllib.loads(source) if tomllib is not None else _simple_toml_loads(source)
-    except (ValueError, RecursionError) as exc:
+        return tomllib.loads(source)
+    except (tomllib.TOMLDecodeError, ValueError, RecursionError) as exc:
         raise ValueError(f"无法安全合并 {path}，原文件已保留: {exc}") from exc
 
 
@@ -826,11 +718,7 @@ def detect_installed_apps() -> Dict[str, Any]:
             if name == "codex" and not (cli or desktop):
                 cli, desktop = _find_windows_codex_package()
         elif name == "agy":
-            desktop = _first_executable([Path("/usr/bin/antigravity"), Path("/opt/Antigravity/antigravity"),
-                                         Path("/Applications/Antigravity.app/Contents/MacOS/Antigravity")])
-        elif sys.platform == "darwin":
-            desktop = _first_executable([Path("/Applications/Codex.app/Contents/MacOS/Codex"),
-                                         home / "Applications" / "Codex.app" / "Contents" / "MacOS" / "Codex"])
+            desktop = _first_executable([Path("/usr/bin/antigravity"), Path("/opt/Antigravity/antigravity")])
 
         evidence = []
         interop_complete = not wsl
@@ -926,7 +814,7 @@ def _is_working_python_cmd(executable: str, launcher_args: List[str]) -> bool:
     try:
         proc = subprocess.run(
             [executable, *launcher_args, *HOOK_PYTHON_FLAGS,
-             "-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"],
+             "-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"],
             capture_output=True,
             timeout=5,
         )
@@ -945,7 +833,7 @@ def detect_hook_python_command(*, antigravity: bool = False) -> str:
         if shell_path and Path(shell_path) == Path(executable) and _is_working_python_cmd(executable, launcher_args):
             return " ".join([name, *launcher_args, flags])
     if antigravity and os.name == "nt":
-        raise ValueError("Windows 反重力钩子需要 PATH 中可执行的 Python 3.9+（python.exe 或 py.exe -3）。")
+        raise ValueError("Windows 反重力钩子需要 PATH 中可执行的 Python 3.11+（python.exe 或 py.exe -3）。")
     executable = f'"{sys.executable}"' if os.name == "nt" else shlex.quote(sys.executable)
     return f"{executable} {flags}"
 
@@ -1613,6 +1501,11 @@ def _plan_codex_hooks(
     events = doc.setdefault("hooks", {})
     codex_path = codex_root.as_posix()
     quote_path = (lambda path: '"' + path + '"') if os.name == "nt" else shlex.quote
+    quote_exe = (
+        (lambda exe: f'"{exe}"' if Path(exe).is_absolute() or any(ch.isspace() for ch in exe) else exe)
+        if os.name == "nt" else shlex.quote
+    )
+    py_prefix_size = len(shlex.split(py_cmd, posix=(os.name != "nt")))
 
     candidates = _hook_python_candidates()
     classifications = {}
@@ -1677,11 +1570,15 @@ def _plan_codex_hooks(
                     if handler["command"] != desired[kind]["command"]:
                         if managed.interpreter is None or not _is_working_python_cmd(*managed.interpreter):
                             updated_handler = {**handler, "command": desired[kind]["command"]}
-                        elif kind == "gate" and managed.policy != (mode, compact_limit):
-                            # gate 尾部固定为脚本路径和八个策略参数，沿用其解释器与启动选项。
+                        else:
                             tokens = _codex_hook_tokens(handler)
-                            prefix = " ".join([quote_path(tokens[0]), *tokens[1:-9]])
-                            updated_handler = {**handler, "command": prefix + desired[kind]["command"][len(py_cmd):]}
+                            launcher = managed.interpreter[1]
+                            latest_args = _codex_hook_tokens(desired[kind])[py_prefix_size:]
+                            if (
+                                kind == "loader" and tokens[1:] != launcher + HOOK_PYTHON_FLAGS + latest_args
+                            ) or (kind == "gate" and managed.policy != (mode, compact_limit)):
+                                prefix = " ".join([quote_exe(tokens[0]), *launcher, *HOOK_PYTHON_FLAGS])
+                                updated_handler = {**handler, "command": prefix + desired[kind]["command"][len(py_cmd):]}
                     handlers.append(updated_handler)
                     retained.add(kind)
             retained.update(custom_slots)
@@ -1895,8 +1792,8 @@ def resolve_app_plan(
 def main() -> None:
     """先解析参数、完成双端预检，再按预演或正式安装路径执行。"""
     parser = argparse.ArgumentParser(description="Antigravity & Codex 统一工作流与双向协作安装器")
-    if sys.version_info < (3, 9):
-        parser.error("需要 Python 3.9 或更高版本")
+    if sys.version_info < (3, 11):
+        parser.error("需要 Python 3.11 或更高版本")
     parser.add_argument(
         "--app",
         choices=("auto", "both", "antigravity", "codex"),

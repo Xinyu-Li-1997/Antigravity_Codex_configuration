@@ -122,10 +122,8 @@ class HarnessTests(unittest.TestCase):
         expected = {'model': 'gpt-9-fixture#literal', 'model_context_window': 500000,
                     'model_auto_compact_token_limit': 450000, 'model_reasoning_effort': 'high'}
         self.assertEqual(harness._top_level_toml(path), expected)
-        with patch.object(harness, 'tomllib', None):
-            self.assertEqual(harness._top_level_toml(path), expected)
-            path.write_text("model_context_window = 500_000x\n'other' = 300\n", encoding='utf-8')
-            self.assertEqual(harness._top_level_toml(path), {})
+        path.write_text("model_context_window = 500_000x\n'other' = 300\n", encoding='utf-8')
+        self.assertEqual(harness._top_level_toml(path), {})
 
     def test_probe_context_metadata_belongs_to_selected_model(self):
         cache = {'models': [{'slug': 'catalog-first', 'priority': 1, 'context_window': 500000},
