@@ -1,0 +1,84 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "^(compact|resume)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/session_context_loader.py\" --client claude --state-dir \"~/.claude/hooks/state/session-context\" --log \"~/.claude/hooks/logs/session-context.jsonl\"",
+            "timeout": 45,
+            "statusMessage": "恢复本会话用户原话"
+          },
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/handoff_gate.py\" --client claude --mode advisory --compact-limit 0 --state-dir \"~/.claude/hooks/state/handoff\"",
+            "timeout": 10,
+            "statusMessage": "检查长会话交接状态"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/handoff_gate.py\" --client claude --mode advisory --compact-limit 0 --state-dir \"~/.claude/hooks/state/handoff\"",
+            "timeout": 10,
+            "statusMessage": "检查长会话交接状态"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/handoff_gate.py\" --client claude --mode advisory --compact-limit 0 --state-dir \"~/.claude/hooks/state/handoff\"",
+            "timeout": 10,
+            "statusMessage": "检查长会话交接状态"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/status_guard.py\" --client claude --state-dir \"~/.claude/hooks/state\" --log-dir \"~/.claude/hooks/logs\"",
+            "timeout": 15,
+            "statusMessage": "核验工作区边界与防空转门禁"
+          },
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/handoff_gate.py\" --client claude --mode advisory --compact-limit 0 --state-dir \"~/.claude/hooks/state/handoff\"",
+            "timeout": 10,
+            "statusMessage": "检查长会话交接状态"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/reply_repeat_guard.py\" --client claude --state-dir \"~/.claude/hooks/state\" --log-dir \"~/.claude/hooks/logs\"",
+            "timeout": 15,
+            "statusMessage": "检查重复状态回复"
+          },
+          {
+            "type": "command",
+            "command": "python3 -X utf8 -I -B \"~/.claude/hooks/handoff_gate.py\" --client claude --mode advisory --compact-limit 0 --state-dir \"~/.claude/hooks/state/handoff\"",
+            "timeout": 10,
+            "statusMessage": "检查长会话交接状态"
+          }
+        ]
+      }
+    ]
+  }
+}

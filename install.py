@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-  Antigravity & Codex 统一工程／科研工作流与双向协作一键安装器
+  Antigravity、Codex 与 Claude Code 工程／科研工作流安装器
 ================================================================================
 功能特性：
-1. 支持三种部署形态，自动探测本机已安装客户端并按需适配（--app auto|both|antigravity|codex）：
+1. 自动探测客户端并按需部署（--app auto|all|both|antigravity|codex|claude）：
    - 单反重力独立模式：部署 ~/.gemini/config/plugins/user-guard 全套插件（含双模压缩恢复与两阶段长会话交接停机门禁）、CLI 默认模型补缺与可选 Zotero MCP；
    - 单 Codex 独立模式：部署 ~/.codex/AGENTS.md（保留自定义本机硬件段）、agents/readonly-*.toml 只读子代理、
      hooks/ 原话压缩恢复和长会话交接钩子、config.toml 安全沙箱和默认模型补缺及可选 Zotero MCP；
-   - 双端完整协作模式：同时部署上述两套独立工作流，并同步双端共享的 cae-harness 跨平台派工与验收技能。
+   - both 保持反重力加 Codex；all 同时部署三端。Claude 可选集成本地路由器与 CC Switch 提示词清理。
 2. 当本机仅检测到单客户端时，清晰提示是否先安装另一方；选择不安装（或非交互 --yes）即单独配置当前客户端，零报错闭环。
-3. 提供 --probe-apps 纯只读环境探测 JSON 输出，供 Codex 或反重力读取仓库后自动引导自举配置。
+3. --probe-apps 探测客户端；--audit-upgrade 零写入检查资产、卡片与本地模型目录对齐状态。
 4. 以 -B 无字节码模式运行 tests/ 下全套离线与端到端回归测试。
 ================================================================================
 """
@@ -18,18 +18,22 @@
 import argparse
 import copy
 import datetime
+import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
 import stat
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import tomllib
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
+from types import ModuleType
+from urllib.parse import urlsplit
 
 # 全平台强制标准流为 UTF-8
 for _stream_name in ("stdin", "stdout", "stderr"):
@@ -58,6 +62,8 @@ TOML_ASSIGNMENT = re.compile(rf"^([ \t]*({TOML_KEY_PATH})[ \t]*=[ \t]*)(.*)$")
 HOOK_PYTHON_FLAGS = ["-X", "utf8", "-I", "-B"]
 LEGACY_PYTHON_FLAGS = ([], ["-B"], ["-I", "-B"], HOOK_PYTHON_FLAGS)
 HANDOFF_MARKER = re.compile(r"\[user-guard codex-handoff v1 mode=(advisory|enforce|off) compact_limit=([0-9]+)\]")
+CLAUDE_HOOK_SCRIPTS = ("user_words.py", "session_context_loader.py", "status_guard.py", "reply_repeat_guard.py", "handoff_gate.py")
+CLAUDE_RETIRED_SCRIPTS = ("background_status.py", "read_delegation_guard.py", "receipts_stop.py")
 
 
 def _is_mnt_windows_path(path_str: Optional[str]) -> bool:
@@ -539,8 +545,22 @@ class CodexConfig:
             updated = UTF8_BOM + updated
         return FileChange(self.path, self.original, updated) if updated != (self.original or b"") else None
 
+    def set_integer(self, key: str, value: int) -> None:
+        if key not in self.data:
+            self.add_defaults((), {key: str(value)})
+        elif self.data[key] != value:
+            lines, _, assignments = self._locations()
+            location = assignments.get((key,))
+            if location is None or not re.fullmatch(r"[0-9_]+[ \t]*(?:#.*)?", location[1][3]):
+                raise ValueError(f"{self.path} 的 {key} 不是可安全替换的非负整数")
+            index, assignment = location
+            suffix = re.sub(r"^[0-9_]+", "", assignment[3])
+            ending = lines[index][len(lines[index].rstrip("\r\n")):]
+            lines[index] = assignment[1] + str(value) + suffix + ending
+            self._update(lines)
 
-# 三、双端客户端、WSL 互操作与 Python / Zotero 探测
+
+# 三、客户端、WSL 互操作与 Python / Zotero 探测
 
 
 def _first_executable(candidates: List[Path], *, windows: bool = False) -> Optional[str]:
@@ -560,7 +580,7 @@ def _windows_app_binaries(home: Path, local_app: Path, name: str) -> Tuple[Optio
             local_app / "Programs" / "antigravity" / "Antigravity.exe",
             local_app / "Programs" / "Antigravity IDE" / "Antigravity IDE.exe",
         ]
-    else:
+    elif name == "codex":
         codex_dir = local_app / "OpenAI" / "Codex"
         cli = [home / ".local" / "bin" / "codex.exe", home / ".cargo" / "bin" / "codex.exe"]
         desktop = [codex_dir / "Codex.exe"]
@@ -569,6 +589,17 @@ def _windows_app_binaries(home: Path, local_app: Path, name: str) -> Tuple[Optio
                 cli += sorted(codex_dir.glob("bin/**/codex.exe"), reverse=True)
         except OSError:
             pass
+    elif name == "claude":
+        cli = [home / ".local" / "bin" / f"claude{suffix}" for suffix in (".exe", "")]
+        cli += [home / ".npm-global" / "bin" / f"claude{suffix}" for suffix in (".cmd", ".exe")]
+        cli += [home / "AppData" / "Roaming" / "npm" / "claude.cmd"]
+        desktop = []
+    elif name == "cc-switch":
+        cli = [local_app / "Programs" / "cc-switch" / "cc-switch.exe",
+               Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "CC Switch" / "cc-switch.exe"]
+        desktop = []
+    else:
+        return None, None
     return _first_executable(cli, windows=True), _first_executable(desktop, windows=True)
 
 
@@ -578,31 +609,55 @@ def _native_cli(name: str, home: Path) -> Optional[str]:
         local_cli, _ = _windows_app_binaries(home, local_app, name)
         return local_cli or shutil.which(f"{name}.exe") or shutil.which(name)
     candidates = [home / ".local" / "bin" / name]
-    candidates.insert(0, home / (".gemini" if name == "agy" else ".cargo") / "bin" / name)
+    if name in {"agy", "codex"}:
+        candidates.insert(0, home / (".gemini" if name == "agy" else ".cargo") / "bin" / name)
+    if name == "claude":
+        candidates.append(home / ".npm-global" / "bin" / name)
+    candidates += [Path("/usr/bin") / name, Path("/usr/local/bin") / name]
     found = _first_executable(candidates) or shutil.which(name)
     return found if found and not _is_mnt_windows_path(found) and not found.lower().endswith(".exe") else None
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
 def _find_windows_codex_package() -> Tuple[Optional[str], Optional[str]]:
-    """读取当前用户的 Codex 应用包注册，不启动应用或 CLI。"""
-    powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-    if not powershell.is_file():
+    """通过注册表只读读取当前用户的 Codex 应用包位置，不启动外部进程且零磁盘写入。"""
+    if not _is_windows():
         return None, None
     try:
-        result = subprocess.run(
-            [str(powershell), "-NoProfile", "-NonInteractive", "-Command",
-             "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
-             "(Get-AppxPackage -Name OpenAI.Codex).InstallLocation"],
-            capture_output=True, text=True, encoding="utf-8", timeout=5,
-        )
-        location = result.stdout.strip()
-        if result.returncode != 0 or not location:
-            return None, None
-        app = Path(location) / "app"
-        return (_first_executable([app / "resources" / "codex.exe"], windows=True),
-                _first_executable([app / "Codex.exe"], windows=True))
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None, None
+        import winreg
+
+        key_path = r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages"
+        locations: List[Tuple[Tuple[int, ...], str]] = []
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as root_key:
+            count = winreg.QueryInfoKey(root_key)[0]
+            for idx in range(count):
+                try:
+                    sub_name = winreg.EnumKey(root_key, idx)
+                except OSError:
+                    continue
+                if not sub_name.lower().startswith("openai.codex_"):
+                    continue
+                try:
+                    with winreg.OpenKey(root_key, sub_name) as sub_key:
+                        loc, _ = winreg.QueryValueEx(sub_key, "PackageRootFolder")
+                except OSError:
+                    continue
+                if isinstance(loc, str) and loc.strip():
+                    parts = sub_name.split("_")
+                    ver = tuple(int(part) for part in parts[1].split(".") if part.isdigit()) if len(parts) > 1 else ()
+                    locations.append((ver, loc.strip()))
+        for _, location in sorted(locations, reverse=True):
+            app = Path(location) / "app"
+            cli = _first_executable([app / "resources" / "codex.exe"], windows=True)
+            desktop = _first_executable([app / "Codex.exe"], windows=True)
+            if cli or desktop:
+                return cli, desktop
+    except (ImportError, OSError, ValueError):
+        pass
+    return None, None
 
 
 def _probe_wsl_windows_profile_dir() -> Optional[Path]:
@@ -672,7 +727,7 @@ def _probe_windows_wsl() -> Dict[str, Any]:
 
     # --exec 不加载交互配置，不运行被探测的 CLI。
     script = (
-        'for name in agy codex; do '
+        'for name in agy codex claude cc-switch; do '
         '  bin=$(command -v "$name"); '
         '  for candidate in "$HOME/.gemini/bin/$name" "$HOME/.local/bin/$name" "$HOME/.cargo/bin/$name"; do '
         '    if [ -f "$candidate" ] && [ -x "$candidate" ]; then bin=$candidate; break; fi; '
@@ -681,7 +736,9 @@ def _probe_windows_wsl() -> Dict[str, Any]:
         '  trace=false; '
         '  if [ "$name" = agy ]; then '
         '    [ -d "$HOME/.gemini/config" ] || [ -d "$HOME/.gemini/antigravity-cli" ] || [ -d "$HOME/.gemini/antigravity" ]; '
-        '  else [ -d "$HOME/.codex" ]; fi && trace=true; '
+        '  elif [ "$name" = codex ]; then [ -d "$HOME/.codex" ]; '
+        '  elif [ "$name" = claude ]; then [ -d "$HOME/.claude" ]; '
+        '  else [ -f "$HOME/.cc-switch/cc-switch.db" ]; fi && trace=true; '
         '  printf "%s\\t%s\\t%s\\n" "$name" "$bin" "$trace"; '
         'done'
     )
@@ -697,7 +754,7 @@ def _probe_windows_wsl() -> Dict[str, Any]:
                 continue
             for line in probe.stdout.splitlines():
                 fields = line.split("\t")
-                if len(fields) == 3 and fields[0] in {"agy", "codex"}:
+                if len(fields) == 3 and fields[0] in {"agy", "codex", "claude", "cc-switch"}:
                     name, binary, trace = fields
                     result["apps"].setdefault(name, []).append(
                         {"distro": distro, "binary": binary or None, "config_dir_exists": trace == "true"}
@@ -712,12 +769,14 @@ def _probe_windows_wsl() -> Dict[str, Any]:
 
 def detect_installed_apps() -> Dict[str, Any]:
     """
-    只读探测当前运行环境的 Antigravity 与 Codex 安装状态（区分本侧原生与跨子系统互操作）。
+    只读探测 Antigravity、Codex、Claude Code 与 CC Switch（区分本侧原生与跨子系统互操作）。
     """
     home = Path.home()
     gemini_root = home / ".gemini"
     configured_codex = os.environ.get("CODEX_HOME", "").strip()
     codex_root = Path(configured_codex).expanduser() if configured_codex else (home / ".codex")
+    claude_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude").expanduser()
+    cc_db = home / ".cc-switch" / "cc-switch.db"
 
     wsl = _is_wsl()
     windows_home = _probe_wsl_windows_profile_dir() if wsl else None
@@ -744,7 +803,8 @@ def detect_installed_apps() -> Dict[str, Any]:
             if windows_home is not None:
                 known_cli, win_desktop = _windows_app_binaries(windows_home, windows_home / "AppData" / "Local", name)
                 win_cli = win_cli or known_cli
-                trace = (windows_home / (".gemini" if name == "agy" else ".codex")).is_dir()
+                config_name = {"agy": ".gemini", "codex": ".codex", "claude": ".claude", "cc-switch": ".cc-switch"}[name]
+                trace = (windows_home / config_name).is_dir()
             evidence.append({"binary": win_cli, "desktop_binary": win_desktop, "config_dir_exists": trace})
         elif wsl_probe is not None:
             evidence = wsl_probe["apps"].get(name, [])
@@ -765,16 +825,25 @@ def detect_installed_apps() -> Dict[str, Any]:
 
     ag = app_info("agy", any((gemini_root / sub).is_dir() for sub in ("antigravity", "antigravity-cli", "config")))
     cx = app_info("codex", codex_root.is_dir())
+    cl = app_info("claude", claude_root.is_dir())
+    cc = app_info("cc-switch", cc_db.is_file())
     ag["target_plugin_dir"] = str(gemini_root / "config" / "plugins" / "user-guard")
     cx["target_codex_home"] = str(codex_root)
+    cl["target_claude_home"] = str(claude_root)
+    cc.update(db_path=str(cc_db), db_exists=cc_db.is_file())
     ag_native, cx_native = ag["native_installed"], cx["native_installed"]
+    cl_native = cl["native_installed"]
 
-    if ag_native and cx_native:
+    if cl_native and (ag_native or cx_native):
+        recommended = "all"
+    elif ag_native and cx_native:
         recommended = "both"
     elif ag_native:
         recommended = "antigravity"
     elif cx_native:
         recommended = "codex"
+    elif cl_native:
+        recommended = "claude"
     else:
         recommended = "none"
 
@@ -787,11 +856,13 @@ def detect_installed_apps() -> Dict[str, Any]:
         "wsl_probe": wsl_probe,
         "antigravity": ag,
         "codex": cx,
+        "claude": cl,
+        "cc_switch": cc,
         "zotero_mcp_detected": zotero_exe,
         "recommended_app_mode": recommended,
         "single_app_only_on_host": (
-            (ag_native and not cx_native and cx["interop_status"] == "not_detected")
-            or (cx_native and not ag_native and ag["interop_status"] == "not_detected")
+            sum(bool(info["native_installed"]) for info in (ag, cx, cl)) == 1
+            and all(info["native_installed"] or info["interop_status"] == "not_detected" for info in (ag, cx, cl))
         ),
     }
 
@@ -1208,19 +1279,13 @@ def _apply_codex_frontier_max(
         print(f"[*] 未读取到有效的 Codex 模型目录 {cache_path}，默认模型设置保持原样。")
         return
 
-    def supported_levels(model: Dict[str, Any]) -> List[Dict[str, Any]]:
-        raw_levels = model.get("supported_reasoning_levels")
-        if not isinstance(raw_levels, list):
-            return []
-        return [level for level in raw_levels if isinstance(level, dict) and level.get("effort") in EFFORT_ORDER]
-
     if cur_model and not overwrite:
         selected = next((model for model in models if model["slug"] == cur_model), None)
     else:
         visible = [model for model in models if model.get("visibility") != "hide"] or models
         if cur_effort and not overwrite:
-            visible = [model for model in visible if any(level["effort"] == cur_effort for level in supported_levels(model))]
-        selected = min(
+            visible = [model for model in visible if cur_effort in _model_efforts(model)]
+        selected = _latest_codex_model(visible, "sol") or _latest_codex_model(visible, "astra") or min(
             visible,
             key=lambda model: model["priority"] if type(model.get("priority")) is int else 9999,
             default=None,
@@ -1230,10 +1295,7 @@ def _apply_codex_frontier_max(
         return
 
     slug = selected["slug"]
-    efforts = [
-        level["effort"] for level in supported_levels(selected)
-        if level["effort"] != "ultra" and "delegation" not in str(level.get("description") or "").lower()
-    ]
+    efforts = _model_efforts(selected)
     effort = cur_effort if cur_effort and not overwrite else max(efforts, key=EFFORT_ORDER.index, default="")
     if not effort:
         print(f"[*] Codex 模型 {slug} 缺少可用的非委派推理挡位元数据，未补齐挡位。")
@@ -1243,6 +1305,37 @@ def _apply_codex_frontier_max(
     for key, value in zip(keys, (slug, effort)):
         if value and value != values.get(key, "").strip():
             editor.set_string(key, value)
+    maximum = _model_window(selected)
+    if maximum is not None and (overwrite or "model_context_window" not in editor.data):
+        editor.set_integer("model_context_window", maximum)
+
+
+def _model_generation(slug: str) -> Tuple[int, ...]:
+    match = re.search(r"(?:gpt|gemini)[- ](\d+(?:\.\d+)*)", slug, re.I)
+    return tuple(map(int, match[1].split("."))) if match else ()
+
+
+def _latest_codex_model(models: List[Dict[str, Any]], family: str) -> Optional[Dict[str, Any]]:
+    candidates = [item for item in models if re.fullmatch(rf"gpt-\d+(?:\.\d+)*-{family}", item["slug"], re.I)
+                  and item.get("visibility") != "hide"]
+    return max(candidates, key=lambda item: _model_generation(item["slug"]), default=None)
+
+
+def _model_window(model: Dict[str, Any]) -> Optional[int]:
+    for key in ("max_context_window", "context_window"):
+        value = model.get(key)
+        if type(value) is int and value > 0:
+            return value
+    return None
+
+
+def _model_efforts(model: Dict[str, Any]) -> List[str]:
+    levels = model.get("supported_reasoning_levels", model.get("supported_efforts", []))
+    if not isinstance(levels, list):
+        return []
+    return [effort for level in levels for effort in [level.get("effort") if isinstance(level, dict) else level]
+            if effort in EFFORT_ORDER and effort != "ultra"
+            and not (isinstance(level, dict) and "delegation" in str(level.get("description", "")).lower())]
 
 
 def _apply_codex_workspace_boundary(editor: "CodexConfig") -> None:
@@ -1310,6 +1403,10 @@ def _sync_codex_workspace_boundary(codex_root: Path, dry_run: bool = False) -> N
 
 
 def _sync_codex_global_rules(template_rules_path: Path, codex_root: Path, dry_run: bool = False) -> None:
+    _sync_global_rules(template_rules_path, codex_root / "AGENTS.md", "Codex", dry_run)
+
+
+def _sync_global_rules(template_rules_path: Path, rules_path: Path, label: str, dry_run: bool) -> None:
     """更新工程规则，保留末尾自定义『## 工具与本机』段的原文及换行。"""
     if not template_rules_path.is_file():
         return
@@ -1319,7 +1416,7 @@ def _sync_codex_global_rules(template_rules_path: Path, codex_root: Path, dry_ru
     template_env = env_sec_re.search(template_text)
     template_core = template_text[:template_env.start()].rstrip() if template_env else template_text.rstrip()
 
-    codex_agents = codex_root / "AGENTS.md"
+    codex_agents = rules_path
     original = _read_optional_bytes(codex_agents)
     existing = _decode_utf8(codex_agents, original or b"")
 
@@ -1336,7 +1433,7 @@ def _sync_codex_global_rules(template_rules_path: Path, codex_root: Path, dry_ru
         merged = (template_text.rstrip() + "\n").replace("\n", newline)
 
     if existing == merged:
-        print("[*] Codex 全局规则 AGENTS.md 已是最新状态。")
+        print(f"[*] {label} 全局规则 {rules_path.name} 已是最新状态。")
         return
 
     if dry_run:
@@ -1345,7 +1442,7 @@ def _sync_codex_global_rules(template_rules_path: Path, codex_root: Path, dry_ru
 
     content = (UTF8_BOM if (original or b"").startswith(UTF8_BOM) else b"") + merged.encode("utf-8")
     _atomic_write(FileChange(codex_agents, original, content))
-    print(f"[+] 已同步更新 Codex 全局规则 {codex_agents}")
+    print(f"[+] 已同步更新 {label} 全局规则 {codex_agents}")
 
 
 def _sync_codex_agents(codex_template_dir: Path, codex_root: Path, dry_run: bool = False) -> None:
@@ -1710,7 +1807,579 @@ def _validate_codex_assets(
         _validate_tree_links(pycache)
 
 
-# 六、CLI 参数、预演与主安装流程
+# 六、Claude Code、路由器与 CC Switch 同步
+
+
+def _sync_claude_global_rules(template_rules_path: Path, claude_root: Path, dry_run: bool = False) -> None:
+    _sync_global_rules(template_rules_path, claude_root / "CLAUDE.md", "Claude Code", dry_run)
+
+
+def _sync_claude_agents(claude_template_dir: Path, claude_root: Path, dry_run: bool = False) -> None:
+    for source in sorted((claude_template_dir / "agents").glob("readonly-*.md")):
+        target = claude_root / "agents" / source.name
+        original = _read_optional_bytes(target)
+        content = source.read_bytes()
+        if original != content:
+            _apply_file_change(FileChange(target, original, content), dry_run)
+
+
+def _claude_hook_tokens(handler: Dict[str, Any]) -> List[str]:
+    if handler.get("type") != "command" or not isinstance(handler.get("command"), str):
+        return []
+    args = handler.get("args")
+    if isinstance(args, list) and all(isinstance(arg, str) for arg in args):
+        return [handler["command"].strip('"'), *args]
+    return _codex_hook_tokens(handler)
+
+
+def _claude_managed_script(handler: Dict[str, Any], claude_root: Path) -> Optional[str]:
+    tokens = _claude_hook_tokens(handler)
+    if len(tokens) < 2:
+        return None
+    exe_name = Path(tokens[0]).name.lower()
+    if not re.fullmatch(r"(?:python(?:\d+(?:\.\d+)*)?|py)(?:\.exe)?", exe_name):
+        return None
+    idx = 2 if tokens[1:2] == ["-3"] else 1
+    while idx < len(tokens):
+        if tokens[idx] == "-X" and idx + 1 < len(tokens):
+            idx += 2
+        elif tokens[idx] in {"-I", "-B", "-u", "-S", "-E", "-s"}:
+            idx += 1
+        else:
+            break
+    if idx >= len(tokens):
+        return None
+    target = tokens[idx]
+    name = Path(target).name
+    if name in (*CLAUDE_HOOK_SCRIPTS, *CLAUDE_RETIRED_SCRIPTS):
+        try:
+            if _same_nonlink_path(Path(target).expanduser(), claude_root / "hooks" / name):
+                return name
+        except (OSError, RuntimeError, ValueError):
+            return None
+    return None
+
+
+def _claude_handoff_policy(
+    handlers: List[Dict[str, Any]], mode: Optional[str], compact_limit: Optional[int],
+) -> Tuple[str, int]:
+    policies = set()
+    for handler in handlers:
+        tokens = _claude_hook_tokens(handler)
+        try:
+            old_mode = tokens[tokens.index("--mode") + 1]
+            old_limit = tokens[tokens.index("--compact-limit") + 1]
+            if old_mode in {"advisory", "enforce", "off"} and re.fullmatch(r"[0-9]+", old_limit):
+                policies.add((old_mode, int(old_limit)))
+        except (ValueError, IndexError):
+            continue
+    modes, limits = {item[0] for item in policies}, {item[1] for item in policies}
+    if (mode is None and len(modes) > 1) or (compact_limit is None and len(limits) > 1):
+        raise ValueError("Claude 交接策略不一致，请显式指定 --claude-handoff-mode 和 --claude-handoff-compactions")
+    return mode or next(iter(modes), "advisory"), compact_limit if compact_limit is not None else next(iter(limits), 0)
+
+
+def _plan_claude_settings(
+    settings_path: Path, template_path: Path, py_cmd: str,
+    mode: Optional[str] = None, compact_limit: Optional[int] = None, *,
+    include_hooks: bool = True, include_model: bool = True, overwrite_model: bool = False,
+    verify_interpreters: bool = True,
+) -> CodexHooksPlan:
+    """按目标脚本路径迁移托管钩子，其余设置及第三方 handler 保持原值。"""
+    original = _read_optional_bytes(settings_path)
+    doc = _read_json_object(settings_path, original)
+    initial = copy.deepcopy(doc)
+    claude_root = settings_path.parent.resolve()
+    env = doc.get("env", {})
+    if not isinstance(env, dict):
+        raise ValueError(f"{settings_path} 的 env 必须是对象")
+    if include_model:
+        if overwrite_model or "effortLevel" not in doc:
+            doc["effortLevel"] = "xhigh"
+        if overwrite_model:
+            env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
+    if include_hooks:
+        events = doc.setdefault("hooks", {})
+        if not isinstance(events, dict):
+            raise ValueError(f"{settings_path} 的 hooks 必须是对象")
+        defaults = _read_json_object(template_path, template_path.read_bytes())["hooks"]
+        managed = {}
+        prefixes = {}
+        verified = {}
+        gates = []
+        for event, groups in events.items():
+            if not isinstance(groups, list) or any(
+                not isinstance(group, dict) or not isinstance(group.get("hooks"), list)
+                or any(not isinstance(handler, dict) for handler in group["hooks"]) for group in groups
+            ):
+                raise ValueError(f"{settings_path} 的 {event} 必须包含钩子组与 handler 对象列表")
+            for group in groups:
+                for handler in group["hooks"]:
+                    name = _claude_managed_script(handler, claude_root)
+                    if name is None:
+                        continue
+                    managed[id(handler)] = name
+                    if name == "handoff_gate.py":
+                        gates.append(handler)
+                    tokens = _claude_hook_tokens(handler)
+                    executable = tokens[0]
+                    launcher = ["-3"] if tokens[1:2] == ["-3"] else []
+                    resolved = executable if Path(executable).is_absolute() else shutil.which(executable)
+                    if resolved and verify_interpreters:
+                        key = (resolved, tuple(launcher))
+                        if key not in verified:
+                            verified[key] = _is_working_python_cmd(resolved, launcher)
+                        if verified[key]:
+                            quote = ((lambda value: '"' + value + '"' if Path(value).is_absolute() or any(c.isspace() for c in value) else value)
+                                     if os.name == "nt" else shlex.quote)
+                            prefixes.setdefault(name, " ".join([quote(executable), *launcher, *HOOK_PYTHON_FLAGS]))
+        # 关闭模式通过现有托管钩子中不含 gate 的状态沿用，无需添加非标准 settings 字段。
+        modern = any("args" not in handler and "--client" in tokens
+                     and tokens[2 if tokens[1:2] == ["-3"] else 1:][:4] == HOOK_PYTHON_FLAGS
+                     for groups in events.values() for group in groups for handler in group["hooks"]
+                     if id(handler) in managed for tokens in [_claude_hook_tokens(handler)])
+        if mode is None and managed and modern and not gates:
+            mode = "off"
+        mode, compact_limit = _claude_handoff_policy(gates, mode, compact_limit)
+        for event, groups in list(events.items()):
+            retained = []
+            canonical_matcher = defaults.get(event, [{}])[0].get("matcher")
+            for group in groups:
+                handlers = [handler for handler in group["hooks"] if id(handler) not in managed]
+                canonical = event in defaults and group.get("matcher") == canonical_matcher
+                if handlers or not group["hooks"] or canonical:
+                    retained.append({**group, "hooks": handlers})
+            if retained:
+                events[event] = retained
+            else:
+                events.pop(event, None)
+        quote_path = (lambda value: '"' + value + '"') if os.name == "nt" else shlex.quote
+        for event, groups in defaults.items():
+            default_group = groups[0]
+            desired = []
+            for handler in default_group["hooks"]:
+                command = handler["command"]
+                name = next(name for name in CLAUDE_HOOK_SCRIPTS if name in command)
+                if name == "handoff_gate.py" and mode == "off":
+                    continue
+                command = command[command.index('"~/.claude/'):]
+                command = re.sub(r'"~/.claude/([^"\n]+)"',
+                                 lambda match: quote_path(claude_root.as_posix() + "/" + match[1]), command)
+                command = command.replace("--mode advisory --compact-limit 0", f"--mode {mode} --compact-limit {compact_limit}")
+                desired.append({**handler, "command": prefixes.get(name, next(iter(prefixes.values()), py_cmd)) + " " + command})
+            if not desired:
+                continue
+            existing = events.setdefault(event, [])
+            target = next((group for group in existing if group.get("matcher") == default_group.get("matcher")), None)
+            if target is None:
+                target = {key: value for key, value in default_group.items() if key != "hooks"}
+                target["hooks"] = []
+                existing.append(target)
+            target["hooks"].extend(desired)
+    else:
+        mode, compact_limit = mode or "advisory", compact_limit or 0
+    content = _preserve_text_format(_json_bytes(doc), original)
+    return CodexHooksPlan(FileChange(settings_path, original, content) if doc != initial else None, mode, compact_limit)
+
+
+def _claude_hook_script_names(mode: str) -> List[str]:
+    return [name for name in CLAUDE_HOOK_SCRIPTS if mode != "off" or name != "handoff_gate.py"]
+
+
+def _sync_claude_hooks(
+    source_hooks: Path, claude_root: Path, plan: CodexHooksPlan, dry_run: bool = False,
+) -> None:
+    hooks_dir = claude_root / "hooks"
+    for name in _claude_hook_script_names(plan.mode):
+        target = hooks_dir / name
+        original, content = _read_optional_bytes(target), (source_hooks / name).read_bytes()
+        if original != content:
+            _apply_file_change(FileChange(target, original, content), dry_run)
+    retired = list(CLAUDE_RETIRED_SCRIPTS) + (["handoff_gate.py"] if plan.mode == "off" else [])
+    for name in retired:
+        target = _validate_path(hooks_dir / name, directory=False)
+        if target.exists():
+            if dry_run:
+                print(f"[Dry-Run CLEAN] 将清理 Claude 废弃钩子 {target}")
+            else:
+                target.unlink()
+    cache = hooks_dir / "__pycache__"
+    _validate_tree_links(cache)
+    if cache.is_dir():
+        if dry_run:
+            print(f"[Dry-Run CLEAN] 将清理 {cache}")
+        else:
+            shutil.rmtree(cache)
+    _apply_file_change(plan.change, dry_run)
+
+
+def _cc_router_files(template_dir: Path, claude_root: Path) -> List[Tuple[Path, Path]]:
+    pairs = [(source, claude_root / "router" / source.name) for source in _template_files(template_dir)]
+    primary = claude_root / "router" / "router.json"
+    if not primary.exists():
+        pairs.append((template_dir / ("router.windows.json" if os.name == "nt" else "router.wsl.json"), primary))
+    return pairs
+
+
+def _sync_cc_router(template_dir: Path, claude_root: Path, dry_run: bool = False) -> None:
+    for source, target in _cc_router_files(template_dir, claude_root):
+        original, content = _read_optional_bytes(target), source.read_bytes()
+        if content != original:
+            _apply_file_change(FileChange(target, original, content), dry_run)
+        if not dry_run and target.suffix in {".sh", ".py"} and os.name != "nt":
+            if stat.S_IMODE(target.stat().st_mode) != 0o755:
+                target.chmod(0o755)
+
+
+def _load_ccswitch_admin(repo_root: Path) -> ModuleType:
+    source = repo_root / "template" / "claude" / "router" / "ccswitch_admin.py"
+    module = ModuleType("installer_ccswitch_admin")
+    module.__file__ = str(source)
+    # 不通过导入缓存落盘，即使调用方没有启用 -B，体检也保持零写入。
+    exec(compile(source.read_bytes(), str(source), "exec"), module.__dict__)
+    return module
+
+
+def _validate_claude_assets(repo_root: Path, claude_root: Path, args: argparse.Namespace, mode: str) -> None:
+    _validate_tree_links(claude_root)
+    sources = []
+    if not args.no_claude_rules:
+        sources.append((repo_root / "template/user-guard/rules/AGENTS.md", claude_root / "CLAUDE.md"))
+    if not args.no_claude_agents:
+        sources.extend((source, claude_root / "agents" / source.name)
+                       for source in (repo_root / "template/claude/agents").glob("readonly-*.md"))
+    if not args.no_claude_hooks:
+        sources.extend((repo_root / "template/user-guard/hooks" / name, claude_root / "hooks" / name)
+                       for name in _claude_hook_script_names(mode))
+    if args.with_cc_router:
+        sources.extend(_cc_router_files(repo_root / "template/claude/router", claude_root))
+    for source, target in sources:
+        _decode_utf8(source, _validate_path(source, directory=False).read_bytes())
+        original = _read_optional_bytes(target)
+        if target.name == "CLAUDE.md":
+            _decode_utf8(target, original or b"")
+
+
+# 七、零写入升级体检
+
+
+def _audit_cli(info: Dict[str, Any]) -> Dict[str, Any]:
+    report = {key: info.get(key) for key in (
+        "native_installed", "native_binary", "native_desktop_binary", "native_status", "interop_status",
+    )}
+    report["version"] = None
+    binary = info.get("native_binary")
+    if binary:
+        try:
+            cmd = (
+                [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", binary, "--version"]
+                if os.name == "nt" and str(binary).lower().endswith((".cmd", ".bat"))
+                else [binary, "--version"]
+            )
+            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3)
+            match = re.search(r"\b\d+(?:\.\d+){1,3}(?:-[A-Za-z0-9.]+)?\b", proc.stdout or "")
+            if proc.returncode == 0 and match:
+                report["version"] = match[0]
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return report
+
+
+def _rules_core(raw: bytes) -> str:
+    text = raw.decode("utf-8-sig").replace("\r\n", "\n")
+    return re.split(r"^##[ \t]+工具与[^\n]*", text, maxsplit=1, flags=re.MULTILINE)[0].rstrip()
+
+
+def _audit_redact(value: Any, roots: List[Tuple[Path, str]], secrets: Set[str]) -> Any:
+    if isinstance(value, dict):
+        return {_audit_redact(key, roots, secrets): _audit_redact(item, roots, secrets) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_audit_redact(item, roots, secrets) for item in value]
+    if not isinstance(value, str):
+        return value
+    for secret in sorted(secrets, key=len, reverse=True):
+        if secret:
+            value = value.replace(secret, "<redacted>")
+    for path, label in sorted(roots, key=lambda item: len(str(item[0])), reverse=True):
+        for variant in {str(path), path.as_posix()}:
+            value = re.sub(re.escape(variant), lambda match: label, value, flags=re.IGNORECASE if os.name == "nt" else 0)
+    # URL 仅保留服务端点；查询串、片段与 userinfo 均不进入报告。
+    def endpoint(match: re.Match) -> str:
+        try:
+            parsed = urlsplit(match[0])
+            host = parsed.hostname or ""
+            if ":" in host:
+                host = "[" + host + "]"
+            return f"{parsed.scheme}://{host}" + (f":{parsed.port}" if parsed.port else "") + parsed.path
+        except ValueError:
+            return "<redacted-url>"
+    value = re.sub(r"https?://[^\s\"<>]+", endpoint, value)
+    value = re.sub(r"(?i)(?:[A-Z]:[/\\]Users[/\\]|/(?:home|Users)/)[^/\\\s]+", "<home>", value)
+    value = re.sub(r"(?i)\b(?:sk-[A-Za-z0-9_-]{12,}|Bearer\s+[^\s]+)", "<redacted>", value)
+    return value
+
+
+def audit_upgrade_status(
+    repo_root: Optional[Path] = None, target_plugin_dir: Optional[Path] = None,
+    codex_root: Optional[Path] = None, claude_root: Optional[Path] = None,
+    ccswitch_db: Optional[Path] = None, *, detection: Optional[Dict[str, Any]] = None,
+    is_sandbox_run: bool = False, app_scope: str = "auto", expect_cc_router: bool = False,
+) -> Dict[str, Any]:
+    """只读本地资产、模型目录和卡片状态；不刷新目录、不修改配置。"""
+    explicit_ag = target_plugin_dir is not None
+    explicit_cx = codex_root is not None
+    explicit_cl = claude_root is not None
+    explicit_cc = ccswitch_db is not None
+    repo_root = Path(repo_root or Path(__file__).resolve().parent)
+    home = Path.home()
+    target_plugin_dir = Path(target_plugin_dir or home / ".gemini/config/plugins/user-guard")
+    codex_root = Path(codex_root or os.environ.get("CODEX_HOME") or home / ".codex")
+    claude_root = Path(claude_root or os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude")
+    ccswitch_db = Path(ccswitch_db or home / ".cc-switch/cc-switch.db")
+    target_plugin_dir, codex_root, claude_root, ccswitch_db = (
+        path.expanduser().absolute() for path in (target_plugin_dir, codex_root, claude_root, ccswitch_db)
+    )
+    detection = detect_installed_apps() if detection is None else detection
+    errors: Dict[str, str] = {}
+    secrets: Set[str] = set()
+    template = repo_root / "template/user-guard"
+
+    def collect_secrets(doc: Any) -> None:
+        if isinstance(doc, dict):
+            for key, value in doc.items():
+                if re.search(r"(?i)(?:auth|api.?key|secret|password|(?:^|_)token(?:$|_))", key):
+                    if isinstance(value, str) and value not in {"via-router", "present", "missing"}:
+                        secrets.add(value)
+                collect_secrets(value)
+        elif isinstance(doc, list):
+            for item in doc:
+                collect_secrets(item)
+
+    def read_json(path: Path) -> Dict[str, Any]:
+        try:
+            result = _read_json_object(path, _read_optional_bytes(path))
+            collect_secrets(result)
+            return result
+        except (OSError, ValueError, RuntimeError) as exc:
+            errors[str(path)] = type(exc).__name__
+            return {}
+
+    def read_raw(path: Path) -> Optional[bytes]:
+        try:
+            return _read_optional_bytes(path)
+        except (OSError, ValueError, RuntimeError) as exc:
+            errors[str(path)] = type(exc).__name__
+            return None
+
+    def drift(root: Path, sources: List[Tuple[Path, str]], *, core_rules: bool = False) -> List[str]:
+        result = []
+        for source, relative in sources:
+            actual = read_raw(root / relative)
+            expected = source.read_bytes()
+            try:
+                equal = actual is not None and (_rules_core(actual) == _rules_core(expected) if core_rules and relative.endswith(".md") and "/" not in relative else actual == expected)
+            except UnicodeError:
+                equal = False
+            if not equal:
+                result.append(relative)
+        return result
+
+    repo_version = read_json(template / "plugin.json").get("version")
+    ag = _audit_cli(detection.get("antigravity", {}))
+    ag.update(plugin_exists=target_plugin_dir.is_dir(), installed_version=read_json(target_plugin_dir / "plugin.json").get("version"))
+    version_tuple = lambda value: tuple(int(part) for part in re.findall(r"\d+", str(value or "")))
+    ag["upgrade_recommended"] = version_tuple(ag["installed_version"]) < version_tuple(repo_version)
+    ag_sources = [(source, source.relative_to(template).as_posix()) for source in _template_files(template)
+                  if source.relative_to(template).parts[0] in {"rules", "hooks", "agents"}]
+    ag["drift_files"] = drift(target_plugin_dir, ag_sources)
+    installed_ag_hooks = read_json(target_plugin_dir / "hooks.json")
+    try:
+        lifecycle = installed_ag_hooks["user-guard-lifecycle"]
+        first = next(iter(lifecycle.values()))[0]
+        prefix = first.get("hooks", [first])[0]["command"].partition(" ./hooks/")[0]
+        if installed_ag_hooks != json.loads(_agy_hooks_bytes((template / "hooks.json").read_bytes(), prefix)):
+            ag["drift_files"].append("hooks.json")
+    except (KeyError, IndexError, TypeError, ValueError):
+        ag["drift_files"].append("hooks.json")
+    gemini_root = target_plugin_dir.parent.parent.parent if target_plugin_dir.parent.name == "plugins" else target_plugin_dir.parent
+    ag_settings = read_json(gemini_root / "antigravity-cli/settings.json")
+    ag_desktop = read_json(gemini_root / "config/config.json").get("userSettings", {})
+    desktop_model = ag_desktop.get("model") if isinstance(ag_desktop, dict) else None
+    ag["configured_model"] = ag_settings.get("model") or desktop_model or read_json(gemini_root / "antigravity/settings.json").get("model")
+    ag_models = read_json(gemini_root / "antigravity-cli/cache/cae_models_cache.json").get("models", [])
+    if not ag_models:
+        ag_models = read_json(gemini_root / "antigravity/cache/cae_models_cache.json").get("models", [])
+    if not isinstance(ag_models, list):
+        ag_models = []
+    ag_models = [item for item in ag_models if isinstance(item, dict) and isinstance(item.get("slug"), str)]
+    ag["model_catalog"] = [{"slug": item["slug"], "generation": list(_model_generation(item["slug"])),
+                             "declared_max_context_window": _model_window(item), "supported_efforts": _model_efforts(item)} for item in ag_models]
+    carbon = [item for item in ag_models if "carbon" in item["slug"].lower() and not item["slug"].endswith("-ultra")]
+    latest_carbon = max((_model_generation(item["slug"]) for item in carbon), default=())
+    carbon = [item for item in carbon if _model_generation(item["slug"]) == latest_carbon]
+    ag["recommended_carbon_variants"] = [item["slug"] for item in carbon]
+    ag["carbon_supported_efforts"] = sorted({item["slug"].rsplit("-", 1)[-1] for item in carbon
+                                             if item["slug"].rsplit("-", 1)[-1] in EFFORT_ORDER}, key=EFFORT_ORDER.index)
+    ag["retiring_models"] = [item["slug"] for item in ag_models if re.search(r"claude[- ]?4[.-]6|gpt[- ]oss[- ]120b", item["slug"], re.I)]
+    if isinstance(ag["configured_model"], str) and re.search(r"claude[- ]?4[.-]6|gpt[- ]oss[- ]120b", ag["configured_model"], re.I):
+        ag["retiring_models"].append(ag["configured_model"])
+    ag["catalog_source"] = "local_cache"
+
+    cx = _audit_cli(detection.get("codex", {}))
+    config_path = codex_root / "config.toml"
+    try:
+        config = _parse_toml(_decode_utf8(config_path, read_raw(config_path) or b""), config_path)
+        collect_secrets(config)
+    except ValueError as exc:
+        errors[str(config_path)] = type(exc).__name__
+        config = {}
+    cx.update({key: config.get(key) for key in ("model", "model_reasoning_effort", "model_context_window")})
+    cx_models = read_json(codex_root / "models_cache.json").get("models", [])
+    cx_models = [item for item in cx_models if isinstance(item, dict) and isinstance(item.get("slug"), str)] if isinstance(cx_models, list) else []
+    sol, astra = _latest_codex_model(cx_models, "sol"), _latest_codex_model(cx_models, "astra")
+    selected = sol or astra
+    current = next((item for item in cx_models if item["slug"] == cx["model"]), None)
+    family = "astra" if re.fullmatch(r"gpt-\d+(?:\.\d+)*-astra", str(cx["model"])) else "sol"
+    latest = (astra if family == "astra" else sol) or selected
+    cx["latest_sol_slug"], cx["latest_astra_slug"] = (sol or {}).get("slug"), (astra or {}).get("slug")
+    cx["declared_max_context_window"] = _model_window(latest or {})
+    cx["supported_efforts"] = _model_efforts(latest or {})
+    reasons = []
+    if latest is None:
+        reasons.append("本地模型目录缺少 Sol / Astra，需刷新客户端目录后复查")
+    else:
+        if current is None or current["slug"] != latest["slug"]:
+            reasons.append("当前默认模型与本地目录的最新同系列模型不一致")
+        if cx["declared_max_context_window"] is not None and cx["model_context_window"] != cx["declared_max_context_window"]:
+            reasons.append("声明上下文窗口未对齐")
+        best_effort = max(cx["supported_efforts"], key=EFFORT_ORDER.index, default=None)
+        if best_effort is None or cx["model_reasoning_effort"] != best_effort:
+            reasons.append("思考强度未对齐目录中的最高单模型挡位")
+    cx.update(model_aligned=not reasons, upgrade_recommended=bool(reasons), alignment_reasons=reasons, catalog_source="local_cache")
+    codex_doc = read_json(codex_root / "hooks.json")
+    marker = HANDOFF_MARKER.search(str(codex_doc.get("description", "")))
+    codex_mode = marker[1] if marker else "advisory"
+    cx_sources = [(template / "rules/AGENTS.md", "AGENTS.md")]
+    cx_sources += [(source, "agents/" + source.name) for source in (repo_root / "template/codex/agents").glob("*.toml")]
+    cx_sources += [(template / "hooks" / name, "hooks/" + name) for name in _codex_hook_script_names(codex_mode)]
+    cx["drift_files"] = drift(codex_root, cx_sources, core_rules=True)
+    if not isinstance(codex_doc.get("hooks"), dict) or not codex_doc["hooks"].get("SessionStart"):
+        cx["drift_files"].append("hooks.json")
+
+    cl = _audit_cli(detection.get("claude", {}))
+    settings_path = claude_root / "settings.json"
+    settings = read_json(settings_path)
+    env = settings.get("env", {})
+    env = env if isinstance(env, dict) else {}
+    cl.update(effortLevel=settings.get("effortLevel"), locked_effort_env="CLAUDE_CODE_EFFORT_LEVEL" in env,
+              model_mapping={key: env.get(key) for key in ("ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_MAX_CONTEXT_TOKENS")})
+    claude_mode = "advisory"
+    try:
+        plan = _plan_claude_settings(settings_path, repo_root / "template/claude/hooks.json", "python3 -X utf8 -I -B",
+                                    include_model=False, verify_interpreters=False)
+        claude_mode = plan.mode
+        expected_doc = json.loads(plan.change.content) if plan.change else settings
+        def hook_layout(doc: Dict[str, Any]) -> List[Any]:
+            result = []
+            for event, groups in doc.get("hooks", {}).items():
+                for group in groups:
+                    for handler in group["hooks"]:
+                        name = _claude_managed_script(handler, claude_root)
+                        if name:
+                            tokens = _claude_hook_tokens(handler)
+                            prefix_end = 2 if tokens[1:2] == ["-3"] else 1
+                            result.append((event, group.get("matcher"), name, tokens[prefix_end:], "args" in handler))
+            return sorted(result, key=repr)
+        cl["hooks_aligned"] = settings_path.is_file() and hook_layout(settings) == hook_layout(expected_doc)
+    except (OSError, ValueError, TypeError, KeyError):
+        cl["hooks_aligned"] = False
+    cl_sources = [(template / "rules/AGENTS.md", "CLAUDE.md")]
+    cl_sources += [(source, "agents/" + source.name) for source in (repo_root / "template/claude/agents").glob("readonly-*.md")]
+    cl_sources += [(template / "hooks" / name, "hooks/" + name) for name in _claude_hook_script_names(claude_mode)]
+    cl["drift_files"] = drift(claude_root, cl_sources, core_rules=True)
+    cl["drift_files"].extend("hooks/" + name for name in CLAUDE_RETIRED_SCRIPTS if read_raw(claude_root / "hooks" / name) is not None)
+    if not cl["hooks_aligned"]:
+        cl["drift_files"].append("settings.json")
+    router_sources = [(source, source.name) for source in _template_files(repo_root / "template/claude/router")]
+    router_drift = drift(claude_root / "router", router_sources)
+    cl["router"] = {"installed": (claude_root / "router/router.py").is_file(), "drift_files": router_drift,
+                    "config_exists": (claude_root / "router/router.json").is_file(),
+                    "template_hashes": {relative: hashlib.sha256(source.read_bytes()).hexdigest() for source, relative in router_sources}}
+
+    if app_scope == "all":
+        ag_active, cx_active, cl_active = True, True, True
+    elif app_scope == "both":
+        ag_active, cx_active, cl_active = True, True, False
+    elif app_scope == "antigravity":
+        ag_active, cx_active, cl_active = True, False, False
+    elif app_scope == "codex":
+        ag_active, cx_active, cl_active = False, True, False
+    elif app_scope == "claude":
+        ag_active, cx_active, cl_active = False, False, True
+    elif explicit_ag or explicit_cx or explicit_cl:
+        ag_active, cx_active, cl_active = explicit_ag, explicit_cx, explicit_cl
+    else:
+        ag_active = bool(ag.get("native_installed") or target_plugin_dir.is_dir())
+        cx_active = bool(cx.get("native_installed") or codex_root.is_dir())
+        cl_active = bool(cl.get("native_installed") or claude_root.is_dir())
+        if not (ag_active or cx_active or cl_active):
+            ag_active = cx_active = cl_active = True
+
+    cc = _audit_cli(detection.get("cc_switch", {}))
+    port = 8240 if os.name == "nt" else 8241
+    card_uses_router = False
+    try:
+        admin = _load_ccswitch_admin(repo_root)
+        cc.update(admin.inspect_status(ccswitch_db, settings_path))
+        current_card = cc.get("current_claude_card") or {}
+        card_uses_router = current_card.get("base_url") == f"http://127.0.0.1:{port}"
+        if cl_active and (card_uses_router or (not is_sandbox_run and (expect_cc_router or cl["router"]["installed"]))):
+            cc.update(admin.inspect_status(ccswitch_db, settings_path, router_port=port))
+    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+        cc.update(db_exists=ccswitch_db.is_file(), schema_version=None, enabled_prompts=[], inspection_error=type(exc).__name__)
+    cc["default_router_port"] = port
+    router_active = cl_active and bool(
+        expect_cc_router or cl["router"]["installed"] or cl["router"]["config_exists"] or card_uses_router
+    )
+    cc_active = cl_active and bool(not is_sandbox_run or explicit_cc or ccswitch_db.is_file())
+    actions = []
+    if ag_active:
+        if ag["drift_files"] or ag["upgrade_recommended"]:
+            actions.append("sync_antigravity_plugin")
+        if ag["retiring_models"]:
+            actions.append("review_antigravity_models")
+    if cx_active:
+        if cx["drift_files"]:
+            actions.append("sync_codex")
+        if cx["upgrade_recommended"]:
+            actions.append("sync_codex_model_defaults" if latest else "refresh_codex_model_catalog")
+    if cl_active:
+        if cl["drift_files"]:
+            actions.append("sync_claude")
+        if cl["effortLevel"] != "xhigh" or cl["locked_effort_env"]:
+            actions.append("sync_claude_model_defaults")
+    if router_active and (router_drift or not cl["router"]["config_exists"]):
+        actions.append("sync_cc_router")
+    if cc_active:
+        if cc.get("enabled_prompts"):
+            actions.append("disable_ccswitch_prompts")
+        if cc.get("settings_aligned") is False:
+            actions.append("align_ccswitch_card")
+        if (card_uses_router or expect_cc_router) and cc.get("router_health") and not cc["router_health"].get("ok"):
+            actions.append("start_cc_router")
+        if cc.get("inspection_error"):
+            actions.append("inspect_ccswitch_schema")
+    if errors:
+        actions.append("repair_unreadable_configs")
+    report = {"plugin_version": repo_version,
+              "host": {"platform": sys.platform, "python_version": sys.version.split()[0], "is_wsl": detection.get("is_wsl"), "wsl_probe": detection.get("wsl_probe")},
+              "antigravity": ag, "codex": cx, "claude": cl, "cc_switch": cc,
+              "summary": {"all_aligned": not actions, "recommended_actions": actions}, "read_errors": errors}
+    roots = [(home, "~"), (target_plugin_dir, "<antigravity>"), (codex_root, "<codex>"), (claude_root, "<claude>"), (repo_root, "<repo>")]
+    return _audit_redact(report, roots, secrets)
+
+
+# 八、CLI 参数、预演与主安装流程
 
 
 def _confirm_single_app_install(
@@ -1803,23 +2472,60 @@ def resolve_app_plan(
     sys.exit(2)
 
 
+def resolve_multi_app_plan(
+    app_arg: str, has_explicit_ag: bool, has_explicit_cx: bool, has_explicit_cl: bool,
+    detection: Dict[str, Any], interactive: bool, auto_yes: bool, dry_run: bool,
+) -> Tuple[bool, bool, bool]:
+    explicit = {"all": (True, True, True), "both": (True, True, False),
+                "antigravity": (True, False, False), "codex": (False, True, False), "claude": (False, False, True)}
+    if app_arg in explicit:
+        return explicit[app_arg]
+    if has_explicit_ag or has_explicit_cx or has_explicit_cl:
+        return bool(has_explicit_ag), bool(has_explicit_cx), bool(has_explicit_cl)
+    names = ("antigravity", "codex", "claude")
+    installed = tuple(bool(detection.get(name, {}).get("native_installed")) for name in names)
+    if sum(installed) >= 2:
+        return installed
+    if not any(installed):
+        print("[!] 未检测到本侧客户端，请先安装客户端或显式指定 --app。", file=sys.stderr)
+        sys.exit(2)
+    missing = [name for name, native in zip(names, installed) if not native]
+    if any(detection.get(name, {}).get("interop_available") or detection.get(name, {}).get("interop_status") == "unknown" for name in missing):
+        print("[*] 对侧客户端可用或状态未确认，本次只配置已检测到的本侧客户端。")
+        return installed
+    label = names[installed.index(True)]
+    if not _confirm_single_app_install(label, " / ".join(missing), interactive, auto_yes, dry_run):
+        sys.exit(0)
+    return installed
+
+
 def main() -> None:
-    """先解析参数、完成双端预检，再按预演或正式安装路径执行。"""
-    parser = argparse.ArgumentParser(description="Antigravity & Codex 统一工作流与双向协作安装器")
+    """先解析参数、完成各端预检，再按预演或正式安装路径执行。"""
+    parser = argparse.ArgumentParser(description="Antigravity、Codex 与 Claude Code 统一工作流安装器")
     if sys.version_info < (3, 11):
         parser.error("需要 Python 3.11 或更高版本")
     parser.add_argument(
         "--app",
-        choices=("auto", "both", "antigravity", "codex"),
+        choices=("auto", "all", "both", "antigravity", "codex", "claude"),
         default="auto",
-        help="目标客户端模式：auto（默认自动检测，单端提示确认）、both（双端全配）、antigravity（仅配反重力）、codex（仅配 Codex）",
+        help="auto 按已安装集合配置；both 仅反重力加 Codex；all 配置三端；也可单独指定客户端",
     )
-    parser.add_argument("--probe-apps", action="store_true", help="纯只读探测本机反重力、Codex 与 Zotero 安装状态并输出 JSON")
+    parser.add_argument("--probe-apps", action="store_true", help="只读探测反重力、Codex、Claude Code、CC Switch 与 Zotero，输出 JSON")
+    parser.add_argument("--audit-upgrade", action="store_true", help="零写入全栈升级与本地模型目录对齐体检，输出 JSON")
     parser.add_argument("-y", "--yes", action="store_true", help="非交互自动确认（仅检测到单客户端时直接单独配置已安装的一端）")
     parser.add_argument("--target-dir", type=str, default="",
                         help="自定义反重力插件目录。配置 Zotero 时须采用 <配置目录>/plugins/user-guard 布局")
     parser.add_argument("--codex-home", type=str, default="", help="自定义 Codex 主配置目录（默认 $CODEX_HOME 或 ~/.codex，用于沙箱全量验证）")
     parser.add_argument("--codex-skills-dir", default="", help="仅自定义 Codex 技能根目录（其下安装 cae-harness，兼容隔离验证）")
+    parser.add_argument("--claude-home", default="", help="Claude Code 主目录（默认 $CLAUDE_CONFIG_DIR 或 ~/.claude）")
+    parser.add_argument("--no-claude-rules", action="store_true", help="跳过 Claude 全局 CLAUDE.md")
+    parser.add_argument("--no-claude-agents", action="store_true", help="跳过 Claude 只读子代理")
+    parser.add_argument("--no-claude-hooks", action="store_true", help="跳过 Claude 钩子同步")
+    parser.add_argument("--claude-handoff-mode", choices=("advisory", "enforce", "off"), help="首次默认 advisory，升级沿用已有策略")
+    parser.add_argument("--claude-handoff-compactions", type=int, help="首次默认 0，升级沿用已有阈值")
+    parser.add_argument("--with-cc-router", action="store_true", help="同步 Claude 本地路由器并保留已有 router.json")
+    parser.add_argument("--ccswitch-db", default="", help="自定义 CC Switch 数据库路径")
+    parser.add_argument("--disable-ccswitch-prompts", action="store_true", help="在线备份并禁用陈旧提示词，支持预演")
     parser.add_argument("--dry-run", action="store_true", help="演练模式，仅打印同步与配置计划不实际写入")
     parser.add_argument("--skip-test", action="store_true", help="跳过安装后的全套自动化回归测试")
     parser.add_argument("--no-zotero", action="store_true", help="跳过本机可选 Zotero MCP 自动探测与配置")
@@ -1840,6 +2546,21 @@ def main() -> None:
 
     if args.codex_handoff_compactions is not None and args.codex_handoff_compactions < 0:
         parser.error("--codex-handoff-compactions 必须为非负整数")
+    if args.claude_handoff_compactions is not None and args.claude_handoff_compactions < 0:
+        parser.error("--claude-handoff-compactions 必须为非负整数")
+
+    repo_root = Path(__file__).resolve().parent
+    is_sandbox_run = bool(args.target_dir or args.codex_home or args.codex_skills_dir or args.claude_home)
+    if args.audit_upgrade:
+        report = audit_upgrade_status(
+            repo_root, Path(args.target_dir) if args.target_dir else None,
+            Path(args.codex_home) if args.codex_home else None,
+            Path(args.claude_home) if args.claude_home else None,
+            Path(args.ccswitch_db) if args.ccswitch_db else None, is_sandbox_run=is_sandbox_run,
+            app_scope=args.app, expect_cc_router=args.with_cc_router,
+        )
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return
 
     if args.probe_apps:
         try:
@@ -1859,10 +2580,17 @@ def main() -> None:
         parser.error("--app antigravity 模式下不应指定 --codex-home 或 --codex-skills-dir")
     if args.app == "both" and bool(args.target_dir) != bool(args.codex_home or args.codex_skills_dir):
         parser.error("--app both 指定自定义目标目录时，须同时提供反重力 --target-dir 与 Codex 目录参数，避免误改另一端真实主目录")
+    if args.app == "claude" and (args.target_dir or args.codex_home or args.codex_skills_dir):
+        parser.error("--app claude 不能指定反重力或 Codex 目标目录")
+    if args.app in {"codex", "antigravity", "both"} and args.claude_home:
+        parser.error(f"--app {args.app} 不能指定 --claude-home")
+    if args.app == "all" and is_sandbox_run and not (args.target_dir and (args.codex_home or args.codex_skills_dir) and args.claude_home):
+        parser.error("--app all 自定义安装必须同时提供 --target-dir、Codex 目录与 --claude-home")
 
     repo_root = Path(__file__).resolve().parent
     template_dir = repo_root / "template" / "user-guard"
     codex_template_dir = repo_root / "template" / "codex"
+    claude_template_dir = repo_root / "template" / "claude"
     tests_dir = repo_root / "tests"
 
     if not template_dir.is_dir():
@@ -1875,16 +2603,15 @@ def main() -> None:
 
     has_explicit_ag = bool(args.target_dir)
     has_explicit_cx = bool(args.codex_home or args.codex_skills_dir)
+    has_explicit_cl = bool(args.claude_home)
     try:
-        detection = detect_installed_apps() if args.app == "auto" and not (has_explicit_ag or has_explicit_cx) else {}
+        detection = detect_installed_apps() if args.app == "auto" and not (has_explicit_ag or has_explicit_cx or has_explicit_cl) else {}
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     is_interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
 
-    install_ag, install_cx = resolve_app_plan(
-        args.app,
-        has_explicit_ag_target=has_explicit_ag,
-        has_explicit_cx_target=has_explicit_cx,
+    install_ag, install_cx, install_cl = resolve_multi_app_plan(
+        args.app, has_explicit_ag=has_explicit_ag, has_explicit_cx=has_explicit_cx, has_explicit_cl=has_explicit_cl,
         detection=detection,
         interactive=is_interactive,
         auto_yes=args.yes,
@@ -1894,6 +2621,13 @@ def main() -> None:
     default_config_root = Path.home() / ".gemini" / "config"
     configured_codex_env = os.environ.get("CODEX_HOME", "").strip()
     default_codex_root = Path(configured_codex_env).expanduser() if configured_codex_env else (Path.home() / ".codex")
+    default_claude_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+    claude_root = Path(args.claude_home).expanduser().absolute() if args.claude_home else default_claude_root.absolute()
+    claude_root = claude_root if install_cl else None
+    ccswitch_db = Path(args.ccswitch_db).expanduser().absolute() if args.ccswitch_db else Path.home() / ".cc-switch/cc-switch.db"
+    disable_prompts = args.disable_ccswitch_prompts and (not is_sandbox_run or bool(args.ccswitch_db))
+    if args.with_cc_router and not install_cl:
+        parser.error("--with-cc-router 需要选择 Claude 安装")
 
     target_plugin_dir: Optional[Path] = None
     if install_ag:
@@ -1917,7 +2651,6 @@ def main() -> None:
             if not args.no_codex_skill:
                 target_skill_dir = codex_root / "skills" / "cae-harness"
 
-    is_sandbox_run = bool(args.target_dir or args.codex_home or args.codex_skills_dir)
     zotero_exe: Optional[str] = None
     if not args.no_zotero and (not is_sandbox_run or args.zotero_cmd):
         try:
@@ -1935,11 +2668,13 @@ def main() -> None:
     agy_zotero_change = None
     agy_model_changes: List[FileChange] = []
     py_cmd = None
+    claude_settings_plan = None
+    ccswitch_admin = None
     try:
         agy_config_root = None
         if target_plugin_dir is not None:
             target_plugin_dir = validate_install_target(target_plugin_dir, repo_root)
-            for forbidden_codex in {default_codex_root.resolve(), (Path.home().resolve() / ".codex")}:
+            for forbidden_codex in {default_codex_root.resolve(), (Path.home().resolve() / ".codex"), default_claude_root.resolve()}:
                 if target_plugin_dir == forbidden_codex or forbidden_codex in target_plugin_dir.parents:
                     raise ValueError(f"反重力插件目标目录不能位于 Codex 配置目录内: {target_plugin_dir}")
             _validate_mirror(template_dir, target_plugin_dir)
@@ -1956,31 +2691,30 @@ def main() -> None:
                 agy_config_root = config_root
         if codex_root is not None:
             codex_root = validate_codex_home_target(codex_root, repo_root)
+            if codex_root == default_claude_root.resolve() or default_claude_root.resolve() in codex_root.parents:
+                raise ValueError("Codex 目录不能位于 Claude 配置目录内")
             if not args.no_codex_skill:
                 target_skill_dir = codex_root / "skills" / "cae-harness"
         if target_skill_dir is not None:
             target_skill_dir = validate_install_target(target_skill_dir, repo_root)
             _validate_mirror(template_dir / "skills" / "cae-harness", target_skill_dir)
-        if target_plugin_dir is not None and target_skill_dir is not None:
-            if (
-                target_skill_dir == target_plugin_dir
-                or target_skill_dir in target_plugin_dir.parents
-                or target_plugin_dir in target_skill_dir.parents
-            ):
-                raise ValueError("反重力插件与 Codex 技能安装目标不能相互包含")
-        if target_plugin_dir is not None and codex_root is not None:
-            if (
-                codex_root == target_plugin_dir
-                or codex_root in target_plugin_dir.parents
-                or target_plugin_dir in codex_root.parents
-            ):
-                raise ValueError("反重力插件与 Codex 主配置目录不能相互包含")
+        if claude_root is not None:
+            claude_root = validate_codex_home_target(claude_root, repo_root)
+            if claude_root == default_codex_root.resolve() or default_codex_root.resolve() in claude_root.parents:
+                raise ValueError("Claude 目录不能位于 Codex 配置目录内")
+        targets = [path for path in (target_plugin_dir, codex_root, claude_root, target_skill_dir) if path is not None]
+        for index, left in enumerate(targets):
+            for right in targets[index + 1:]:
+                if left == codex_root and right == target_skill_dir:
+                    continue  # Codex 自带的 skills/cae-harness 是明确约定的从属资产。
+                if left == right or left in right.parents or right in left.parents:
+                    raise ValueError("不同客户端的安装目标不能相互包含")
         if agy_config_root is not None:
             mcp_path = agy_config_root / "mcp_config.json"
             if mcp_path in {codex_root, target_skill_dir}:
                 raise ValueError(f"反重力 Zotero 配置文件与 Codex 目标目录冲突: {mcp_path}")
             agy_zotero_change = _plan_user_zotero(agy_config_root, zotero_exe)
-        if target_plugin_dir is not None or (codex_root is not None and not args.no_codex_hooks):
+        if target_plugin_dir is not None or (codex_root is not None and not args.no_codex_hooks) or (claude_root is not None and not args.no_claude_hooks):
             py_cmd = detect_hook_python_command(antigravity=target_plugin_dir is not None)
         if target_plugin_dir is not None:
             agy_hooks = _agy_hooks_bytes((template_dir / "hooks.json").read_bytes(), py_cmd)
@@ -1995,20 +2729,28 @@ def main() -> None:
                 codex_root, include_sandbox=not args.no_sandbox_config, include_model=not args.no_model_config,
                 overwrite_model=args.sync_model_defaults, zotero_exe=zotero_exe,
             )
+        if claude_root is not None:
+            claude_settings_plan = _plan_claude_settings(
+                claude_root / "settings.json", claude_template_dir / "hooks.json", py_cmd or "", args.claude_handoff_mode,
+                args.claude_handoff_compactions, include_hooks=not args.no_claude_hooks,
+                include_model=not args.no_model_config, overwrite_model=args.sync_model_defaults,
+            )
+            _validate_claude_assets(repo_root, claude_root, args, claude_settings_plan.mode)
+        if disable_prompts:
+            _validate_path(ccswitch_db, directory=False)
+            ccswitch_admin = _load_ccswitch_admin(repo_root)
+            # 先只读验证 schema，再写入客户端资产；预演不备份、不改库。
+            ccswitch_admin.disable_prompts(ccswitch_db, dry_run=True)
         if target_plugin_dir == (default_config_root / "plugins" / "user-guard").absolute() and not args.no_model_config:
             agy_model_changes = _plan_agy_model(
                 default_config_root.parent, dry_run=args.dry_run, overwrite=args.sync_model_defaults,
             )
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, sqlite3.Error) as exc:
         parser.error(str(exc))
-    mode_desc = (
-        "双端完整配置（反重力 + Codex 独立工作流及双向协作）"
-        if (install_ag and install_cx)
-        else ("单反重力独立工作流配置" if install_ag else "单 Codex 独立工作流配置")
-    )
+    mode_desc = " + ".join(name for name, enabled in (("反重力", install_ag), ("Codex", install_cx), ("Claude Code", install_cl)) if enabled)
 
     print("=" * 80)
-    print("  Antigravity & Codex 统一工作流与协作安装程序")
+    print("  Antigravity、Codex 与 Claude Code 统一工作流安装程序")
     print("=" * 80)
     print(f"[*] 仓库根目录   : {repo_root}")
     print(f"[*] 部署目标模式 : {mode_desc}")
@@ -2018,6 +2760,8 @@ def main() -> None:
         print(f"[*] 反重力插件路径: {target_plugin_dir}")
     if codex_root is not None:
         print(f"[*] Codex 主目录 : {codex_root}")
+    if claude_root is not None:
+        print(f"[*] Claude 主目录: {claude_root}")
     if target_skill_dir is not None:
         print(f"[*] Codex 技能路径: {target_skill_dir}")
     print("-" * 80)
@@ -2044,7 +2788,23 @@ def main() -> None:
                 if codex_hooks_plan is not None:
                     _sync_codex_hooks(template_dir / "hooks", codex_root, codex_hooks_plan, dry_run=args.dry_run)
                 _apply_file_change(codex_config_change, args.dry_run)
-    except (OSError, ValueError) as exc:
+        if claude_root is not None:
+            if not args.no_claude_rules:
+                _sync_claude_global_rules(template_dir / "rules/AGENTS.md", claude_root, args.dry_run)
+            if not args.no_claude_agents:
+                _sync_claude_agents(claude_template_dir, claude_root, args.dry_run)
+            if not args.no_claude_hooks:
+                _sync_claude_hooks(template_dir / "hooks", claude_root, claude_settings_plan, args.dry_run)
+            else:
+                _apply_file_change(claude_settings_plan.change, args.dry_run)
+            if args.with_cc_router:
+                _sync_cc_router(claude_template_dir / "router", claude_root, args.dry_run)
+        if disable_prompts:
+            result = ccswitch_admin.disable_prompts(ccswitch_db, dry_run=args.dry_run)
+            print(f"[*] CC Switch 提示词处理: {len(result['disabled'])} 条；备份: {result['backup']}")
+        elif args.disable_ccswitch_prompts:
+            print("[*] 沙箱未显式指定 --ccswitch-db，跳过宿主提示词数据库。")
+    except (OSError, ValueError, sqlite3.Error) as exc:
         print(f"[!] 配置同步失败: {exc}", file=sys.stderr)
         sys.exit(1)
 

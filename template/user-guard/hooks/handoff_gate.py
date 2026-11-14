@@ -1855,39 +1855,168 @@ def _codex_tool_kind(payload: Dict[str, Any]) -> Tuple[str, List[Path]]:
     return "mutating_other", []
 
 
+def _reconcile_claude_compactions(payload: Dict[str, Any], transcript: Path, state: Dict[str, Any]) -> None:
+    """增量登记边界；同一边界的 PostCompact / SessionStart 观察只计一次。"""
+    ledger = state.setdefault("claudeCompactionLedger", {"files": {}, "records": {}, "observations": {}})
+    if not isinstance(ledger, dict) or any(not isinstance(ledger.get(key), dict)
+                                          for key in ("files", "records", "observations")):
+        raise ValueError("Claude 压缩对账状态格式错误，保留原文件")
+    issues = []
+    path_key = _path_key(transcript)
+    cursor = ledger["files"].get(path_key, {})
+    records = ledger["records"]
+    observations = ledger["observations"]
+    new_boundaries = []
+    with transcript.open("rb") as stream:
+        stat = os.fstat(stream.fileno())
+        identity = [stat.st_dev, stat.st_ino]
+        if not isinstance(cursor, dict) or type(cursor.get("offset", 0)) is not int or cursor.get("offset", 0) < 0:
+            raise ValueError("Claude 压缩轨迹游标格式错误")
+        offset = cursor.get("offset", 0)
+        stream.seek(max(0, offset - 128))
+        anchor = hashlib.sha256(stream.read(min(128, offset))).hexdigest()
+        if cursor.get("identity") != identity or offset > stat.st_size or cursor.get("anchor") != anchor:
+            offset = 0
+            cursor = {"identity": identity, "occurrences": {}}
+        if not isinstance(cursor.get("occurrences"), dict):
+            raise ValueError("Claude 压缩轨迹出现次数格式错误")
+        stream.seek(offset)
+        while stream.tell() < stat.st_size:
+            row_offset = stream.tell()
+            raw = stream.readline(stat.st_size - row_offset)
+            if not raw.endswith(b"\n"):
+                stream.seek(row_offset)
+                issues.append("Claude 轨迹末尾记录待写完")
+                break
+            if not raw.strip():
+                continue
+            try:
+                entry = json.loads(user_words.decode_jsonl_line(raw))
+            except (ValueError, RecursionError):
+                cursor["unreadable"] = True
+                continue
+            if (not isinstance(entry, dict) or entry.get("isSidechain") is True
+                    or entry.get("type") != "system"
+                    or entry.get("subtype") not in ("compact_boundary", "microcompact_boundary")):
+                continue
+            digest = hashlib.sha256(raw.strip()).hexdigest()
+            occurrence = cursor["occurrences"].get(digest, 0) + 1
+            cursor["occurrences"][digest] = occurrence
+            key = str(entry.get("uuid") or entry.get("id") or f"{digest}:{occurrence}")
+            if key not in records:
+                records[key] = {"path": str(transcript), "offset": row_offset}
+                new_boundaries.append(key)
+            cursor["latestBoundary"] = key
+        offset = stream.tell()
+        stream.seek(max(0, offset - 128))
+        anchor = hashlib.sha256(stream.read(min(128, offset))).hexdigest()
+        cursor.update(offset=offset, anchor=anchor)
+        ledger["files"][path_key] = cursor
+    if cursor.get("unreadable"):
+        issues.append("Claude 轨迹存在不可解析记录")
+    # 先到达的 hook 观察在边界刷盘后并入对应记录，避免两套来源相加。
+    pending = [key for key, value in observations.items() if not value]
+    for pending_key, boundary in zip(pending, new_boundaries):
+        observations[pending_key] = boundary
+    event = payload["hook_event_name"]
+    if event == "PostCompact" or (event == "SessionStart" and payload.get("source") == "compact"):
+        latest = cursor.get("latestBoundary", "")
+        observation_key = latest or str(payload.get("compact_id") or payload.get("event_id") or "pending_snapshot")
+        observations.setdefault(observation_key, latest)
+    fallback = sum(not value for value in observations.values())
+    state["compactionCount"] = max(state.get("compactionCount", 0), len(records) + fallback)
+    state.update(compactionRecordCount=len(records), compactionFallbackCount=fallback,
+                 compactionIssues=issues, compactionIdentity="claude_boundary" if records else "hook_snapshot")
+
+
+def _claude_handoff_targets(raw_paths: List[str], cwd: str) -> List[Path]:
+    if not cwd or not raw_paths:
+        return []
+    base = Path(cwd).resolve()
+    targets = []
+    for raw in raw_paths:
+        path = _resolve_candidate_path(raw, cwd)
+        resolved = path.resolve()
+        if (not path.is_relative_to(base) or not resolved.is_relative_to(base)
+                or resolved.suffix.lower() not in (".md", ".markdown", ".txt", ".rst")
+                or not HANDOFF_FILENAME_RE.search(resolved.name)):
+            return []
+        targets.append(path)
+    return targets
+
+
+def _claude_tool_kind(payload: Dict[str, Any]) -> Tuple[str, List[Path]]:
+    name = str(payload.get("tool_name") or "").strip()
+    args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    cwd = str(payload.get("cwd") or "")
+    if name in ("Agent", "Task", "Subagent"):
+        return "blocked_always", []
+    if name in ("Read", "Grep", "Glob", "LS", "ToolSearch", "TodoRead", "TodoWrite", "AskUserQuestion"):
+        return "readonly", []
+    if name in ("Write", "Edit", "MultiEdit"):
+        targets = _claude_handoff_targets([str(args.get("file_path") or args.get("path") or "")], cwd)
+        if targets:
+            return "handoff_document", targets
+    if name in ("Bash", "PowerShell"):
+        command = str(args.get("command") or "")
+        kind = _classify_run_command(command)
+        if kind != "mutating_other":
+            return kind, []
+        redirects = re.compile(r'''(?<![>])(?:\d*)>{1,2}(?![>&])\s*("[^"]+"|'[^']+'|[^\s;|&<>]+)''')
+        raw_paths = [match[1].strip("\"'") for match in redirects.finditer(command)]
+        if raw_paths and _classify_run_command(redirects.sub("", command)) == "readonly_inspect":
+            targets = _claude_handoff_targets(raw_paths, cwd)
+            if targets:
+                return "handoff_document", targets
+    return "mutating_other", []
+
+
 def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "advisory",
                          compact_limit: int = 0) -> Dict[str, Any]:
     """Codex 原生协议入口。advisory 永不阻断；enforce 只采用显式策略。"""
+    return _handle_native_handoff(payload, state_dir, mode, compact_limit, "codex")
+
+
+def handle_claude_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "advisory",
+                          compact_limit: int = 0) -> Dict[str, Any]:
+    """Claude 原生生命周期入口；Stop 只补正一次，不使用 Codex 停机字段。"""
+    return _handle_native_handoff(payload, state_dir, mode, compact_limit, "claude")
+
+
+def _handle_native_handoff(payload: Dict[str, Any], state_dir: Path, mode: str,
+                           compact_limit: int, client: str) -> Dict[str, Any]:
+    label = "Claude" if client == "claude" else "Codex"
     event = str(payload.get("hook_event_name") or "")
     if event not in CODEX_EVENTS or mode == "off":
         return {}
     if mode not in ("advisory", "enforce") or type(compact_limit) is not int or compact_limit < 0:
-        raise ValueError("无效的 Codex 交接策略")
-    sid, transcript, identity_error, skip = user_words.codex_hook_session(payload)
+        raise ValueError(f"无效的 {label} 交接策略")
+    resolver = user_words.claude_hook_session if client == "claude" else user_words.codex_hook_session
+    sid, transcript, identity_error, skip = resolver(payload)
     if skip:
         return {}
     if transcript is None:
-        return {"systemMessage": f"Codex 长会话门禁未更新。{identity_error}。"}
+        return {"systemMessage": f"{label} 长会话门禁未更新。{identity_error}。"}
     state_dir = Path(state_dir)
     with user_words.session_state_lock(state_dir, sid):
         state_path = _gate_state_path(state_dir, sid)
         if state_path.exists():
             state = json.loads(state_path.read_text(encoding="utf-8-sig"))
-            if (not isinstance(state, dict) or state.get("client") != "codex" or state.get("version") != 1
+            if (not isinstance(state, dict) or state.get("client") != client or state.get("version") != 1
                     or state.get("conversationId") != sid or not isinstance(state.get("observedEvents"), list)
                     or state.get("phase") not in ("normal", "advisory", "drain", "freeze", "overridden")):
-                raise ValueError("Codex 门禁状态格式不兼容，保留原文件")
+                raise ValueError(f"{label} 门禁状态格式不兼容，保留原文件")
             for key, expected in (("drainActionsRemaining", int), ("overrideUntilCount", int),
                                   ("lastUserEvent", str), ("stopCorrectionRequested", bool), ("handoffRecorded", bool)):
                 if type(state.get(key)) is not expected:
-                    raise ValueError(f"Codex 门禁状态字段 {key} 格式错误")
+                    raise ValueError(f"{label} 门禁状态字段 {key} 格式错误")
             if state["drainActionsRemaining"] < 0:
-                raise ValueError("Codex 排空动作预算不能为负数")
+                raise ValueError(f"{label} 排空动作预算不能为负数")
             for key in ("toolDecisions", "handoffFileBaselines"):
                 if key in state and not isinstance(state[key], dict):
-                    raise ValueError(f"Codex 门禁状态字段 {key} 必须为对象")
+                    raise ValueError(f"{label} 门禁状态字段 {key} 必须为对象")
         else:
-            state = {"client": "codex", "version": 1, "conversationId": sid, "phase": "normal",
+            state = {"client": client, "version": 1, "conversationId": sid, "phase": "normal",
                      "compactionKeys": [], "compactionCount": 0, "observedEvents": [],
                      "drainActionsRemaining": CODEX_DRAIN_ACTIONS, "overrideUntilCount": -1,
                      "lastUserEvent": "", "stopCorrectionRequested": False, "handoffRecorded": False}
@@ -1896,7 +2025,10 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
         state.update(mode=mode, compactLimit=compact_limit, lastModel=str(payload.get("model") or "unknown"))
         if mode == "advisory" and state["phase"] in ("drain", "freeze"):
             state["phase"] = "advisory"
-        _reconcile_codex_compactions(payload, transcript, state)
+        if client == "claude":
+            _reconcile_claude_compactions(payload, transcript, state)
+        else:
+            _reconcile_codex_compactions(payload, transcript, state)
         if state["phase"] == "normal" and (event == "PostCompact" or state["compactionCount"]):
             state["phase"] = "advisory"
         count = state["compactionCount"]
@@ -1907,7 +2039,7 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
         user_event_is_new = False
         prompt = str(payload.get("prompt") or "").strip() if event == "UserPromptSubmit" else ""
         if prompt and not payload.get("stop_hook_active"):
-            turn = str(payload.get("turn_id") or "")
+            turn = str(payload.get("turn_id") or payload.get("uuid") or payload.get("event_id") or transcript.stat().st_size)
             user_key = turn + ":" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
             user_event_is_new = user_key != state["lastUserEvent"]
             if user_event_is_new:
@@ -1927,6 +2059,8 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
                          handoffFileBaselines={})
         phase = state["phase"]
         notice = _codex_notice(phase, count, mode)
+        if client == "claude":
+            notice = notice.replace("Codex", "Claude", 1)
         if state["compactionIssues"]:
             notice += " 压缩轨迹对账存在缺口，次数按当前可见证据保守计算。"
         response: Dict[str, Any] = {}
@@ -1941,7 +2075,7 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
             if tool_id and tool_id in previous:
                 save_gate_state(state_dir, sid, state)
                 return previous[tool_id]
-            kind, targets = _codex_tool_kind(payload)
+            kind, targets = _claude_tool_kind(payload) if client == "claude" else _codex_tool_kind(payload)
             if kind == "blocked_always" or (phase == "freeze" and kind == "mutating_other"):
                 response = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                             "permissionDecisionReason": notice}}
@@ -1958,11 +2092,12 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
             reply = str(payload.get("last_assistant_message") or "")
             if _handoff_structure_present(reply) or _has_valid_handoff_file(state):
                 state.update(phase="freeze", handoffRecorded=True)
-                response = {"continue": False, "stopReason": "已记录交接结构，结束当前回合；目标与后台任务状态须由用户/总控另行核对。"}
+                response = {} if client == "claude" else {"continue": False, "stopReason": "已记录交接结构，结束当前回合；目标与后台任务状态须由用户/总控另行核对。"}
             elif payload.get("stop_hook_active") or state["stopCorrectionRequested"]:
                 state["phase"] = "freeze"
-                response = {"continue": False, "stopReason": "交接要素仍不完整，已停止本轮自动补正以防循环；请人工核对未完成事项。",
-                            "systemMessage": "交接未通过结构检查，不能报告为已完成。"}
+                response = ({"systemMessage": "交接未通过结构检查，不能报告为已完成。"} if client == "claude" else
+                            {"continue": False, "stopReason": "交接要素仍不完整，已停止本轮自动补正以防循环；请人工核对未完成事项。",
+                             "systemMessage": "交接未通过结构检查，不能报告为已完成。"})
             else:
                 state["stopCorrectionRequested"] = True
                 response = {"decision": "block", "reason": notice + "请补齐交接后结束；本次仅补正一次。"}
@@ -1974,18 +2109,21 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Codex 长会话交接事件适配；反重力使用既有模块接口")
-    parser.add_argument("--client", choices=("codex",), required=True)
+    parser.add_argument("--client", choices=("codex", "claude"), required=True)
     parser.add_argument("--mode", choices=("advisory", "enforce", "off"), default="advisory")
     parser.add_argument("--compact-limit", type=int, default=0)
     parser.add_argument("--state-dir", default=str(HOOKS_DIR / "state" / "handoff"))
     args = parser.parse_args()
     try:
         payload = user_words.read_hook_payload()
-        response = handle_codex_handoff(payload, Path(args.state_dir), args.mode, args.compact_limit)
+        handler = handle_claude_handoff if args.client == "claude" else handle_codex_handoff
+        state_dir = Path(args.state_dir).expanduser() if args.client == "claude" else Path(args.state_dir)
+        response = handler(payload, state_dir, args.mode, args.compact_limit)
     except Exception as exc:
         # 状态/协议异常时不伪装已受保护，不在失败的钩子中无限继续。
-        sys.stderr.write(f"Codex handoff hook: {exc}\n")
-        response = {"systemMessage": "Codex 长会话门禁本次处理失败，未更新保护状态；请检查钩子错误。"}
+        label = "Claude" if args.client == "claude" else "Codex"
+        sys.stderr.write(f"{label} handoff hook: {exc}\n")
+        response = {"systemMessage": f"{label} 长会话门禁本次处理失败，未更新保护状态；请检查钩子错误。"}
     sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
 
 

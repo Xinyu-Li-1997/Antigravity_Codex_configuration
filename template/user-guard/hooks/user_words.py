@@ -1089,7 +1089,8 @@ def extract_codex_session_words(
     }
 
 
-def _read_codex_publication(md_path: Path, meta_path: Path, sid: str) -> Dict[str, Any]:
+def _read_codex_publication(md_path: Path, meta_path: Path, sid: str,
+                            archive_format: str = CODEX_ARCHIVE_FORMAT) -> Dict[str, Any]:
     saved: Dict[str, Any] = {
         "file": str(md_path), "available": False, "manifest_verified": False, "verified": False,
         "preserved": False, "count": None, "last_time": None, "sources": [],
@@ -1115,11 +1116,11 @@ def _read_codex_publication(md_path: Path, meta_path: Path, sid: str) -> Dict[st
         sources = manifest.get("sources")
         count = manifest.get("count")
         last_time = manifest.get("last_time")
-        archive_format = manifest.get("format")
-        legacy = archive_format == CODEX_LEGACY_ARCHIVE_FORMAT
+        manifest_format = manifest.get("format")
+        legacy = archive_format == CODEX_ARCHIVE_FORMAT and manifest_format == CODEX_LEGACY_ARCHIVE_FORMAT
         complete = manifest.get("complete")
         if (
-            archive_format not in (CODEX_ARCHIVE_FORMAT, CODEX_LEGACY_ARCHIVE_FORMAT) or manifest.get("id") != sid
+            (manifest_format != archive_format and not legacy) or manifest.get("id") != sid
             or manifest.get("file") != str(md_path) or not isinstance(manifest.get("sha256"), str)
             or not SHA256_RE.fullmatch(manifest["sha256"])
             or type(count) is not int or count < 0
@@ -1278,3 +1279,254 @@ def refresh_codex_session_archive(
         "meta_path": str(meta_path),
         "segments": parsed["segments"],
     }
+
+
+# ⑦ Claude Code 主轨迹与原话归档
+
+CLAUDE_ARCHIVE_FORMAT = "user-guard-claude-v1"
+CLAUDE_INJECTED_TAG_RE = re.compile(
+    r"<(ide_opened_file|ide_selection|ide_diagnostics|system-reminder)\b[^>]*>.*?</\1\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def claude_hook_session(payload: Dict[str, Any]) -> Tuple[str, Optional[Path], str, bool]:
+    """定位显式主轨迹；子代理支线返回 skip=True，未传路径时仅查 projects 下同 ID 主会话。"""
+    sid = str(payload.get("session_id") or "").strip()
+    if payload.get("agent_id"):
+        return sid, None, "", True
+    if not valid_session_id(sid):
+        return "", None, "缺少合法 session_id", False
+    raw = strip_win_extended_prefix(str(payload.get("transcript_path") or ""))
+    if raw:
+        path = Path(raw).expanduser()
+        if any(part.lower() == "subagents" for part in path.parts):
+            return sid, None, "", True
+        if path.is_file():
+            return sid, path, "", False
+    else:
+        home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+        candidates = list((home / "projects").glob(f"*/{sid}.jsonl"))
+        candidates = [path for path in candidates if path.is_file()]
+        if candidates:
+            return sid, max(candidates, key=lambda path: path.stat().st_mtime_ns), "", False
+    return sid, None, "未找到 Claude 会话轨迹文件", False
+
+
+def _claude_clean_text(text: str) -> str:
+    if re.search(r"<local-command-(?:stdout|caveat)\b", text, re.IGNORECASE):
+        return ""
+    text = CLAUDE_INJECTED_TAG_RE.sub("", text).strip()
+    command = re.search(r"<command-name>(.*?)</command-name>", text, re.DOTALL)
+    if command:
+        args = re.search(r"<command-args>(.*?)</command-args>", text, re.DOTALL)
+        return (command[1].strip() + (" " + args[1].strip() if args and args[1].strip() else "")).strip()
+    return text
+
+
+def _claude_answer_text(value: Any) -> str:
+    if isinstance(value, dict) and isinstance(value.get("answers"), dict):
+        lines = []
+        for question, answer in value["answers"].items():
+            if isinstance(answer, list):
+                answer = "、".join(str(item) for item in answer)
+            if isinstance(answer, str) and answer.strip():
+                lines.append(f"{question}：{answer.strip()}")
+        return "\n".join(lines)
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (ValueError, RecursionError):
+            prefix = "User has answered your questions:"
+            if value.strip().startswith(prefix):
+                return value.strip()[len(prefix):].split("You can now continue with the user's answers", 1)[0].strip()
+        else:
+            if isinstance(decoded, dict):
+                return _claude_answer_text(decoded)
+    return ""
+
+
+def _claude_question_ids_from_assistant(entry: Dict[str, Any]) -> Set[str]:
+    msg = entry.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return set()
+    return {
+        str(block["id"]) for block in content
+        if isinstance(block, dict) and block.get("type") == "tool_use"
+        and block.get("name") == "AskUserQuestion" and block.get("id")
+    }
+
+
+def _claude_tool_result_ids(entry: Dict[str, Any]) -> Set[str]:
+    msg = entry.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return set()
+    return {
+        str(block["tool_use_id"]) for block in content
+        if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id")
+    }
+
+
+def claude_user_content(entry: Dict[str, Any], question_ids: Optional[Set[str]] = None) -> Tuple[str, str]:
+    """仅识别人类正文、排队输入与经 tool_use_id 核实的问答选择，供归档和回合定位共用。"""
+    if entry.get("isSidechain") is True or entry.get("isMeta") is True:
+        return "", ""
+    if entry.get("type") == "attachment":
+        att = entry.get("attachment")
+        if not isinstance(att, dict) or att.get("type") != "queued_command":
+            return "", ""
+        origin = att.get("origin") or {}
+        if not isinstance(origin, dict) or origin.get("kind") not in ("human", None):
+            return "", ""
+        prompt = att.get("prompt")
+        return (prompt.strip(), "queued_command") if isinstance(prompt, str) else ("", "")
+    msg = entry.get("message")
+    if entry.get("type") != "user" or not isinstance(msg, dict):
+        return "", ""
+    content = msg.get("content")
+    if isinstance(content, list) and any(isinstance(block, dict) and block.get("type") == "tool_result"
+                                         for block in content):
+        matched_blocks = [
+            block for block in content
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+            and (question_ids is None or str(block.get("tool_use_id") or "") in question_ids)
+        ]
+        if not matched_blocks:
+            return "", ""
+        answer = _claude_answer_text(entry.get("toolUseResult"))
+        if not answer:
+            answers = []
+            for block in matched_blocks:
+                text = _claude_answer_text(block) or _claude_answer_text(block.get("content"))
+                if not text and isinstance(block.get("content"), list):
+                    text = "\n".join(_claude_answer_text(item.get("text")) for item in block["content"]
+                                     if isinstance(item, dict))
+                if text:
+                    answers.append(text)
+            answer = "\n".join(answers)
+        return answer, "ask_question_answer" if answer else ""
+    if isinstance(content, list):
+        content = "\n".join(block["text"] for block in content if isinstance(block, dict)
+                            and block.get("type") == "text" and isinstance(block.get("text"), str))
+    return (_claude_clean_text(content), "user_input") if isinstance(content, str) else ("", "")
+
+
+def extract_claude_user_words(transcript_path: Path) -> Dict[str, Any]:
+    """逐行严格解码并记录读取缺口；仅合并排队输入及紧邻的消费记录。"""
+    words: List[Dict[str, Any]] = []
+    issues: List[str] = []
+    sources: List[Dict[str, Any]] = []
+    digest = hashlib.sha256()
+    offset = 0
+    queued_index: Optional[int] = None
+    question_ids: Set[str] = set()
+    try:
+        with transcript_path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            for line_index, raw in enumerate(stream, 1):
+                digest.update(raw)
+                offset += len(raw)
+                if not raw.strip():
+                    continue
+                try:
+                    entry = json.loads(decode_jsonl_line(raw))
+                    if not isinstance(entry, dict) or not isinstance(entry.get("type"), str):
+                        raise ValueError("记录缺少 type")
+                except (ValueError, RecursionError) as exc:
+                    issues.append(f"Claude 轨迹第 {line_index} 行无法解析（{exc}）")
+                    queued_index = None
+                    continue
+                if entry.get("type") == "assistant" and not entry.get("isSidechain"):
+                    question_ids.update(_claude_question_ids_from_assistant(entry))
+                text, kind = claude_user_content(entry, question_ids=question_ids)
+                if not text:
+                    if entry.get("type") == "assistant" and not entry.get("isSidechain"):
+                        queued_index = None
+                    continue
+                word = {"turn": len(words) + 1, "step_index": line_index,
+                        "created_at": str(entry.get("timestamp") or ""), "content": text, "kind": kind}
+                if (kind == "user_input" and queued_index is not None
+                        and words[queued_index]["content"] == text):
+                    word["turn"] = words[queued_index]["turn"]
+                    words[queued_index] = word
+                else:
+                    words.append(word)
+                queued_index = len(words) - 1 if kind == "queued_command" else None
+            after = os.fstat(stream.fileno())
+        current = transcript_path.stat()
+        if (offset != before.st_size
+                or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+            issues.append("读取时 Claude 轨迹发生变化，待再次核对")
+        sources.append({"path": str(transcript_path), "complete_offset": min(offset, before.st_size),
+                        "observed_size": before.st_size, "sha256": digest.hexdigest()})
+    except OSError as exc:
+        issues.append(f"读取 Claude 轨迹失败（{exc}）")
+    return {"words": words, "issues": issues, "sources": sources, "complete": not issues}
+
+
+def archive_claude_session_words(payload: Dict[str, Any], state_dir: Path) -> Dict[str, Any]:
+    """按 Codex SessionStart 的目录与恢复安全规则发布 Claude 原话及 SHA-256 清单。"""
+    sid, transcript, error, skip = claude_hook_session(payload)
+    result: Dict[str, Any] = {"complete": False, "words": [], "issues": [error] if error else [],
+                              "saved": {}, "meta_path": "", "segments": [], "skipped": skip}
+    if skip or not sid:
+        return result
+    user_words_dir = state_dir.parent / "user-words" if state_dir.name == "session-context" else state_dir / "user-words"
+    md_path = user_words_dir / f"{sid}.md"
+    meta_path = user_words_dir / f"{sid}.meta.json"
+    result["meta_path"] = str(meta_path)
+    with session_state_lock(user_words_dir, sid):
+        previous = _read_codex_publication(md_path, meta_path, sid, CLAUDE_ARCHIVE_FORMAT)
+        parsed = extract_claude_user_words(transcript) if transcript else result
+        words = parsed["words"]
+        issues = list(parsed["issues"])
+        sources = parsed.get("sources", [])
+        complete = bool(transcript is not None and not issues)
+        recorded_sources = previous.get("previous_manifest_sources") or previous.get("sources", [])
+        missing = _missing_codex_source_coverage(recorded_sources, sources)
+        if missing:
+            complete = False
+            issues.append("本次轨迹未覆盖已有归档来源：" + "、".join(missing))
+        can_update_partial = bool(words) and (not previous["available"] or (
+            previous["manifest_verified"] and not previous["verified"] and len(words) >= previous["count"]
+        ))
+        md_text = format_user_words_markdown(sid, words, issues)
+        md_sha = hashlib.sha256(md_text.encode("utf-8")).hexdigest()
+        body_sha = previous.get("body_sha256")
+        can_restore_manifest = bool(body_sha and body_sha == md_sha and sources and not previous.get("legacy_hash_mismatch"))
+        unresolved_body = bool(body_sha and not previous["manifest_verified"] and not can_restore_manifest)
+        if unresolved_body:
+            complete = False
+            issues.append("未能证明本次重建覆盖现有归档正文，已保留原正文")
+        saved = previous
+        should_publish = (transcript is not None and not missing and not unresolved_body
+                          and (complete or can_update_partial or can_restore_manifest))
+        if should_publish:
+            try:
+                manifest = {"format": CLAUDE_ARCHIVE_FORMAT, "id": sid, "file": str(md_path),
+                            "count": len(words), "last_time": words[-1]["created_at"] if words else None,
+                            "sources": sources, "sha256": md_sha, "complete": complete}
+                if body_sha != md_sha:
+                    atomic_write_text(md_path, md_text)
+                atomic_write_json(meta_path, manifest)
+            except OSError as exc:
+                complete = False
+                issues.append(f"归档发布中断（{exc}）")
+            saved = _read_codex_publication(md_path, meta_path, sid, CLAUDE_ARCHIVE_FORMAT)
+            if not saved["manifest_verified"]:
+                complete = False
+        if not complete and saved.get("verified") and saved.get("sha256") == previous.get("sha256"):
+            saved["preserved"] = True
+        if saved.get("issue"):
+            issues.append(saved["issue"])
+        saved.pop("body_sha256", None)
+        saved.pop("previous_manifest_sources", None)
+        saved.pop("legacy_hash_mismatch", None)
+        result.update(complete=complete and saved.get("verified", False), words=words, issues=issues,
+                      saved=saved, segments=[str(transcript)] if transcript else [])
+    return result

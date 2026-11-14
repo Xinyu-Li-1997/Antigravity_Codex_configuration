@@ -4,6 +4,16 @@
 
 ---
 
+## [1.8.0] - 2026-11-14
+
+打通 Antigravity、Codex、Claude Code 与 CC Switch 四组件单点真源协同治理、本地模型分流路由与全栈升级适配回归规程：
+
+- **三端全局规则、只读子代理与生命周期门禁同源统一（`template/user-guard/`、`template/claude/`、`install.py`）**：新增 `--app claude` 与 `--app all` 部署模式，将 `R0–R11` 全局规则无损同步至 `~/.claude/CLAUDE.md`（自动保留末尾自定义 `## 工具与...` 段落），配齐 Claude Code 原生三个严格只读子代理（`readonly-reader`、`readonly-auditor`、`readonly-collaborator`），并将压缩原话回溯（`session_context_loader.py`）、`R4` 项目目录硬边界 AST 守卫与防空转门禁（`status_guard.py`）、防重复等待刷屏（`reply_repeat_guard.py`）及长会话交接门禁（`handoff_gate.py`）扩展支持 `--client claude` 协议，升级时自动迁移旧版拆分式 `args` 钩子并保留可用解释器。
+- **CC Switch 卡片无损投影、提示词防回退与混合分流路由收编（`template/claude/router/`）**：收编纯标准库分流守护进程 `router.py`（主模型直连 Kimi、子代理分流 DeepSeek、支持 WSL 跟随 Windows 手动代理与 TUN Fake-IP 回环探测及 60 秒卡片密钥只读缓存）、统一管理 CLI `ccswitch_admin.py`（支持 SQLite 在线原子备份、三卡初始化、按 `floor/exclusive/residue` 规则无损切换卡片、一键禁用 `prompts` 表陈旧提示词防反向覆盖）以及 WSLg 窗口防白屏启动器 `launch-cc-switch-wsl.sh` 与官方 `.deb` 校验升级脚本 `update-cc-switch-wsl.sh`。
+- **全客户端、CC Switch 与大模型升级标准适配体检与全量回归测试（`install.py --audit-upgrade`、`AGENTS.md`、`.github/workflows/ci.yml`、`tests/`）**：新增零写入 `--audit-upgrade` 全栈体检器（Windows 应用包探测同步切换为标准库 `winreg` 纯内存只读查询，消除外部进程缓存写入）与触发式六步升级回归规程，覆盖各客户端版本、SQLite Schema、生命周期钩子协议及最新大模型目录（模型代际、上下文窗口上限、思考挡位、卡片与路由对齐）一致性核查，并在 CI 与本地沙箱补齐五模式隔离安装及全套离线单测。
+
+---
+
 ## [1.7.5] - 2026-11-14
 
 完成仓库工程标准化完善、门面英文架构导引与跨平台自动化回归门禁建设（保持中文单源提示词内核零膨胀）：

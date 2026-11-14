@@ -788,11 +788,54 @@ def handle_codex_session_start(
     }
 
 
+def handle_claude_session_start(
+    payload: Dict[str, Any], state_dir_str: str = "", log_path_str: str = "",
+) -> Dict[str, Any]:
+    """Claude SessionStart：恢复原话并按宿主协议注入有界上下文。"""
+    home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+    state_dir = Path(state_dir_str).expanduser() if state_dir_str else home / "hooks" / "state" / "session-context"
+    result = user_words.archive_claude_session_words(payload, state_dir)
+    if result.get("skipped"):
+        return {}
+    saved = result["saved"]
+    source = str(payload.get("source") or "unknown").strip()
+    count = saved.get("count")
+    scope = f"第 1～{count} 条" if isinstance(count, int) and count > 0 else "0 条" if count == 0 else "尚未核实"
+    lines = [f"恢复来源：Claude {source}",
+             "提取状态：成功（本次可见主轨迹中的原话已归档）" if result["complete"] else "提取状态：存在缺口",
+             f"本会话用户原话文件：{saved['file']}" if saved.get("available") else "本会话用户原话文件：尚无已确认可读的归档文档",
+             f"已保存记录范围：{scope}。最后一条时间：{saved.get('last_time') or '未记录'}。"]
+    if saved.get("preserved"):
+        lines.append("文件状态：保留上次已验证文档，本次因读取缺口未覆盖")
+    elif saved.get("manifest_verified"):
+        lines.append("文件状态：归档正文 SHA-256 与校验清单一致" + ("，本次可见记录已归档" if saved.get("verified") else "，记录范围存在缺口"))
+    else:
+        lines.append("文件状态：归档完整性未验证")
+    if saved.get("available"):
+        lines.append(f"校验清单：{result['meta_path']}")
+    full_context = build_compaction_system_message(
+        result["words"], Path(saved["file"]) if saved.get("available") else None, f"Claude {source}",
+        header="\n".join(lines), issues=result["issues"], source_paths=result["segments"],
+    )
+    # 路径、来源和时间戳也可能很长，最终输出仍须遵守 SessionStart 字符预算。
+    if len(full_context) > MAX_INLINE_TOTAL_CHARS:
+        suffix = "\n（内联内容已截断，请查阅原话档案。）"
+        full_context = full_context[:MAX_INLINE_TOTAL_CHARS - len(suffix)] + suffix
+    if log_path_str:
+        user_words.append_jsonl_log(Path(log_path_str).expanduser(), {
+            "ts": get_current_iso_time(), "event": "SessionStart", "client": "claude",
+            "session_id": str(payload.get("session_id") or "unknown"), "source": source,
+            "cwd": str(payload.get("cwd") or ""), "outcome": "saved" if result["complete"] else "gap",
+            "saved": saved, "issues": result["issues"],
+        })
+    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": full_context}}
+
+
 # ⑦ 命令行主入口
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Antigravity & Codex Compaction Context Loader Hook")
-    parser.add_argument("--client", type=str, default="antigravity", choices=("antigravity", "codex"), help="Host client type")
+    parser.add_argument("--client", type=str, default="antigravity", choices=("antigravity", "codex", "claude"), help="Host client type")
     parser.add_argument("--event", type=str, default="", help="Hook event name: SessionStart or PreInvocation")
     parser.add_argument("--state-dir", type=str, default="", help="Optional state directory override (used by Codex hook)")
     parser.add_argument("--log", type=str, default="", help="Optional JSONL log file path override (used by Codex hook)")
@@ -802,21 +845,24 @@ def main() -> None:
     try:
         payload = user_words.read_hook_payload()
     except (OSError, ValueError) as e:
-        if args.client == "codex":
+        if args.client in ("codex", "claude"):
             sys.stderr.write(f"session_context_loader JSON parse error: {e}\n")
             sys.exit(2)
         log_event(args.event or "Unknown", "unknown", f"Failed to parse stdin JSON: {e}")
 
-    if args.client == "codex":
+    if args.client in ("codex", "claude"):
         try:
-            response = handle_codex_session_start(payload, state_dir_str=args.state_dir, log_path_str=args.log)
+            handler = handle_claude_session_start if args.client == "claude" else handle_codex_session_start
+            response = handler(payload, state_dir_str=args.state_dir, log_path_str=args.log)
         except Exception as e:
             response = {
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": f"恢复来源：{payload.get('source', 'unknown')}\n提取状态：异常（{e}）",
+                    "additionalContext": f"恢复来源：{'Claude ' if args.client == 'claude' else ''}{payload.get('source', 'unknown')}\n提取状态：异常（{e}）",
                 }
             }
+            if args.client == "claude":
+                response["hookSpecificOutput"]["additionalContext"] = response["hookSpecificOutput"]["additionalContext"][:MAX_INLINE_TOTAL_CHARS]
         sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
         sys.stdout.flush()
         return

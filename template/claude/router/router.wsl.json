@@ -1,0 +1,21 @@
+{
+  "listen": "127.0.0.1",
+  "port": 8241,
+  "follow_windows_proxy": true,
+  "default_upstream": "https://api.kimi.com/coding",
+  "routes": [
+    {
+      "prefix": "deepseek",
+      "upstream": "https://api.deepseek.com/anthropic",
+      "key_from_card": "DeepSeek",
+      "force_effort": "max"
+    }
+  ],
+  "kimi_effort_map": {
+    "xhigh": "max"
+  },
+  "ccswitch_db": "~/.cc-switch/cc-switch.db",
+  "log": "~/.claude/router/logs/router.log",
+  "timeout_s": 900,
+  "default_key_from_card": "Kimi"
+}

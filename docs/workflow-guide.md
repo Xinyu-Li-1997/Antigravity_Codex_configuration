@@ -1,6 +1,6 @@
-# 反重力与 Codex 工程及科研协作实践指南
+# 反重力、Codex 与 Claude Code 工程及科研协作实践指南
 
-本文面向日常从事计算流体力学（CFD）、有限元分析（FEA）、偏微分方程（PDE）数值求解器与高性能科学计算的开发者，说明 `user-guard` 与共享技能 `cae-harness` 在课题推进、公式推导、求解器编码、跨模块审计及门禁验收中的实战配合方法。命令行参数细则见 [`cae-harness` 技能说明](../template/user-guard/skills/cae-harness/SKILL.md)，底层钩子协议见[架构设计与生命周期钩子规范](architecture-and-hooks.md)，部署方法见[仓库总 README](../README.md)。
+本文面向日常从事计算流体力学（CFD）、有限元分析（FEA）、偏微分方程（PDE）数值求解器与高性能科学计算的开发者，说明 `user-guard`、共享技能 `cae-harness` 以及 Claude Code 本地路由／CC Switch 协同工具在课题推进、公式推导、求解器编码、跨模块审计及例行升级回归中的实战配合方法。命令行参数细则见 [`cae-harness` 技能说明](../template/user-guard/skills/cae-harness/SKILL.md)，底层钩子协议与分流架构见[架构设计与生命周期钩子规范](architecture-and-hooks.md)，部署方法见[仓库总 README](../README.md)。
 
 ---
 
@@ -9,7 +9,7 @@
 | 项目类型 | 默认总控 | 实战分工方式 |
 | --- | --- | --- |
 | 科研课题与数值求解器综合研发（默认推荐） | 反重力（推荐单模型 `Gemini 4 Carbon (High)`） | 反重力负责全局推进、多篇文献对照、跨模块接口梳理、方向把关、中文技术写作与最终验收；凡涉及高难度方程推导、离散守恒／稳定性分析、核心求解器编码、深层边界审查与验证门禁闭环，**优先通过 `cae-harness` 发起 Codex 无头工作流（`Astra`／`Sol`）攻坚**；阶段收口与发版前，按全量文件由 Codex 负责代码回归检查、Debug 排错与性能优化，反重力负责文档润色、清淤精简与脱敏把关 |
-| 用户显式指定的纯代码重构／工程项目 | Codex | Codex 负责代码修改与本地测试闭环，按需调反重力做物理／架构复核、技术文档润色或独立验收 |
+| 用户显式指定的纯代码重构／工程项目 | Codex 或 Claude Code | 在当前终端宿主内完成代码修改与本地测试闭环（Claude Code 接入 `router.py` 时主会话默认走 `k3.1-pro[1m]`、三个只读子代理走 `deepseek-flash`），按需调反重力做物理／架构复核、技术文档润色或独立验收 |
 
 无论由哪一端担任总控，跨端调用都运行在全新的无头 CLI 子进程中，**看不到桌面聊天窗口里的历史对话和口头补充**。因此，总控下发给 `cae-harness` 的任务单（`--task-file`）必须一次性写清以下五项要素：
 
@@ -27,9 +27,9 @@
 
 日常研发不要把所有工作塞进同一个主会话窗口，应按“是否跨端、是否需要写文件、是否属于硬核数理／编码攻坚”分流：
 
-1. **前端主会话 + 本侧原生 `inherit` 只读子代理（文献通读与多文件静态核查）**：
-   - 前端主会话始终保留用户自选的模型与挡位（推荐单模型 `Gemini 4 Carbon (High)`，避免固定复合模式 `Orchestrator` 在同一窗口内混用模型消耗上下文）。
-   - 当需要并行通读多篇论文、摘录几十个源文件中的边界条件实现或逐行核对汇报引用的行号时，直接在主会话内通过 `invoke_subagent` 唤起 `readonly-reader`、`readonly-auditor` 或 `readonly-collaborator`。这三个原生子代理不设硬编码 `model` 字段，永远默认 `inherit` 跟随当前主对话模型与挡位，且**各自拥有独立的子会话大上下文窗口（前端选用推荐的 `Gemini 4 Carbon (High)` 时标称窗口约 `1M`，运行期受宿主检查点策略管理）**，把大体积原始文本隔离在子窗口内，只向主会话返回精炼摘录与行号证据；若需对 10 个以上同构算例目录或子模块做结构化只读盘点，可使用反重力 `v2.32.0+` 原生 `run_workflow` 并行扇出并按 JSON Schema 聚合（`/boost`、`/swarm`、`/teamwork` 保持仅在用户显式点名时按需启用）。
+1. **前端主会话 + 本侧原生只读子代理（文献通读与多文件静态核查）**：
+   - 前端主会话始终保留用户自选的模型与挡位（反重力推荐单模型 `Gemini 4 Carbon (High)`，避免固定复合模式 `Orchestrator` 在同一窗口内混用模型消耗上下文）。
+   - 当需要并行通读多篇论文、摘录几十个源文件中的边界条件实现或逐行核对汇报引用的行号时，直接在当前会话唤起 `readonly-reader`、`readonly-auditor` 或 `readonly-collaborator`。三端均同步了同名只读子代理（反重力限制 `read_file/search_web`，Codex 启用 `read-only` 沙箱，Claude Code 限制 `Read/Grep/Glob`），各自拥有独立的子会话上下文窗口（反重力选用 `Gemini 4 Carbon (High)` 时标称窗口约 `1M`，运行期受宿主检查点策略管理），把大体积原始文本隔离在子窗口内，只向主会话返回精炼摘录与行号证据；若需对 10 个以上同构算例目录或子模块做结构化只读盘点，可使用反重力 `v2.32.0+` 原生 `run_workflow` 并行扇出并按 JSON Schema 聚合（`/boost`、`/swarm`、`/teamwork` 保持仅在用户显式点名时按需启用）。
    - `cae-harness` 与宿主原生子代理彻底分离：既不干预原生子代理的 `inherit` 行为，也不受前端主会话切到哪个模型的影响。
 2. **`cae-harness` 跨端调用 Codex（默认满血旗舰 + 最长声明窗口）**：
    - **方程推导、离散格式论证与复杂数理审查（`math`／`direction`）**：如推导可压缩 Navier-Stokes 特征分解、熵守恒／熵稳定通量或弯曲网格离散度量恒等式，自动优选深度推理旗舰 **`Astra`**（`gpt-6-astra`），启用单模型纯思考最高挡 **`max`**（投喂给 `Astra (max)` 的任务单宜聚焦预提炼的控制方程与算子范围，必要时将 `--timeout` 设为 `900–1200`；多文件常规代码对账优先选 `review` 调用 `Sol`）。
@@ -63,9 +63,9 @@
 
 1. **反过度工程与代码精简红线（`R0`／`R3.3`）**：
    - 求解器与工程脚本严格聚焦当前明确需求与主力运行环境，严禁为未要求的老旧语言／库版本、未使用的外围平台或假想未来需求编写回退解析器、多余抽象层与防御性样板代码；测试紧扣真实物理算例与目标环境，不堆砌脱离实际的假想 Mock。
-2. **项目目录硬边界双重防护**：
+2. **项目目录硬边界多重防护**：
    - 除用户明确批准外，严禁在当前项目根目录之外创建、修改、移动或删除任何业务文件与全局配置（含严禁在项目外创建 `.codex-worktrees` 或执行外部 `git worktree add`）。
-   - 反重力侧由 `status_guard.py` 静态检查跨宿主表面文件修改工具参数、内联 Python AST、Shell 子句以及 `run_workflow` 动态工作流的外层 `Cwd`／`ScriptPath`／`Script`：前端交互会话遇到越界动作弹出 `force_ask` 审批框（列明意图、写删动作、外部路径与命令片段），无头子任务（`CAE_HARNESS_DEPTH=1`）直接 `deny` 拦截。
+   - 反重力与 Claude Code 侧由 `status_guard.py` 静态检查表面文件修改工具参数、内联 Python AST、Shell 子句以及 `run_workflow` 动态工作流的外层 `Cwd`／`ScriptPath`／`Script`：前端交互会话遇到越界动作返回审批提示（反重力 `force_ask`、Claude Code `permissionDecision: "ask"`），无头子任务（`CAE_HARNESS_DEPTH=1`）直接拒绝拦截。
    - Codex 侧默认启用 `workspace-write` 沙箱，`cae-harness` 同时在任务前后做全目录文件快照对比，任何超出 `--write-scope` 白名单的改动均判定为 `scope_violation`。
 3. **科学计算四级验收证据与红线**：
    - 汇报与验收必须严格区分四个层次：**① 源码／配置静态存在**、**② 编译通过且离线单元测试绿灯**、**③ 离散守恒残差／对称性／自由流保持达机器精度**、**④ 网格加密与时间步缩小的经验收敛阶（EOC）达理论阶数**。仅针对当前目标环境与核心验证链路如实标明未实测环节，严禁在汇报末尾罗列无关外围平台或老旧版本充当防御性免责声明（`cae-harness` 对空白 `--verify-cmd` 直接报错拦截，并对未附带 `--verify-cmd` 的 `code` 任务显式标记 `"verification_executed": false`，从协议层杜绝把静态改码冒充实测通过；大规模收敛阶实验宜采用“粗网格快速淘汰失阶方案 -> 细网格五档精测”的两级验收命令）。
@@ -73,14 +73,26 @@
 
 ---
 
-## 六、Windows 与 WSL2 跨子系统协同实战与排障
+## 六、Windows 与 WSL2 跨子系统协同及 CC Switch 职责边界
 
 1. **计算环境隔离与无痕会话**：
    - 大规模 C++/Fortran 编译、细密网格生成或高内存 MPI 数值算例建议放在 WSL2 或独立计算环境中执行（`R10`），避免宿主机桌面内存溢出（OOM）。
    - 反重力调 Codex 采用 `codex exec --ephemeral`，Codex 调反重力采用独立无头存储 `~/.gemini/antigravity-cli`，两侧均不会往桌面客户端侧边栏塞入临时子任务聊天记录。
    - Windows 与 WSL2 各自维护独立的用户主目录、登录态与额度冷却缓存；仓库升级后在两侧终端分别运行一次安装脚本即可保持同源同步。
-2. **WSL2 `<->` Windows 自动互操作规则**：
-   - 在 WSL2 中运行 `cae-harness` 时，优先调用 WSL2 本侧已安装且已登录的原生 Linux CLI；若 WSL2 未安装或未登录对应 CLI，在开启互操作时会自动回退调用 Windows 侧 `.exe`。
-   - 调用 Windows 侧 CLI 处理 `/mnt/<盘符>/...` 共享盘项目时可直接读写；处理 WSL2 纯 Linux 文件系统路径（如 `/home/<user>/...`）时，只读审查与公式推导任务会自动建立临时镜像目录完成分析，而需要修改源码的写入任务则须放在 `/mnt/<盘符>` 共享盘下，或在 WSL2 内登录原生 Linux CLI 执行。
-3. **Windows 版 Codex 沙箱反向调用 `agy.exe` 超时排障**：
-   - 反重力主会话直接启动 `codex.exe` 时具备正常宿主环境；但若从 Windows 版 Codex 的受限沙箱（如 `workspace-write`／AppContainer）内部反向调用 `agy.exe`，受限令牌会拦截 `agy.exe` 向 `~/.gemini/antigravity-cli` 写入状态锁，表现为迟迟收不到 `init` 事件直至超时。确需此方向调用时，须在放行 `~/.gemini` 写权限的宿主通道下运行，并将 `--timeout` 设为 `300` 秒以上。
+2. **Claude Code 本地分流路由与 CC Switch 卡片解耦**：
+   - **单点规则真源**：全局规则（`CLAUDE.md`／`AGENTS.md`）、只读子代理与生命周期钩子统一由 `install.py` 从本仓库同源同步；CC Switch 仅用于管理供应商 API 凭据与卡片切换，须通过 `--disable-ccswitch-prompts`（或 `ccswitch_admin.py disable-prompts`）保持 `cc-switch.db` 内置提示词处于禁用状态，防止切卡时反向覆盖全局规则。
+   - **双侧独立端口与代理跟随**：启用 `--with-cc-router` 时，Windows 侧本地分流路由默认监听 `127.0.0.1:8240`，WSL2 侧默认监听 `127.0.0.1:8241`（开启 `follow_windows_proxy: true` 自动识别 WSL 网关／系统代理并透传连接，避免双侧端口碰撞）；调用 `ccswitch_admin.py switch-card` 切卡时仅原子投影受管的模型／鉴权顶层字段与 `env` 键，完整保留 `hooks`、`effortLevel`、`permissions` 及用户自定义配置。
+3. **WSL2 `<->` Windows 自动互操作与沙箱排障**：
+   - 在 WSL2 中运行 `cae-harness` 时，优先调用 WSL2 本侧已登录的原生 Linux CLI；未安装或未登录时自动回退调用 Windows 侧 `.exe`（`/mnt/<盘符>` 共享盘可直接读写；纯 Linux 路径支持只读临时镜像分析，写入任务须置于共享盘或使用已登录的原生 CLI）。
+   - 若从 Windows 版 Codex 的受限沙箱内部反向调用 `agy.exe`，受限令牌会拦截 `agy.exe` 向 `~/.gemini/antigravity-cli` 写入状态锁导致超时；确需此方向调用时，须在放行 `~/.gemini` 写权限的宿主通道下运行，并将 `--timeout` 设为 `300` 秒以上。
+
+---
+
+## 七、客户端、CC Switch 与大模型升级例行回归流程
+
+当任一客户端（反重力、Codex、Claude Code）、CC Switch 或上游大模型版本更新，用户在对话中提出**“根据各自升级做适配与回归测试”**时，按 [AGENTS.md](../AGENTS.md) 第三章的触发式六步标准流程闭环执行：
+
+1. **全栈只读体检**：运行 `python -B install.py --audit-upgrade` 与 `cae_harness.py probe --discover-models`／`assess`，一次查清三端版本号、规则／钩子哈希漂移、CC Switch `user_version` 与提示词状态、本地路由健康度，以及最新大模型目录（如 `Sol`/`Astra`/`Carbon` 最新代际、声明最大上下文窗口与可调思考挡位）。
+2. **能力匹配与精简修订**：针对新模型代际、窗口上限变化或客户端钩子协议演进更新模板与选路映射，清理已下线模型配置（遵循 `R3.3` 不留废弃兼容层）。
+3. **跨端代码门禁与五模式沙箱测试**：调 Codex `Sol (max)` 完成边界审查与 `--verify-cmd` 门禁测试，在临时目录跑通 `codex`、`antigravity`、`claude --with-cc-router`、`both`、`all --with-cc-router` 五套沙箱安装、沙箱 `--audit-upgrade` 零漂移校验及全量 `unittest` 回归。
+4. **润色脱敏与双侧预演收口**：同步更新文档能力表与 `CHANGELOG.md`，通过全仓脱敏审计后输出 Windows 与 WSL 双侧 `--dry-run --yes` 预演清单，获用户批准后同步生产配置并复核零漂移状态。

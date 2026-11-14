@@ -14,9 +14,11 @@ reply_repeat_guard.py - 反重力 Stop 交接终审与防连续同质等待刷�
 
 # ① 常量、阈值与宿主依赖
 
+import argparse
 import difflib
 import hashlib
 import json
+import os
 import re
 import sys
 import traceback
@@ -130,7 +132,7 @@ def log_event(event_name: str, conversation_id: str, message: str) -> None:
     user_words.append_lifecycle_log(HOOKS_DIR, event_name, conversation_id, message)
 
 
-def _load_repeat_state(state_file: Path, conversation_id: str) -> Dict[str, Any]:
+def _load_repeat_state(state_file: Path, conversation_id: str, logs_dir: Optional[Path] = None) -> Dict[str, Any]:
     if state_file.exists():
         try:
             data = json.loads(state_file.read_text(encoding="utf-8-sig"))
@@ -147,7 +149,13 @@ def _load_repeat_state(state_file: Path, conversation_id: str) -> Dict[str, Any]
                 return data
             raise ValueError("状态格式或会话身份不符")
         except (OSError, ValueError, RecursionError) as exc:
-            log_event("Stop:repeat_state_error", conversation_id, f"防重复状态读取失败（{exc}），保留原文件")
+            if logs_dir is None:
+                log_event("Stop:repeat_state_error", conversation_id, f"防重复状态读取失败（{exc}），保留原文件")
+            else:
+                user_words.append_jsonl_log(logs_dir / "lifecycle.log", {
+                    "event": "Stop:repeat_state_error", "client": "claude", "session_id": conversation_id,
+                    "message": f"防重复状态读取失败（{exc}），保留原文件",
+                })
             raise
     return {"version": 2, "conversationId": conversation_id, "turns": {}}
 
@@ -525,21 +533,176 @@ def handle_stop_repeat_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"decision": "allow"}
 
 
+def _claude_reverse_entries(path: Path):
+    """从末尾分块读取，保留行首字节偏移，回合超出尾部窗口时继续向前找。"""
+    with path.open("rb") as stream:
+        position = stream.seek(0, 2)
+        carry = b""
+        while position:
+            start = max(0, position - TAIL_SCAN_BYTES)
+            stream.seek(start)
+            data = stream.read(position - start) + carry
+            lines = data.split(b"\n")
+            carry = lines.pop(0) if start else b""
+            offset = start + len(carry) + 1 if start else 0
+            located = []
+            for line in lines:
+                located.append((offset, line))
+                offset += len(line) + 1
+            for row_offset, raw in reversed(located):
+                if not raw.strip():
+                    continue
+                try:
+                    entry = json.loads(user_words.decode_jsonl_line(raw))
+                except (ValueError, RecursionError):
+                    continue
+                if isinstance(entry, dict):
+                    yield row_offset, entry
+            position = start
+
+
+def _claude_turn_reply(payload: Dict[str, Any]) -> Tuple[str, Optional[int], str, str]:
+    supplied = payload.get("last_assistant_message")
+    latest_reply = supplied.strip() if isinstance(supplied, str) else ""
+    _, transcript, _, skip = user_words.claude_hook_session(payload)
+    if skip or transcript is None:
+        return "turn_0_initial", None, latest_reply, ""
+    step: Optional[int] = None
+    message_id = ""
+    turn_key = "turn_0_initial"
+    pending_question: Optional[Tuple[int, Dict[str, Any], Set[str]]] = None
+    try:
+        for offset, entry in _claude_reverse_entries(transcript):
+            if entry.get("isSidechain") is True or entry.get("isMeta") is True:
+                continue
+            if pending_question is not None and entry.get("type") == "assistant":
+                cand_offset, cand_entry, cand_ids = pending_question
+                q_ids = user_words._claude_question_ids_from_assistant(entry)
+                if q_ids & cand_ids:
+                    q_text, _ = user_words.claude_user_content(cand_entry, question_ids=q_ids)
+                    if q_text:
+                        identity = str(cand_entry.get("uuid") or cand_entry.get("id") or cand_offset)
+                        turn_key = "turn_" + hashlib.sha256((identity + ":" + q_text).encode("utf-8")).hexdigest()[:24]
+                        break
+                msg = entry.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else None
+                tool_ids = {
+                    str(block["id"]) for block in (content if isinstance(content, list) else [])
+                    if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id")
+                }
+                if cand_ids & tool_ids:
+                    pending_question = None
+            text, kind = user_words.claude_user_content(entry)
+            if text and kind in ("user_input", "queued_command"):
+                identity = str(entry.get("uuid") or entry.get("id") or offset)
+                turn_key = "turn_" + hashlib.sha256((identity + ":" + text).encode("utf-8")).hexdigest()[:24]
+                break
+            if text and kind == "ask_question_answer":
+                r_ids = user_words._claude_tool_result_ids(entry)
+                if r_ids and pending_question is None:
+                    pending_question = (offset, entry, r_ids)
+                continue
+            if entry.get("type") != "assistant" or step is not None:
+                continue
+            msg = entry.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if isinstance(content, list):
+                text = "\n".join(block["text"] for block in content if isinstance(block, dict)
+                                 and block.get("type") == "text" and isinstance(block.get("text"), str))
+            else:
+                text = content if isinstance(content, str) else ""
+            if text.strip():
+                step = offset
+                message_id = str(entry.get("uuid") or entry.get("id") or "")
+                if not latest_reply:
+                    latest_reply = text.strip()
+        if step is None and latest_reply:
+            # 宿主可能在助手记录刷盘前调用 Stop；同一快照的重复投递仍须幂等。
+            step = transcript.stat().st_size
+    except OSError:
+        return turn_key, None, latest_reply, ""
+    return turn_key, step, latest_reply, message_id
+
+
+def handle_claude_stop_repeat_guard(payload: Dict[str, Any], state_dir: Optional[Path] = None,
+                                   logs_dir: Optional[Path] = None) -> Dict[str, Any]:
+    if payload.get("stop_hook_active") is True:
+        return {}
+    sid, _, _, skip = user_words.claude_hook_session(payload)
+    if skip or not user_words.valid_session_id(sid):
+        return {}
+    home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+    state_dir = Path(state_dir).expanduser() if state_dir is not None else home / "hooks" / "state"
+    logs_dir = Path(logs_dir).expanduser() if logs_dir is not None else home / "hooks" / "logs"
+    turn_key, step, reply, message_id = _claude_turn_reply(payload)
+    if not reply:
+        return {}
+    try:
+        with user_words.session_state_lock(state_dir, sid):
+            state_file = state_dir / f"{sid}_repeat_guard.json"
+            state = _load_repeat_state(state_file, sid, logs_dir)
+            record = state["turns"].setdefault(turn_key, {
+                "consecutiveShortWaitCount": 0, "lastNormalizedReply": "", "lastStepIndex": None,
+                "blockedSignatures": [],
+            })
+            if ((step is not None and step == record["lastStepIndex"])
+                    or (message_id and message_id == record.get("lastMessageId"))):
+                return {}
+            record.update(lastStepIndex=step, lastMessageId=message_id)
+            if is_short_status_reply(reply):
+                normalized = normalize_reply_text(reply)
+                previous = record["lastNormalizedReply"]
+                record["consecutiveShortWaitCount"] = (record["consecutiveShortWaitCount"] + 1
+                    if are_replies_homogeneous(previous, normalized) else 1)
+                record["lastNormalizedReply"] = normalized
+            else:
+                record.update(consecutiveShortWaitCount=0, lastNormalizedReply="")
+            block = record["consecutiveShortWaitCount"] >= 3 and not record["blockedSignatures"]
+            if block:
+                record["blockedSignatures"].append(hashlib.sha256(record["lastNormalizedReply"].encode("utf-8")).hexdigest()[:16])
+            _save_repeat_state(state_file, state, sid)
+            if block:
+                user_words.append_jsonl_log(logs_dir / "lifecycle.log", {
+                    "event": "Stop:reply_repeat_guard", "client": "claude", "session_id": sid,
+                    "turn_key": turn_key, "count": record["consecutiveShortWaitCount"],
+                })
+                return {"decision": "block", "reason": BLOCK_REASON_TEXT}
+    except (OSError, ValueError) as exc:
+        user_words.append_jsonl_log(logs_dir / "lifecycle.log", {
+            "event": "Stop:state_error", "client": "claude", "session_id": sid, "message": str(exc),
+        })
+    return {}
+
+
 # ⑥ 命令行主入口
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Stop 短状态等待回复门禁")
+    parser.add_argument("--client", choices=("antigravity", "claude"), default="antigravity")
+    parser.add_argument("--state-dir", default="")
+    parser.add_argument("--log-dir", default="")
+    args, _ = parser.parse_known_args()
     payload: Dict[str, Any] = {}
     try:
         payload = user_words.read_hook_payload()
     except (OSError, ValueError) as e:
-        log_event("Stop:reply_repeat_guard", "unknown", f"Failed to parse stdin JSON: {e}")
+        if args.client == "claude":
+            sys.stderr.write(f"Claude Stop JSON parse error: {e}\n")
+        else:
+            log_event("Stop:reply_repeat_guard", "unknown", f"Failed to parse stdin JSON: {e}")
 
     try:
-        response = handle_stop_repeat_guard(payload)
+        response = (handle_claude_stop_repeat_guard(payload, Path(args.state_dir) if args.state_dir else None,
+                                                  Path(args.log_dir) if args.log_dir else None)
+                    if args.client == "claude" else handle_stop_repeat_guard(payload))
     except Exception as e:
         stack_str = traceback.format_exc()
-        log_event("Stop:reply_repeat_guard", str(payload.get("conversationId", "unknown")), f"Exception: {e}\n{stack_str}")
-        response = {"decision": "allow"}
+        if args.client == "claude":
+            sys.stderr.write(f"Claude Stop: {e}\n")
+            response = {}
+        else:
+            log_event("Stop:reply_repeat_guard", str(payload.get("conversationId", "unknown")), f"Exception: {e}\n{stack_str}")
+            response = {"decision": "allow"}
 
     sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
     sys.stdout.flush()

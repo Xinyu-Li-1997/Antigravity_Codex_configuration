@@ -17,6 +17,7 @@ status_guard.py - 反重力 PreToolUse 项目目录硬边界、长会话交接�
 
 # ① 常量、阈值与宿主依赖
 
+import argparse
 import ast
 import hashlib
 import itertools
@@ -201,8 +202,14 @@ def get_current_iso_time() -> str:
     return user_words.current_iso_time()
 
 
-def log_event(event_name: str, conversation_id: str, message: str) -> None:
-    user_words.append_lifecycle_log(HOOKS_DIR, event_name, conversation_id, message)
+def log_event(event_name: str, conversation_id: str, message: str, logs_dir: Optional[Path] = None) -> None:
+    if logs_dir is None:
+        user_words.append_lifecycle_log(HOOKS_DIR, event_name, conversation_id, message)
+    else:
+        user_words.append_jsonl_log(logs_dir / "lifecycle.log", {
+            "timestamp": get_current_iso_time(), "event": event_name, "client": "claude",
+            "conversationId": conversation_id, "message": message,
+        })
 
 
 def _is_inside_dir(target: Path, parent: Path) -> bool:
@@ -226,7 +233,7 @@ def _canonical_path_key(p: Path) -> str:
     return user_words._canonical_path_key(p)
 
 
-def _load_guard_state(state_file: Path, conversation_id: str) -> Dict[str, Any]:
+def _load_guard_state(state_file: Path, conversation_id: str, logs_dir: Optional[Path] = None) -> Dict[str, Any]:
     if state_file.exists():
         try:
             data = json.loads(state_file.read_text(encoding="utf-8-sig"))
@@ -235,7 +242,7 @@ def _load_guard_state(state_file: Path, conversation_id: str) -> Dict[str, Any]:
                 return data
             raise ValueError("轮询状态格式或会话身份错误")
         except (ValueError, OSError, RecursionError) as exc:
-            log_event("PreToolUse:poll_state_error", conversation_id, f"轮询状态读取失败（{exc}），保留原文件")
+            log_event("PreToolUse:poll_state_error", conversation_id, f"轮询状态读取失败（{exc}），保留原文件", logs_dir)
             raise
     return {"version": 2, "conversationId": conversation_id, "records": {}}
 
@@ -912,6 +919,11 @@ def _collect_boundary_context(
     internal_raw.extend(str(codex_home / name) for name in (
         "memories", "sessions", "cache", "tmp", ".tmp", "sqlite", "attachments", "visualizations",
     ))
+    if payload.get("_client") == "claude":
+        claude_home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or home_p / ".claude").expanduser()
+        internal_raw.extend(str(claude_home / name) for name in (
+            "projects", "todos", "session-env", "statsig", "telemetry", "hooks/state", "hooks/logs",
+        ))
     for host in ("antigravity", "antigravity-cli", "antigravity-ide"):
         internal_raw.extend(str(gemini_home / host / name) for name in (
             "brain", "plugin_data", "conversations", "annotations", "knowledge", "scratch",
@@ -2107,7 +2119,7 @@ def _detect_command_external_mutation(
         ):
             return "创建项目外 Git 工作树 (git worktree add)", wt_path, _compact_snippet(m_wt.group(0))
 
-    # 2. 专项拦截: 执行生产级全局安装脚本 (默认改写 ~/.gemini/config 与 ~/.codex)
+    # 2. 专项拦截: 执行生产级全局安装脚本 (默认改写 ~/.gemini/config、~/.codex、~/.claude 或 ~/.cc-switch)
     for m_inst in _INSTALLER_INVOKE_RE.finditer(shell_masked):
         if _pos_inside_quotes(shell_masked, m_inst.start()):
             continue
@@ -2116,8 +2128,11 @@ def _detect_command_external_mutation(
             continue
         tail_args = m_inst.group(1) or ""
         arg_tokens = _safe_split_tokens(tail_args)
-        value_flags = {"--app", "--target-dir", "--codex-home", "--codex-skills-dir", "--zotero-cmd",
-                       "--codex-handoff-mode", "--codex-handoff-compactions"}
+        value_flags = {
+            "--app", "--target-dir", "--codex-home", "--codex-skills-dir", "--claude-home",
+            "--ccswitch-db", "--zotero-cmd", "--codex-handoff-mode", "--codex-handoff-compactions",
+            "--claude-handoff-mode", "--claude-handoff-compactions",
+        }
         options = {flag: [] for flag in value_flags}
         switches = set()
         idx = 0
@@ -2132,26 +2147,31 @@ def _detect_command_external_mutation(
                 options[flag].append(value)
             else:
                 switches.add(token.lower())
-        if switches & {"--dry-run", "-dryrun", "--probe-apps"}:
+        if switches & {"--dry-run", "-dryrun", "--probe-apps", "--audit-upgrade"}:
             continue
         target_dirs = options["--target-dir"]
         skills_dirs = options["--codex-skills-dir"]
         codex_homes = options["--codex-home"]
+        claude_homes = options["--claude-home"]
+        ccswitch_dbs = options["--ccswitch-db"]
         app = options["--app"][-1] if options["--app"] else "auto"
         complete = {
-            "both": bool(target_dirs and (codex_homes or skills_dirs)),
-            "antigravity": bool(target_dirs),
-            "codex": bool(codex_homes or skills_dirs),
-            "auto": bool(target_dirs or codex_homes or skills_dirs),
+            "all": bool(target_dirs and (codex_homes or skills_dirs) and claude_homes),
+            "both": bool(target_dirs and (codex_homes or skills_dirs) and not claude_homes),
+            "antigravity": bool(target_dirs and not (codex_homes or skills_dirs or claude_homes)),
+            "codex": bool((codex_homes or skills_dirs) and not (target_dirs or claude_homes)),
+            "claude": bool(claude_homes and not (target_dirs or codex_homes or skills_dirs)),
+            "auto": bool(target_dirs or codex_homes or skills_dirs or claude_homes),
         }.get(app, False)
         if complete and "--no-zotero" in switches:
+            sandbox_targets = target_dirs + skills_dirs + codex_homes + claude_homes + ccswitch_dbs
             if all(value and _is_write_target_allowed(
                 value, base_cwd, allowed_norm_keys, allowed_resolved_keys, allow_os_temp, wsl_distribution
-            ) for value in target_dirs + skills_dirs + codex_homes):
+            ) for value in sandbox_targets):
                 continue
         return (
-            "执行全局配置同步安装 (将更新本机 ~/.gemini/config 与/或 ~/.codex)",
-            "~/.gemini/config/plugins/user-guard, ~/.codex",
+            "执行全局配置同步安装 (将更新本机 ~/.gemini/config、~/.codex 与/或 ~/.claude)",
+            "~/.gemini/config/plugins/user-guard, ~/.codex, ~/.claude",
             _compact_snippet(m_inst.group(0)),
         )
 
@@ -2428,19 +2448,131 @@ def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
         return boundary or {"decision": "allow"}
 
 
+def _claude_permission(decision: str, reason: str) -> Dict[str, Any]:
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                                   "permissionDecisionReason": reason}}
+
+
+def _claude_check_polling(tool_name: str, args: Dict[str, Any], sid: str, cwd: Optional[str],
+                          state_dir: Path, logs_dir: Path) -> Dict[str, Any]:
+    raw_target = ""
+    if tool_name == "Read":
+        raw_target = str(args.get("file_path") or "")
+        signature = json.dumps({key: args.get(key) for key in ("offset", "limit")}, sort_keys=True)
+    elif tool_name == "Grep":
+        raw_target = str(args.get("path") or cwd or "")
+        signature = json.dumps({key: args.get(key) for key in
+                                ("pattern", "glob", "output_mode", "head_limit", "offset", "type", "-i", "-n", "-A", "-B", "-C", "multiline")},
+                               sort_keys=True, ensure_ascii=False)
+    elif tool_name in ("Bash", "PowerShell"):
+        raw_target, subsystem, signature = parse_run_command_evidence(str(args.get("command") or ""))
+        if subsystem:
+            return {}
+    else:
+        return {}
+    if not raw_target:
+        return {}
+    target = resolve_target_path(raw_target, cwd, [])
+    if tool_name == "Grep" and target.is_dir():
+        targets = sorted(path for path in target.rglob(str(args.get("glob") or "*"))
+                         if path.is_file() and is_evidence_file(str(path)))
+    else:
+        targets = [target] if is_evidence_file(str(target)) else []
+    fingerprints = []
+    for path in targets:
+        if _is_inside_dir(path, state_dir) or _is_inside_dir(path, logs_dir):
+            continue
+        fp = compute_file_fingerprint(path)
+        if fp:
+            fingerprints.append(fp)
+    if not fingerprints:
+        return {}
+    state_file = state_dir / f"{sid}_status_guard.json"
+    state = _load_guard_state(state_file, sid, logs_dir)
+    query_key = f"claude:{tool_name}:{_canonical_path_key(target)}|{signature}"
+    previous = state["records"].get(query_key)
+    unchanged = isinstance(previous, dict) and previous.get("files") == fingerprints
+    state["records"][query_key] = {"files": fingerprints, "params": signature}
+    _save_guard_state(state_file, state, sid)
+    if unchanged:
+        reason = ("【user-guard 防空转门禁阻断】目标证据文件内容与查询参数自上次读取后未发生任何变化。"
+                  "请等待后台任务产生新输出或先推进其他工作；改变读取区间或查询参数后将自动放行。")
+        log_event("PreToolUse:status_guard", sid, f"DENIED unchanged Claude {tool_name}", logs_dir)
+        return _claude_permission("deny", reason)
+    return {}
+
+
+def handle_claude_pre_tool_use(payload: Dict[str, Any], state_dir: Optional[Path] = None,
+                               logs_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Claude PreToolUse：项目边界与证据查询门禁，放行使用空对象。"""
+    sid = str(payload.get("session_id") or "unknown_session").strip()
+    home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+    state_dir = Path(state_dir).expanduser() if state_dir is not None else home / "hooks" / "state"
+    logs_dir = Path(logs_dir).expanduser() if logs_dir is not None else home / "hooks" / "logs"
+    tool_name = str(payload.get("tool_name") or "").strip()
+    args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    cwd = str(payload.get("cwd") or "").strip() or None
+    boundary_payload = {"cwd": cwd, "transcriptPath": payload.get("transcript_path"), "_client": "claude"}
+    projects, allowed, resolved, display, base_cwd = _collect_boundary_context(boundary_payload, state_dir, logs_dir)
+    hit = None
+    if projects:
+        allow_temp = not any(_is_standard_os_temp_key(key) for key in projects)
+        if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+            target = str(args.get("file_path") or args.get("notebook_path") or args.get("path") or "").strip()
+            if target and not _is_write_target_allowed(target, base_cwd, allowed, resolved, allow_temp):
+                hit = (f"{tool_name} 创建或修改文件", target, "")
+        elif tool_name in ("Bash", "PowerShell"):
+            hit = _detect_command_external_mutation(str(args.get("command") or ""), base_cwd, allowed, resolved, allow_temp)
+    if hit:
+        action, target, snippet = hit
+        decision = "deny" if os.environ.get("CAE_HARNESS_DEPTH", "").strip() not in ("", "0") else "ask"
+        reason = (f"【user-guard 项目目录硬边界】当前项目根目录：{display}。"
+                  f"具体写删动作：{action}；项目外目标路径：{target}。")
+        description = str(args.get("description") or "").strip()
+        if description:
+            reason += f"任务说明：{description}。"
+        if snippet:
+            reason += f"触发语句：{snippet}。"
+        reason += "无头子任务禁止越界写入。" if decision == "deny" else "按 R4，改动项目外业务文件或全局配置须先获得用户明确批准。"
+        log_event("PreToolUse:workspace_boundary", sid, reason, logs_dir)
+        return _claude_permission(decision, reason)
+    if not user_words.valid_session_id(sid):
+        return {}
+    try:
+        with user_words.session_state_lock(state_dir, sid):
+            return _claude_check_polling(tool_name, args, sid, cwd, state_dir, logs_dir)
+    except (OSError, ValueError) as exc:
+        log_event("PreToolUse:state_error", sid, f"Claude 轮询状态未更新（{exc}）", logs_dir)
+        return {}
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="项目目录边界与防空转门禁")
+    parser.add_argument("--client", choices=("antigravity", "claude"), default="antigravity")
+    parser.add_argument("--state-dir", default="")
+    parser.add_argument("--log-dir", default="")
+    args, _ = parser.parse_known_args()
     payload: Dict[str, Any] = {}
     try:
         payload = user_words.read_hook_payload()
     except (OSError, ValueError) as e:
-        log_event("PreToolUse:status_guard", "unknown", f"Failed to parse stdin JSON: {e}")
+        if args.client == "claude":
+            sys.stderr.write(f"Claude PreToolUse JSON parse error: {e}\n")
+        else:
+            log_event("PreToolUse:status_guard", "unknown", f"Failed to parse stdin JSON: {e}")
 
     try:
-        response = handle_pre_tool_use(payload)
+        response = (handle_claude_pre_tool_use(payload, Path(args.state_dir) if args.state_dir else None,
+                                              Path(args.log_dir) if args.log_dir else None)
+                    if args.client == "claude" else handle_pre_tool_use(payload))
     except Exception as e:
         stack_str = traceback.format_exc()
-        log_event("PreToolUse:status_guard", str(payload.get("conversationId", "unknown")), f"Exception: {e}\n{stack_str}")
-        response = {"decision": "allow"}
+        if args.client == "claude":
+            sys.stderr.write(f"Claude PreToolUse: {e}\n")
+            response = {}
+        else:
+            log_event("PreToolUse:status_guard", str(payload.get("conversationId", "unknown")), f"Exception: {e}\n{stack_str}")
+            response = {"decision": "allow"}
 
     sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
     sys.stdout.flush()
