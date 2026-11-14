@@ -1538,7 +1538,7 @@ class TestGuardsOffline(unittest.TestCase):
         with unittest.mock.patch.object(status_guard, "_detect_command_external_mutation",
                                         wraps=status_guard._detect_command_external_mutation) as detect:
             self.assertIsNone(scan(safe))
-            self.assertEqual({Path(call.args[1]).resolve() for call in detect.call_args_list}, {project, project / "sub"})
+            self.assertEqual({Path(call.args[1]).resolve() for call in detect.call_args_list}, {project.resolve(), (project / "sub").resolve()})
         self.assertIsNotNone(scan(safe.replace("git status", "touch ../outside/x")))
         self.assertIsNotNone(scan("import subprocess\nsubprocess.run(args='git status', cwd=unknown_cwd)"))
         self.assertIsNone(scan("import subprocess\nsubprocess.run(args='git status', cwd=None)"))
@@ -1567,7 +1567,7 @@ class TestGuardsOffline(unittest.TestCase):
         with unittest.mock.patch.object(status_guard, "_detect_command_external_mutation",
                                         wraps=status_guard._detect_command_external_mutation) as detect:
             self.assertIsNone(scan(script))
-            self.assertEqual({Path(call.args[1]).resolve() for call in detect.call_args_list}, {project, project / "sub"})
+            self.assertEqual({Path(call.args[1]).resolve() for call in detect.call_args_list}, {project.resolve(), (project / "sub").resolve()})
         self.assertIsNotNone(scan(script.replace("git status", "touch ../outside/x")))
         with unittest.mock.patch.object(status_guard.ast, "parse", wraps=status_guard.ast.parse) as parse:
             self.assertIsNone(scan("print(1)"))
@@ -1600,8 +1600,8 @@ class TestGuardsOffline(unittest.TestCase):
                 self.assertEqual(command("cd " + home + " && touch bad.txt"), "force_ask", home)
         if os.name == "nt":
             mounted = status_guard._normalize_cross_env_lexical(str(project / "sub"))
-            self.assertEqual(status_guard._resolve_nearest_existing("ok.txt", mounted), project / "sub" / "ok.txt")
-            self.assertEqual(status_guard._resolve_nearest_existing(mounted + "/ok.txt", str(project)), project / "sub" / "ok.txt")
+            self.assertEqual(status_guard._resolve_nearest_existing("ok.txt", mounted), (project / "sub" / "ok.txt").resolve())
+            self.assertEqual(status_guard._resolve_nearest_existing(mounted + "/ok.txt", str(project)), (project / "sub" / "ok.txt").resolve())
             self.assertEqual(status_guard._host_path_string(mounted)[:2].upper(), project.drive.upper())
         else:
             self.assertEqual(status_guard._host_path_string("X:/Projects/work"), "/mnt/x/Projects/work")
@@ -1689,7 +1689,50 @@ class TestGuardsOffline(unittest.TestCase):
                 with unittest.mock.patch.object(status_guard, "_check_polling_locked", return_value={"decision": "allow"}) as polling:
                     result = status_guard.handle_pre_tool_use({**base, "toolCall": {"name": tool, "args": args}})
                     self.assertEqual(result["decision"], "allow")
-                    self.assertEqual(Path(polling.call_args.args[3]), project / "sub")
+                    self.assertEqual(Path(polling.call_args.args[3]).resolve(), (project / "sub").resolve())
+
+    @unittest.skipUnless(os.name == "nt", "验证 Windows NTFS 8.3 短路径归一化与边界门禁一致性")
+    def test_31_windows_8dot3_short_temp_and_workspace_boundary(self):
+        import ctypes
+
+        long_base = self.tmp_root / "long_8dot3_boundary_dir"
+        temp_dir = long_base / "Temp"
+        proj_dir = long_base / "WorkspaceProject"
+        (proj_dir / "sub").mkdir(parents=True)
+        temp_dir.mkdir(parents=True)
+
+        buf = ctypes.create_unicode_buffer(1024)
+        if not ctypes.windll.kernel32.GetShortPathNameW(str(long_base), buf, 1024) or "~" not in buf.value:
+            self.skipTest("当前卷未启用 NTFS 8.3 短文件名")
+        short_base = Path(buf.value)
+        short_temp = short_base / "Temp"
+        short_proj = short_base / "WorkspaceProject"
+        escape_link = temp_dir / "escape_junction"
+        try:
+            escape_link.symlink_to(long_base, target_is_directory=True)
+        except OSError:
+            import subprocess
+
+            proc = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                 "New-Item -ItemType Junction -Path $env:UG_JUNC -Target $env:UG_TGT | Out-Null"],
+                env={**os.environ, "UG_JUNC": str(escape_link), "UG_TGT": str(long_base)},
+                capture_output=True, timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        with unittest.mock.patch.object(status_guard.tempfile, "gettempdir", return_value=str(short_temp)):
+            base = {"conversationId": "win-8dot3", "cwd": str(short_proj), "workspacePaths": [str(short_proj)]}
+            for cmd, expected in (
+                ("cd sub && touch ok.txt", "allow"),
+                (f'python -c "open({str(proj_dir / "inside.txt")!r}, \'w\')"', "allow"),
+                (f'python -c "open({str(temp_dir / "scratch.txt")!r}, \'w\')"', "allow"),
+                (f'python -c "open({str(short_temp / "scratch2.txt")!r}, \'w\')"', "allow"),
+                (f'python -c "open({str(short_temp / "escape_junction" / "bad.txt")!r}, \'w\')"', "force_ask"),
+                (f'python -c "open({str(long_base / "outside.txt")!r}, \'w\')"', "force_ask"),
+            ):
+                res = status_guard.handle_pre_tool_use({**base, "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}}})
+                self.assertEqual(res["decision"], expected, cmd)
 
 
 if __name__ == "__main__":

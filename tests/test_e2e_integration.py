@@ -1299,7 +1299,7 @@ class TestEndToEndIntegration(unittest.TestCase):
 
     def test_18_codex_hook_upgrade_preserves_handlers_and_rejects_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            codex_root = Path(tmp) / "codex with spaces"
+            codex_root = Path(tmp).resolve() / "codex with spaces"
             codex_root.mkdir()
             hooks_path = codex_root / "hooks.json"
             loader_path = codex_root / "hooks" / "session_context_loader.py"
@@ -1383,7 +1383,7 @@ class TestEndToEndIntegration(unittest.TestCase):
 
     def test_20_codex_loader_upgrade_probes_only_trusted_interpreter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "codex"
+            root = Path(tmp).resolve() / "codex"
             root.mkdir()
             loader = (root / "hooks" / "session_context_loader.py").as_posix()
             old = {"type": "command", "command": f'"{sys.executable}" -B "{loader}" --client codex',
@@ -1418,7 +1418,7 @@ class TestEndToEndIntegration(unittest.TestCase):
 
     def test_20_codex_loader_upgrade_keeps_working_interpreter_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "codex"
+            root = Path(tmp).resolve() / "codex"
             root.mkdir()
             path = root / "hooks.json"
             template = REPO_ROOT / "template/codex/hooks.json"
@@ -1466,7 +1466,7 @@ class TestEndToEndIntegration(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows PATH 的应用执行别名")
     def test_20_shadowed_windows_python_loader_uses_working_launcher(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             alias = str(root / "WindowsApps" / "python.exe")
             python = str(root / "python" / "python.exe")
             launcher = str(root / "py.exe")
@@ -1690,7 +1690,7 @@ class TestEndToEndIntegration(unittest.TestCase):
 
     def test_25_agy_zotero_preserves_existing_remote_and_stdio_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             plugin = root / "agy-config" / "plugins" / "user-guard"
             config = plugin.parent.parent / "mcp_config.json"
             config.parent.mkdir()
@@ -2003,7 +2003,7 @@ class TestEndToEndIntegration(unittest.TestCase):
 
     def test_38_codex_gate_policy_update_keeps_working_interpreter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "codex"
+            root = Path(tmp).resolve() / "codex"
             root.mkdir()
             path = root / "hooks.json"
             interpreter = str(Path(sys.executable).resolve())
@@ -2193,6 +2193,45 @@ class TestEndToEndIntegration(unittest.TestCase):
                 )
                 self.assertTrue(resolved.exists(), f"{rel_posix} 存在失效的本地链接: {raw_target}")
         self.assertGreaterEqual(checked_md_count, 6)
+
+    @unittest.skipUnless(os.name == "nt", "验证 Windows NTFS 8.3 短路径下 Codex 托管钩子升级不重复追加")
+    def test_42_windows_8dot3_short_path_codex_hook_upgrade(self) -> None:
+        import ctypes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            long_root = Path(tmp).resolve() / "long_8dot3_codex_home"
+            (long_root / "hooks").mkdir(parents=True)
+            buf = ctypes.create_unicode_buffer(1024)
+            if not ctypes.windll.kernel32.GetShortPathNameW(str(long_root), buf, 1024) or "~" not in buf.value:
+                self.skipTest("当前卷未启用 NTFS 8.3 短文件名")
+            short_root = Path(buf.value)
+            interpreter = str(Path(sys.executable).resolve())
+            short_loader = (short_root / "hooks" / "session_context_loader.py").as_posix()
+            short_state = (short_root / "hooks" / "state" / "session-context").as_posix()
+            old = {
+                "type": "command",
+                "command": f'"{interpreter}" -B "{short_loader}" --client codex --state-dir "{short_state}"',
+                "timeout": 29,
+                "statusMessage": "保留既有状态提示",
+            }
+            hooks_path = short_root / "hooks.json"
+            hooks_path.write_text(
+                json.dumps({"hooks": {"SessionStart": [{"matcher": "^(compact|resume)$", "hooks": [old]}]}}),
+                encoding="utf-8",
+            )
+            template = REPO_ROOT / "template/codex/hooks.json"
+            with mock.patch.object(INSTALLER, "_hook_python_candidates", return_value=[("", interpreter, [])]), \
+                    mock.patch.object(INSTALLER, "_is_working_python_cmd", return_value=True) as probe:
+                plan = INSTALLER._plan_codex_hooks(hooks_path, template, "python -X utf8 -I -B")
+                probe.assert_called_once_with(interpreter, [])
+                self.assertIsNotNone(plan.change)
+                upgraded = json.loads(plan.change.content)["hooks"]["SessionStart"][0]["hooks"]
+                self.assertEqual(len(upgraded), 2)
+                self.assertEqual(sum("session_context_loader.py" in h["command"] for h in upgraded), 1)
+                self.assertEqual(upgraded[0]["timeout"], 29)
+                self.assertEqual(upgraded[0]["statusMessage"], "保留既有状态提示")
+                hooks_path.write_bytes(plan.change.content)
+                self.assertIsNone(INSTALLER._plan_codex_hooks(hooks_path, template, "python -X utf8 -I -B").change)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

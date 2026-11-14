@@ -11,7 +11,7 @@
 - **文档路径纯 ASCII 标准化与双向链接补齐（`docs/workflow-guide.md`、`docs/architecture-and-hooks.md`、`README.md`、`template/user-guard/README.md`）**：将 `docs/` 下两份中文命名文档规范重命名为小写 ASCII 短横线路径，彻底消除跨平台 Git 八进制路径转义（`core.quotepath`）、URL 百分号编码与旧版文件名语义脱节问题，并同步更新全仓引用链接。
 - **门面英文架构导引与语言作用边界声明（`README.md`）**：在不拆分冗余双语模板、不增加运行期常驻上下文开销的前提下，于根 `README.md` 顶部增设 `English Overview`，简明交代面向 AI-CAE／CFD／FEA／PDE 求解器研发的核心守护机制、三套部署模式及机器契约（英文）与内置交互规则（简体中文）的真实边界。
 - **版本号单点真源、行尾规约与脚本提示口径统一（`template/user-guard/plugin.json`、`template/user-guard/README.md`、`install.ps1`、`.gitattributes`）**：移除插件子目录 `README.md` 中易遗漏的静态版本号硬编码，统一以 `plugin.json` 为全仓唯一版本真源；统一 `install.ps1` 错误输出语种并保持 PowerShell 5.1 所需的 UTF-8 BOM + `CRLF` 编码；补齐 `.gitattributes` 对 `.toml`、`.yml`、`.yaml`、`.svg` 的 `LF` 行尾约束。
-- **跨平台 CI 自动回归门禁与仓库规范单测（`.github/workflows/ci.yml`、`tests/test_e2e_integration.py`）**：新增最小权限 GitHub Actions 工作流（覆盖 `ubuntu-latest` 与 `windows-latest`、Python `3.11`／`3.13` 三模式沙箱安装与全量离线测试），并在端到端测试中新增受控文件纯 ASCII 路径、Markdown 本地相对链接目标存在性及插件文档无重复静态版本号硬编码校验。
+- **跨平台 CI 自动回归门禁、Windows `8.3` 短路径兼容与仓库规范单测（`.github/workflows/ci.yml`、`install.py`、`status_guard.py`、`tests/`）**：新增最小权限 GitHub Actions 工作流（覆盖 `ubuntu-latest` 与 `windows-latest`、Python `3.11`／`3.13` 三模式沙箱安装与全量离线测试）；修复 Windows 长用户名环境下 `%TEMP%` 等目录以 NTFS `8.3` 短路径（如 `RUNNER~1`）传入时 `status_guard.py` 词法边界与 `install.py` 托管钩子识别不一致的问题；并在端到端测试中新增纯 ASCII 路径、相对链接有效性及单点版本号校验。
 
 ---
 

@@ -40,6 +40,15 @@ import user_words  # noqa: E402
 
 user_words.ensure_utf8_stdio()
 
+if os.name == "nt":
+    import ctypes
+
+    _WIN_GET_LONG_PATH = ctypes.windll.kernel32.GetLongPathNameW
+    _WIN_GET_LONG_PATH.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+    _WIN_GET_LONG_PATH.restype = ctypes.c_uint
+else:
+    _WIN_GET_LONG_PATH = None
+
 # 证据类扩展名与严格锚定文件名正则（防止误伤业务源码如 status.json / test_result.json）
 EVIDENCE_EXTENSIONS = {".log", ".out", ".err", ".output"}
 EVIDENCE_FILENAME_RE = re.compile(
@@ -677,6 +686,45 @@ def _expand_host_vars(raw_str: str) -> str:
     return os.path.expanduser(s)
 
 
+def _win_expand_short_path(win_path: str) -> str:
+    """在 Windows 下将已存在前缀中的 NTFS 8.3 短文件名还原为长文件名，不跟随软链接或目录联接。"""
+    if os.name != "nt" or _WIN_GET_LONG_PATH is None or "~" not in win_path:
+        return win_path
+    try:
+        cur = Path(win_path)
+        tail: List[str] = []
+        while True:
+            cur_str = str(cur)
+            buf = ctypes.create_unicode_buffer(max(len(cur_str) + 256, 512))
+            length = _WIN_GET_LONG_PATH(cur_str, buf, len(buf))
+            if length > len(buf):
+                buf = ctypes.create_unicode_buffer(length)
+                length = _WIN_GET_LONG_PATH(cur_str, buf, length)
+            if length:
+                res = Path(buf.value)
+                for part in reversed(tail):
+                    res = res / part
+                return str(res)
+            if cur.parent == cur:
+                return win_path
+            tail.append(cur.name)
+            cur = cur.parent
+    except (OSError, ValueError, RuntimeError):
+        return win_path
+
+
+def _normalize_win_mount_key(drv: str, rest: str) -> str:
+    norm = posixpath.normpath(f"/mnt/{drv}/{rest}")
+    prefix = f"/mnt/{drv}"
+    if "~" in norm and os.name == "nt" and (norm == prefix or norm.startswith(prefix + "/")):
+        sub = norm[len(prefix):].lstrip("/")
+        expanded = _win_expand_short_path(f"{drv.upper()}:\\" + sub.replace("/", "\\"))
+        m_exp = re.match(r"^([A-Za-z]):(?:[\\/](.*))?$", expanded)
+        if m_exp:
+            norm = posixpath.normpath(f"/mnt/{m_exp.group(1).lower()}/{(m_exp.group(2) or '').replace(chr(92), '/')}")
+    return norm.casefold()
+
+
 def _normalize_cross_env_lexical(raw_str: str, base_dir: Optional[str] = None) -> str:
     """盘符与 /mnt/<drive> 共用规范键；本机 POSIX 路径保留大小写，物理路径另查软链接。"""
     expanded = user_words.strip_win_extended_prefix(_expand_host_vars(raw_str))
@@ -697,20 +745,18 @@ def _normalize_cross_env_lexical(raw_str: str, base_dir: Optional[str] = None) -
 
     m_drive = re.match(r"^([A-Za-z]):(?:/(.*))?$", slashes)
     if m_drive:
-        drv = m_drive.group(1).lower()
-        rest = m_drive.group(2) or ""
-        norm = posixpath.normpath(f"/mnt/{drv}/{rest}")
-        return norm.casefold()
+        return _normalize_win_mount_key(m_drive.group(1).lower(), m_drive.group(2) or "")
 
     m_mnt = re.match(r"^/mnt/([A-Za-z])(?:/(.*))?$", slashes)
     if m_mnt:
-        drv = m_mnt.group(1).lower()
-        rest = m_mnt.group(2) or ""
-        norm = posixpath.normpath(f"/mnt/{drv}/{rest}")
-        return norm.casefold()
+        return _normalize_win_mount_key(m_mnt.group(1).lower(), m_mnt.group(2) or "")
 
     if is_unc:
         norm = "//" + posixpath.normpath(slashes.lstrip("/"))
+        if "~" in norm and os.name == "nt":
+            win_unc = _win_expand_short_path(norm.replace("/", "\\"))
+            if win_unc.startswith("\\\\"):
+                norm = "//" + posixpath.normpath(win_unc.replace("\\", "/").lstrip("/"))
         return norm.casefold()
 
     norm = posixpath.normpath(slashes)

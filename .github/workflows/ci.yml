@@ -58,5 +58,15 @@ jobs:
                   [*py, "install.py", "--app", "both", "--target-dir", str(base / "both_agy" / "plugins" / "user-guard"), "--codex-home", str(base / "both_codex"), "--no-zotero"],
               ]
               for cmd in commands:
-                  subprocess.run(cmd, cwd=repo, check=True)
+                  proc = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                  if proc.stdout:
+                      sys.stdout.write(proc.stdout)
+                  if proc.stderr:
+                      sys.stderr.write(proc.stderr)
+                  if proc.returncode != 0:
+                      tail = " | ".join(
+                          line.strip() for line in (proc.stdout + "\n" + proc.stderr).splitlines() if line.strip()
+                      )[-800:]
+                      print(f"::error::CI command failed (exit {proc.returncode}): {tail}", flush=True)
+                      raise SystemExit(proc.returncode)
           PY

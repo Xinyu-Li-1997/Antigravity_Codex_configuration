@@ -52,7 +52,7 @@ class HarnessTests(unittest.TestCase):
         harness._CANCELLED.clear()
         harness._SESSION_QUOTA_BLOCKED.clear()
         self.temp = tempfile.TemporaryDirectory(prefix='cae-test-')
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
 
     def tearDown(self):
         harness._CANCELLED.clear()

@@ -98,6 +98,20 @@ def _is_link_or_junction(path: Path) -> bool:
     return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
 
+def _same_nonlink_path(left: Path, right: Path) -> bool:
+    if not left.is_absolute() or not right.is_absolute():
+        return False
+    if left == right:
+        return True
+    try:
+        for path in (left, right):
+            if any(_is_link_or_junction(item) for item in (*path.parents, path)):
+                return False
+        return left.resolve() == right.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _validate_path(path: Path, *, directory: bool) -> Path:
     """逐级检查真实目录，拒绝路径跳转和目标文件硬链接。"""
     path = path.expanduser().absolute()
@@ -830,7 +844,7 @@ def detect_hook_python_command(*, antigravity: bool = False) -> str:
         if not name:
             continue
         shell_path = shutil.which(name)
-        if shell_path and Path(shell_path) == Path(executable) and _is_working_python_cmd(executable, launcher_args):
+        if shell_path and _same_nonlink_path(Path(shell_path), Path(executable)) and _is_working_python_cmd(executable, launcher_args):
             return " ".join([name, *launcher_args, flags])
     if antigravity and os.name == "nt":
         raise ValueError("Windows 反重力钩子需要 PATH 中可执行的 Python 3.11+（python.exe 或 py.exe -3）。")
@@ -1389,7 +1403,7 @@ def _codex_managed_hook(
 
     def matches(token: str, path: Path) -> bool:
         try:
-            return Path(token).expanduser() == path
+            return _same_nonlink_path(Path(token).expanduser(), path)
         except (RuntimeError, ValueError):
             return False
 
@@ -1407,7 +1421,7 @@ def _codex_managed_hook(
             return ManagedCodexHook("custom", None)
         interpreter = next(
             ((path, flags) for name, path, flags in candidates
-             if (path_prefix and Path(executable) == Path(path))
+             if (path_prefix and _same_nonlink_path(Path(executable), Path(path)))
              or (name and command == name)
              or (os.name == "nt" and name and command + ".exe" == name)),
             None,
@@ -1418,7 +1432,7 @@ def _codex_managed_hook(
             launcher = interpreter[1]
         elif interpreter is not None:
             resolved = shutil.which(executable)
-            if not resolved or Path(resolved) != Path(interpreter[0]):
+            if not resolved or not _same_nonlink_path(Path(resolved), Path(interpreter[0])):
                 interpreter = None
         actual_flags = tokens[1:idx]
         if not any(actual_flags == launcher + flags for flags in LEGACY_PYTHON_FLAGS):
