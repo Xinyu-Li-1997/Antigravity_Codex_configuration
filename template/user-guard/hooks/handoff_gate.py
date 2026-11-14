@@ -206,7 +206,6 @@ def default_gate_state(conversation_id: str) -> Dict[str, Any]:
         "enteredFreezeAtStep": None,
         "drainInvocationsRemaining": DEFAULT_DRAIN_INVOCATIONS,
         "drainActionsRemaining": DEFAULT_DRAIN_ACTIONS,
-        "handoffFilesTouched": [],
         "handoffFileBaselines": {},
         "imageReads": {},
         "imageReadCallCount": 0,
@@ -241,7 +240,7 @@ def load_gate_state(state_dir: Path, conversation_id: str) -> Dict[str, Any]:
         merged = dict(default)
         merged.update(raw)
         merged["gateSchemaVersion"] = int(raw.get("gateSchemaVersion", 1))
-        for key in ("triggers", "handoffFilesTouched", "handoffFileBaselines", "imageReads", "stopGateBlockedTurnKeys",
+        for key in ("triggers", "handoffFileBaselines", "imageReads", "stopGateBlockedTurnKeys",
                     "lastAdvisoryTriggers", "drainInvocationsRemaining", "drainActionsRemaining",
                     "imageReadCallCount", "overrideUntilCheckpoint", "overrideUntilStep", "bannerTriggerHostStep"):
             if type(merged[key]) is not type(default[key]):
@@ -352,10 +351,11 @@ def record_image_read(
 # ③ Shell 分句、包装器与命令副作用分类
 
 def _split_shell_clauses(cmd_str: str) -> List[str]:
-    """线性扫描引号外的分隔符；& 后台执行和花括号内命令也必须接受检查。"""
+    """切分引号外的命令分组，保留命令替换和函数调用中的内嵌括号。"""
     clauses: List[str] = []
     buf: List[str] = []
     quote_ch: Optional[str] = None
+    embedded_parens = 0
     i = 0
     n = len(cmd_str)
     while i < n:
@@ -377,12 +377,37 @@ def _split_shell_clauses(cmd_str: str) -> List[str]:
             i += 1
             continue
 
-        if ch == "\\" and i + 1 < n and cmd_str[i + 1] in ";&|{}\n\"'":
+        if ch == "\\" and i + 1 < n and cmd_str[i + 1] in ";&|{}()\n\"'":
             buf.extend((ch, cmd_str[i + 1]))
             i += 2
             continue
 
-        if ch in ("\n", ";", "{", "}"):
+        if ch == "(":
+            previous = buf[-1] if buf else ""
+            # %(refname) 等 Git 格式占位符也属于当前参数。
+            if embedded_parens or (previous and (previous.isalnum() or previous in "$<>_:%")):
+                embedded_parens += 1
+                buf.append(ch)
+            else:
+                seg = "".join(buf).strip()
+                if seg:
+                    clauses.append(seg)
+                buf = []
+            i += 1
+            continue
+
+        if ch == ")" and embedded_parens:
+            embedded_parens -= 1
+            buf.append(ch)
+            i += 1
+            continue
+
+        if embedded_parens:
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch in ("\n", ";", "{", "}", ")"):
             seg = "".join(buf).strip()
             if seg:
                 clauses.append(seg)
@@ -487,11 +512,6 @@ def _unwrap_clause_or_shell(tokens: List[str]) -> Tuple[List[str], Optional[str]
             continue
         break
     return tokens[idx:], None
-
-
-def _unwrap_clause_tokens(tokens: List[str]) -> List[str]:
-    unwrapped, inner = _unwrap_clause_or_shell(tokens)
-    return _safe_split_clause_tokens(inner) if inner is not None else unwrapped
 
 
 def _git_subcommand(tokens: List[str]) -> Tuple[Optional[str], List[str]]:
@@ -1113,7 +1133,6 @@ def _refresh_phase_from_telemetry(
     # 重新核对旧版单一体积或匿名告警触发，保留其他已登记的触发依据。
     if int(gate_state.get("gateSchemaVersion", 1)) < 3:
         gate_state["gateSchemaVersion"] = 3
-        gate_state["handoffFilesTouched"] = []
         changed = True
         prev_triggers = set(gate_state.get("triggers") or [])
         if (prev_phase in ("advisory", "drain", "freeze") and prev_triggers
@@ -1215,7 +1234,6 @@ def _refresh_phase_from_telemetry(
         gate_state["phase"] = "drain"
         gate_state["triggers"] = list(dict.fromkeys(stage2_hits))
         gate_state["enteredDrainAtStep"] = tel["latestStep"]
-        gate_state["handoffFilesTouched"] = []
         gate_state["handoffFileBaselines"] = {}
         gate_state["drainInvocationsRemaining"] = DEFAULT_DRAIN_INVOCATIONS
         gate_state["drainActionsRemaining"] = DEFAULT_DRAIN_ACTIONS
@@ -1390,12 +1408,14 @@ def check_pre_tool_use_locked(payload: Dict[str, Any], state_dir: Path,
 
     # 2. manage_task / manage_subagents：允许查看或收尾后台任务（不扣减动作预算）
     if tool_name in AGY_INSPECTION_TOOLS:
-        save_gate_state(state_dir, conversation_id, gate_state)
+        if changed or is_image_read:
+            save_gate_state(state_dir, conversation_id, gate_state)
         return None
 
     # 3. read_file：禁止读图（防耗尽剩余配额），放行文本核对
     if tool_name == "read_file":
-        save_gate_state(state_dir, conversation_id, gate_state)
+        if changed or is_image_read:
+            save_gate_state(state_dir, conversation_id, gate_state)
         if is_image_read:
             return {
                 "decision": "deny",
@@ -1648,6 +1668,9 @@ def _scan_codex_compactions(transcript: Path, ledger: Dict[str, Any]) -> Optiona
             stream.seek(max(0, offset - 128))
             anchor = hashlib.sha256(stream.read(min(128, offset))).hexdigest()
             if (cursor.get("identity") != identity or offset > stat.st_size or anchor != cursor.get("anchor")):
+                for key in list(records):
+                    if key.startswith("record:") and records[key].get("path") == str(transcript):
+                        del records[key]
                 cursor = {"identity": identity, "activeTurn": "", "pendingRecord": "", "occurrences": {}}
                 offset = 0
             if (not isinstance(cursor.get("occurrences"), dict)
@@ -1663,8 +1686,6 @@ def _scan_codex_compactions(transcript: Path, ledger: Dict[str, Any]) -> Optiona
                 if not raw.endswith(b"\n"):
                     stream.seek(row_offset)
                     break
-                pending = cursor["pendingRecord"]
-                cursor["pendingRecord"] = ""
                 if not any(token in raw for token in (b'"compacted"', b'"turn_context"', b'"task_started"',
                                                       b'"turn_started"', b'"task_complete"', b'"turn_complete"',
                                                       b'"turn_aborted"')):
@@ -1676,6 +1697,7 @@ def _scan_codex_compactions(transcript: Path, ledger: Dict[str, Any]) -> Optiona
                     continue
                 if not isinstance(entry, dict) or not isinstance(entry.get("payload"), dict):
                     continue
+                pending = cursor["pendingRecord"]
                 kind = entry.get("type")
                 fields = entry["payload"]
                 turn = fields.get("turn_id")
@@ -1685,12 +1707,15 @@ def _scan_codex_compactions(transcript: Path, ledger: Dict[str, Any]) -> Optiona
                         cursor["activeTurn"] = turn
                     elif fields.get("type") in ("task_complete", "turn_complete", "turn_aborted"):
                         cursor["activeTurn"] = ""
+                        cursor["pendingRecord"] = ""
                 elif kind == "turn_context" and turn:
                     if pending:
                         records[pending].update(turn=turn, turnSource="following_turn_context")
+                        cursor["pendingRecord"] = ""
                     if not cursor["activeTurn"]:
                         cursor["activeTurn"] = turn
                 elif kind == "compacted":
+                    cursor["pendingRecord"] = ""
                     window_id = fields.get("window_id")
                     if isinstance(window_id, str) and window_id:
                         key = f"window:{window_id}"
@@ -1708,7 +1733,7 @@ def _scan_codex_compactions(transcript: Path, ledger: Dict[str, Any]) -> Optiona
                     else:
                         if active_turn and not rec["turn"]:
                             rec.update(turn=active_turn, turnSource="active_turn")
-                        if rec["turnSource"] != "record":
+                        if not (rec["turn"] and rec["turnSource"] in ("record", "following_turn_context")):
                             cursor["pendingRecord"] = key
 
             offset = stream.tell()
@@ -1869,6 +1894,8 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
         if event not in state["observedEvents"]:
             state["observedEvents"].append(event)
         state.update(mode=mode, compactLimit=compact_limit, lastModel=str(payload.get("model") or "unknown"))
+        if mode == "advisory" and state["phase"] in ("drain", "freeze"):
+            state["phase"] = "advisory"
         _reconcile_codex_compactions(payload, transcript, state)
         if state["phase"] == "normal" and (event == "PostCompact" or state["compactionCount"]):
             state["phase"] = "advisory"
@@ -1885,13 +1912,14 @@ def handle_codex_handoff(payload: Dict[str, Any], state_dir: Path, mode: str = "
             user_event_is_new = user_key != state["lastUserEvent"]
             if user_event_is_new:
                 state["lastUserEvent"] = user_key
+                state["stopCorrectionRequested"] = False
                 # 只处理短而明确的用户指令，引用长文中的相同短语不改变门禁。
                 if len(prompt) <= 160 and CODEX_OVERRIDE_REQUEST_RE.fullmatch(prompt):
                     state.update(phase="overridden", overrideUntilCount=count + OVERRIDE_SNOOZE_CPS,
                                  stopCorrectionRequested=False, handoffRecorded=False, toolDecisions={},
                                  handoffFileBaselines={})
                     enter_drain = False
-                elif CODEX_HANDOFF_REQUEST_RE.fullmatch(prompt):
+                elif mode == "enforce" and CODEX_HANDOFF_REQUEST_RE.fullmatch(prompt):
                     enter_drain = state["phase"] not in ("drain", "freeze")
         if enter_drain:
             state.update(phase="drain", drainActionsRemaining=CODEX_DRAIN_ACTIONS,

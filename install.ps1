@@ -23,18 +23,25 @@ function Find-WorkingPython {
             $process.StartInfo.RedirectStandardOutput = $true
             $process.StartInfo.RedirectStandardError = $true
             $null = $process.Start()
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
             if (-not $process.WaitForExit(5000)) {
                 $process.Kill()
                 $null = $process.WaitForExit(1000)
                 continue
             }
-            $probeOutput = $process.StandardOutput.ReadToEnd().Trim()
+            if (-not $stdoutTask.Wait(1000) -or -not $stderrTask.Wait(1000)) {
+                continue
+            }
+            $probeOutput = $stdoutTask.Result.Trim()
             if ($process.ExitCode -eq 0 -and $probeOutput -eq 'user-guard-python-ok') {
                 return $commandInfo.Source
             }
         } catch [System.ComponentModel.Win32Exception] {
             continue
         } catch [System.InvalidOperationException] {
+            continue
+        } catch [System.AggregateException] {
             continue
         } finally {
             $process.Dispose()
@@ -49,16 +56,38 @@ if (-not $python -and -not $launcher) {
     exit 1
 }
 
-# 原样透传参数，并把 Python 的退出码交还调用方。
-try {
-    if ($python) {
-        & $python -B -X utf8 "$PSScriptRoot\install.py" @args
-    } else {
-        & $launcher -3 -B -X utf8 "$PSScriptRoot\install.py" @args
+function Quote-WindowsArg {
+    param([AllowEmptyString()][string]$Value)
+    if ($Value.Length -eq 0) {
+        return '""'
     }
-    $installerExitCode = $LASTEXITCODE
-} catch [System.Management.Automation.RuntimeException] {
+    if ($Value -notmatch '[\s"]') {
+        return $Value
+    }
+    $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
+}
+
+# 直接继承控制台标准流启动 Python：既保留无换行交互提示即时输出，又避免 PowerShell 5.1 将原生 stderr 误判为终止异常。
+$exePath = if ($python) { $python } else { $launcher }
+$fullArgs = @(if (-not $python) { '-3' }) + @('-B', '-X', 'utf8', "$PSScriptRoot\install.py") + @($args)
+$installerExitCode = 1
+$proc = [System.Diagnostics.Process]::new()
+try {
+    $proc.StartInfo.FileName = $exePath
+    $proc.StartInfo.Arguments = ($fullArgs | ForEach-Object { Quote-WindowsArg ([string]$_) }) -join ' '
+    $proc.StartInfo.UseShellExecute = $false
+    $null = $proc.Start()
+    $proc.WaitForExit()
+    $installerExitCode = $proc.ExitCode
+} catch [System.ComponentModel.Win32Exception] {
     Write-Error "[!] 无法启动 Python 安装器。$($_.Exception.Message)" -ErrorAction Continue
     $installerExitCode = 1
+} catch [System.InvalidOperationException] {
+    Write-Error "[!] 无法启动 Python 安装器。$($_.Exception.Message)" -ErrorAction Continue
+    $installerExitCode = 1
+} finally {
+    $proc.Dispose()
 }
 exit $installerExitCode

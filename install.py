@@ -92,14 +92,21 @@ def _is_link_or_junction(path: Path) -> bool:
     if path.is_symlink():
         return True
     try:
-        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        metadata = path.lstat()
     except FileNotFoundError:
         return False
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    tag = getattr(metadata, "st_reparse_tag", 0)
+    if os.name == "nt" and tag:
+        return tag in (
+            getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C),
+            getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003),
+        )
     return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
 
 def _validate_path(path: Path, *, directory: bool) -> Path:
-    """逐级检查真实目录，拒绝符号链接、重解析点和目标文件硬链接。"""
+    """逐级检查真实目录，拒绝路径跳转和目标文件硬链接。"""
     path = path.expanduser().absolute()
     if ".." in path.parts:
         raise ValueError(f"安装路径不能包含未解析的上级目录: {path}")
@@ -112,6 +119,12 @@ def _validate_path(path: Path, *, directory: bool) -> Path:
             ):
                 raise ValueError(f"Windows 安装路径包含保留名称或非法字符: {ancestor}")
         if _is_link_or_junction(ancestor):
+            if (
+                os.name != "nt" and ancestor != path
+                and ancestor in (Path("/var"), Path("/tmp"), Path("/etc"))
+                and ancestor.resolve() == Path("/private") / ancestor.name
+            ):
+                continue
             if ancestor == path:
                 raise ValueError(f"安装目标是链接或目录联接，请指定真实路径: {ancestor}")
             raise ValueError(f"安装路径含祖先链接或目录联接，请指定真实路径: {ancestor}")
@@ -366,10 +379,22 @@ def _simple_toml_loads(source: str) -> Dict[str, Any]:
                 if path in explicit_tables:
                     raise ValueError("点分键重定义 TOML 表")
                 dotted_tables.add(path)
-            raw = re.fullmatch(rf"({TOML_STRING}|\[.*\]|[^#]*?)[ \t]*(?:#.*)?", assignment[3])
-            if not raw:
-                raise ValueError("无法识别 TOML 赋值")
-            value = raw[1]
+            value = assignment[3]
+            cursor = 0
+            while cursor < len(value):
+                if value[cursor] in "\"'":
+                    if value.startswith(('"""', "'''"), cursor):
+                        raise ValueError("多行 TOML 字符串需要 Python 3.11+ 才能安全解析")
+                    string = re.match(TOML_STRING, value[cursor:])
+                    if string is None:
+                        raise ValueError("无法识别 TOML 字符串")
+                    cursor += string.end()
+                elif value[cursor] == "#":
+                    value = value[:cursor]
+                    break
+                else:
+                    cursor += 1
+            value = value.strip(" \t")
             if value.startswith("[") and value.endswith("]"):
                 body = value[1:-1].strip(" \t")
                 items = []
@@ -872,7 +897,11 @@ def detect_installed_apps() -> Dict[str, Any]:
 def _hook_python_candidates() -> List[Tuple[str, str, List[str]]]:
     """从安装器自己的 PATH 和当前解释器发现候选，不读取钩子注册表。"""
     candidates: List[Tuple[str, str, List[str]]] = []
-    path_dirs = [Path(entry) for entry in os.get_exec_path() if Path(entry).is_absolute()]
+    path_dirs = []
+    for entry in os.get_exec_path():
+        directory = Path(entry.strip().strip('"') if os.name == "nt" else entry)
+        if directory.is_absolute():
+            path_dirs.append(directory)
     if os.name == "nt":
         for name, args in (("python.exe", []), ("py.exe", ["-3"])):
             for directory in path_dirs:
@@ -1082,6 +1111,17 @@ def mirror_sync_plugin(
             _validate_tree_links(stale_dir)
             shutil.rmtree(stale_dir)
             print(f"  [-] 已清理字节码缓存目录: {rel}")
+
+    if not dry_run:
+        for parent, _, _ in os.walk(target_plugin_dir, topdown=False, followlinks=False):
+            directory = Path(parent)
+            rel = directory.relative_to(target_plugin_dir)
+            if directory == target_plugin_dir or (template_dir / rel).is_dir():
+                continue
+            _validate_path(directory, directory=True)
+            if not any(directory.iterdir()):
+                directory.rmdir()
+                print(f"  [-] 已清理过时空目录: {rel}")
 
 
 def _plan_user_zotero(config_root: Path, zotero_exe: Optional[str]) -> Optional[FileChange]:
@@ -1572,6 +1612,7 @@ def _plan_codex_hooks(
     defaults = _read_codex_hooks(template_path, template_path.read_bytes())["hooks"]
     events = doc.setdefault("hooks", {})
     codex_path = codex_root.as_posix()
+    quote_path = (lambda path: '"' + path + '"') if os.name == "nt" else shlex.quote
 
     candidates = _hook_python_candidates()
     classifications = {}
@@ -1604,7 +1645,6 @@ def _plan_codex_hooks(
                 continue
             command = handler["command"].replace("--mode advisory --compact-limit 0", f"--mode {mode} --compact-limit {compact_limit}")
             script_start = command.index('"~/.codex/')
-            quote_path = (lambda path: '"' + path + '"') if os.name == "nt" else shlex.quote
             script_command = re.sub(
                 r'"~/.codex/([^"\n]+)"',
                 lambda match: quote_path(codex_path + '/' + match.group(1)),
@@ -1634,11 +1674,14 @@ def _plan_codex_hooks(
                 kind = managed.kind
                 if matching and kind in desired and kind not in retained:
                     updated_handler = handler
-                    if kind == "gate":
-                        updated_handler = {**handler, "command": desired[kind]["command"]}
-                    elif handler["command"] != desired[kind]["command"]:
+                    if handler["command"] != desired[kind]["command"]:
                         if managed.interpreter is None or not _is_working_python_cmd(*managed.interpreter):
                             updated_handler = {**handler, "command": desired[kind]["command"]}
+                        elif kind == "gate" and managed.policy != (mode, compact_limit):
+                            # gate 尾部固定为脚本路径和八个策略参数，沿用其解释器与启动选项。
+                            tokens = _codex_hook_tokens(handler)
+                            prefix = " ".join([quote_path(tokens[0]), *tokens[1:-9]])
+                            updated_handler = {**handler, "command": prefix + desired[kind]["command"][len(py_cmd):]}
                     handlers.append(updated_handler)
                     retained.add(kind)
             retained.update(custom_slots)

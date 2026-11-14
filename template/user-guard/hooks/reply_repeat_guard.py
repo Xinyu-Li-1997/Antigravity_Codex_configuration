@@ -34,8 +34,6 @@ MAX_SHORT_REPLY_CHARS = 300
 TAIL_SCAN_BYTES = 256 * 1024  # 256 KB
 SIMILARITY_THRESHOLD = 0.80
 CORE_SIMILARITY_THRESHOLD = 0.75
-MAX_LOG_BYTES = user_words.MAX_LOG_BYTES
-TRIM_LOG_BYTES = user_words.TRIM_LOG_BYTES
 
 WAIT_KEYWORDS = (
     "仍在运行",
@@ -179,12 +177,29 @@ def _read_tail_steps_with_offset(transcript_path: Path) -> Tuple[List[Dict[str, 
                     start_offset = seek_pos
                 else:
                     first_nl = raw.find(b"\n")
-                    if first_nl != -1:
+                    if first_nl != -1 and raw[first_nl + 1 :].strip():
                         start_offset = seek_pos + first_nl + 1
                         raw = raw[first_nl + 1 :]
                     else:
-                        start_offset = fsize
-                        raw = b""
+                        # 尾行可能独占整个窗口（包括仅有末尾换行的 JSONL）。
+                        # 有界逆向寻找行首，避免丢弃超长的最终交接回复。
+                        search_pos = seek_pos
+                        lower_bound = max(0, fsize - user_words.MAX_HOOK_INPUT_CHARS)
+                        while search_pos > lower_bound:
+                            chunk_start = max(lower_bound, search_pos - TAIL_SCAN_BYTES)
+                            f.seek(chunk_start)
+                            prefix = f.read(search_pos - chunk_start)
+                            last_nl = prefix.rfind(b"\n")
+                            if last_nl != -1:
+                                search_pos = chunk_start + last_nl + 1
+                                break
+                            search_pos = chunk_start
+                        else:
+                            if search_pos:
+                                return [], fsize
+                        start_offset = search_pos
+                        f.seek(start_offset)
+                        raw = f.read(fsize - start_offset)
             else:
                 f.seek(0)
                 raw = f.read(fsize)
@@ -344,8 +359,8 @@ def normalize_reply_text(text: str) -> str:
     """归一化回复文本（去除标点与多余空白，但保留字母、汉字与数字以敏感识别迭代步数/残差变化）"""
     low = text.strip().lower()
     # 移除常见 ISO 时间戳如 2026-11-12T06:00:00 或 06:12:34，保留业务数值（步数、残差、百分比）
-    low = re.sub(r"\b\d{4}-\d{2}-\d{2}[t\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})?\b", "", low)
-    low = re.sub(r"\b\d{2}:\d{2}:\d{2}\b", "", low)
+    low = re.sub(r"(?<!\d)\d{4}-\d{2}-\d{2}[t\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})?(?![0-9a-z])", "", low)
+    low = re.sub(r"(?<!\d)\d{2}:\d{2}:\d{2}(?!\d)", "", low)
     # 仅保留中英文字符、数字与科学计数法符号
     cleaned = re.sub(r"[^\w\u4e00-\u9fff.+-]+", " ", low)
     return re.sub(r"\s+", " ", cleaned).strip()
@@ -403,8 +418,18 @@ def _handle_stop_locked(payload: Dict[str, Any], state_dir: Path, conversation_i
 
     # 若当前会话处于长会话 Stage-2 (drain/freeze)，优先验收交接完整性与 /goal 停止标记（每回合至多阻断 1 次）
     last_input = user_words.clean_user_content(payload.get("lastUserInput"))
+    goal_active = user_words.agy_goal_command(last_input)
+    compaction_file = state_dir / f"{conversation_id}_compaction.json"
+    try:
+        compaction_state = json.loads(compaction_file.read_text(encoding="utf-8-sig"))
+        if (isinstance(compaction_state, dict) and compaction_state.get("conversationId") == conversation_id
+                and compaction_state.get("hasExplicitUserInput") is True):
+            # 已按步骤对账的用户输入及后续取消标记优先于 Stop 中的旧首轮输入。
+            goal_active = None
+    except (OSError, ValueError, RecursionError):
+        pass
     handoff_resp = handoff_gate.check_stop_handoff_locked(
-        payload, state_dir, turn_key, latest_reply, goal_active=user_words.agy_goal_command(last_input),
+        payload, state_dir, turn_key, latest_reply, goal_active=goal_active,
     )
     if handoff_resp is not None:
         return handoff_resp

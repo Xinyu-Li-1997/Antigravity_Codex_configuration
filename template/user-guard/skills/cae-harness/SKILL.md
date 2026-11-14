@@ -9,7 +9,7 @@ description: >-
 
 # 反重力与 Codex 双向协作技能（`cae-harness`）
 
-日常科研与数值求解器开发**默认由反重力总控**（负责全局统筹、多篇文献对照、跨模块梳理、方向把关、中文技术写作与最终验收）；双端均可用时，凡涉及**偏微分方程推导、高阶数值格式分析（如 DGSEM／WENO 通量、雅可比矩阵与守恒性证明）、核心求解器编码、严苛边界／脱敏审计及带验证命令的门禁闭环**，**优先通过本技能发起 Codex 无头工作流攻坚**（发挥其深度推理、高保持率长上下文与工程沙箱优势）。若用户指定纯代码项目由 Codex 总控，反重力则配合承担方案复核、技术润色与独立验收。所有跨端调用结果均返回发起方总控，经亲自核对原文件行号与运行证据后再整合交付。
+日常科研与数值求解器开发**默认由反重力总控**（负责全局统筹、多篇文献对照、跨模块梳理、方向把关、中文技术写作与最终验收）；双端均可用时，凡涉及**偏微分方程推导、高阶数值格式分析（如 DGSEM／WENO 通量、雅可比矩阵与守恒性证明）、核心求解器编码、深层边界审查及带验证命令的门禁闭环**，**优先通过本技能发起 Codex 无头工作流攻坚**（发挥其深度推理、高保持率长上下文与工程沙箱优势）；在阶段收口或发版前，按全量文件由 Codex 完成代码回归检查、Debug 排错与优化闭环，由反重力完成文档润色、冗余清淤与隐私脱敏把关。若用户指定纯代码项目由 Codex 总控，反重力则配合承担方案复核、技术润色与独立验收。所有跨端调用结果均返回发起方总控，经亲自核对原文件行号与运行证据后再整合交付。
 
 ## 职责边界：Codex 跨端攻坚优先与本侧原生工具解耦
 
@@ -67,9 +67,9 @@ python -B scripts/cae_harness.py task --caller codex --engine agy:default --kind
 | `direction` | 只读开展方案与数值格式相容性论证，返回依据对比与待拍板项 |
 | `review` | 只读逐行审查代码或公式，返回问题定位、精确行号与原文证据 |
 | `polish` | 只读读取原稿，在回执 `content` 中直接交付去套话、防无声放大的润色稿 |
-| `code` | 仅在 `--write-scope` 授权范围内修改文件，可附 `--verify-cmd` 执行自动化验收 |
+| `code` | 仅在 `--write-scope` 授权范围内修改文件，推荐附 `--verify-cmd` 执行自动化验收（回执显式标注 `verification_executed`） |
 
-写入范围必须位于 `--target` 目录之内（若 `--target` 指向单个文件且未传 `--write-scope`，默认仅授权修改该文件）。任务前后自动对比全目录快照，任何白名单外的写入或删除均判定为 `scope_violation`。调用 `Astra (max)` 执行 `math`／`direction` 任务时，输入应聚焦预提炼的控制方程或架构边界（必要时将 `--timeout` 设为 `900–1200`）；多文件常规代码对账优先选用 `review`（自动路由至最新代 `Sol`）。
+写入范围必须位于 `--target` 目录之内（若 `--target` 指向单个文件且未传 `--write-scope`，默认仅授权修改该文件）。任务前后自动对比全目录快照（非常规特殊文件如 FIFO／socket 直接拒绝防阻塞），任何白名单外的写入或删除均判定为 `scope_violation`。`--verify-cmd` 严禁传入空串或纯空白字符；若 `code` 任务未传 `--verify-cmd`，回执顶层会显式置 `"verification_executed": false` 并附未验证提示，提醒总控跑完验证后再验收。调用 `Astra (max)` 执行 `math`／`direction` 任务时，输入应聚焦预提炼的控制方程或架构边界（必要时将 `--timeout` 设为 `900–1200`）；多文件常规代码对账优先选用 `review`（自动路由至最新代 `Sol`）。
 
 ### 3. 大型求解器审计（`audit`）与物理／测试门禁（`gate`）
 
@@ -81,8 +81,8 @@ python -B scripts/cae_harness.py audit --caller antigravity --target "<项目目
 python -B scripts/cae_harness.py gate --caller antigravity --worker codex:sol --tier max --fallback-on-quota --target "<项目目录>" --task-file "<UTF-8任务单.md>" --write-scope "src/*.py" --verify-cmd "<验收命令>"
 ```
 
-- `audit`：扣除系统提示词、文件清单与 JSON Schema 开销后，在预算内采用单次全量审查（`single-pass`），超预算时按目录内聚性自动分片（`sharded`），并核对计划文件、自报已读文件与未读原因。横跨多个源文件的强耦合算子（如 DGSEM 体积分、界面数值通量与弯曲网格离散度量恒等式）须由总控做跨片联合核对。
-- `gate`：编码落盘后自动运行 `--verify-cmd`（验收命令自身生成的临时测试产物单独归入 `verification_changed_files`）；未通过时在 `--max-rounds` 轮次内携带真实报错继续修复，严禁放宽 `rtol`／`atol`、弱化守恒判据或删改测试断言。
+- `audit`：扣除系统提示词、文件清单与 JSON Schema 开销后，在预算内采用单次全量审查（`single-pass`），超预算时按目录内聚性自动分片（`sharded`），并核对计划文件、自报已读文件与未读原因（即使事后快照遇到权限异常，仍保留已完成的审计单元与发现明细并标注 `scope_verified: false`）。横跨多个源文件的强耦合算子（如 DGSEM 体积分、界面数值通量与弯曲网格离散度量恒等式）须由总控做跨片联合核对。
+- `gate`：编码落盘后自动在宿主机运行非空 `--verify-cmd`（回执顶层及每轮历史均记录 `verification_executed`，验收命令自身生成的临时测试产物单独归入 `verification_changed_files`）；未通过时在 `--max-rounds` 轮次内携带真实报错继续修复，严禁放宽 `rtol`／`atol`、弱化守恒判据或删改测试断言。
 
 ## 额度熔断回退与跨平台运行边界
 

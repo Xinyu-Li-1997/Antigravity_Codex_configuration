@@ -37,9 +37,24 @@ def _append_jsonl(path: Path, obj: dict) -> None:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
+def _new_temp_dir(prefix: str = "lifecycle-test-") -> tempfile.TemporaryDirectory:
+    try:
+        tmp = tempfile.TemporaryDirectory(prefix=prefix)
+        probe = Path(tmp.name) / ".probe.tmp"
+        target = Path(tmp.name) / ".probe.ok"
+        probe.write_bytes(b"ok")
+        os.replace(probe, target)
+        target.unlink()
+        return tmp
+    except OSError:
+        fallback = REPO_ROOT / ".pytest_cache" / "lifecycle_sandbox"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return tempfile.TemporaryDirectory(prefix=prefix, dir=fallback)
+
+
 class TestLifecycleCompactionEngine(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp_obj = tempfile.TemporaryDirectory()
+        self.tmp_obj = _new_temp_dir()
         self.tmp_root = Path(self.tmp_obj.name)
         self.plugin_data = self.tmp_root / "plugin_data"
         self.old_plugin_data = os.environ.get("PLUGIN_DATA")
@@ -1138,9 +1153,16 @@ class TestCodexHandoffAdapter(unittest.TestCase):
     def setUp(self):
         import handoff_gate
         self.gate = handoff_gate
-        self.tmp = tempfile.TemporaryDirectory(prefix="codex-handoff-test-")
+        self.tmp = _new_temp_dir(prefix="codex-handoff-test-")
         self.root = Path(self.tmp.name)
         self.state_dir = self.root / "state"
+        environment = mock.patch.dict(os.environ, {
+            "PLUGIN_DATA": str(self.root),
+            "USER_GUARD_LOGS_DIR": str(self.root / "logs"),
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("USER_GUARD_STATE_DIR", None)
         self.transcript = self.root / "rollout.jsonl"
         self.sid = "codex-handoff-main"
         _append_jsonl(self.transcript, {"type": "session_meta", "payload": {
@@ -1470,6 +1492,393 @@ class TestCodexHandoffAdapter(unittest.TestCase):
         self.assertEqual(len(out["injectSteps"]), 1)
         self.assertIn("保留数值通量守恒", out["injectSteps"][0]["systemMessage"]["systemMessage"])
         self.assertTrue((state_dir / f"{cid}_user_words.md").is_file())
+
+    def test_batch2_parenthesized_commands_are_blocked_in_both_hosts_and_phases(self):
+        self.call("UserPromptSubmit", mode="enforce", prompt="请整理交接并停机")
+        commands = (
+            "(git push origin main)",
+            "((git push origin main))",
+            "((ls && git push origin main))",
+            "(git status; git push origin main)",
+            "(python cae_harness.py task --kind code)",
+            "(ls && (git push origin main))",
+            'echo $(git status; git push origin main)',
+        )
+        for phase in ("drain", "freeze"):
+            state = self.state()
+            state["phase"] = phase
+            self.gate.save_gate_state(self.state_dir, self.sid, state)
+            agy_sid = "agy-grouped-" + phase
+            agy_state = self.gate.default_gate_state(agy_sid)
+            agy_state["phase"] = phase
+            self.gate.save_gate_state(self.state_dir, agy_sid, agy_state)
+            for command in commands:
+                with self.subTest(phase=phase, command=command):
+                    self.assertEqual(self.gate._classify_run_command(command), "blocked_always")
+                    codex = self.call("PreToolUse", mode="enforce", tool_name="Bash", tool_input={"command": command})
+                    self.assertEqual(codex["hookSpecificOutput"]["permissionDecision"], "deny")
+                    agy = self.gate.check_pre_tool_use_locked({
+                        "conversationId": agy_sid, "cwd": str(self.root),
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": command}},
+                    }, self.state_dir)
+                    self.assertEqual(agy["decision"], "deny")
+            for command in ('echo "$(git status)"', "echo [System.Text.UTF8Encoding]::new($false)"):
+                with self.subTest(phase=phase, safe=command):
+                    self.assertEqual(self.gate._split_shell_clauses(command), [command])
+                    self.assertEqual(self.gate._classify_run_command(command), "readonly_inspect")
+                    self.assertEqual(self.call("PreToolUse", mode="enforce", tool_name="Bash",
+                                               tool_input={"command": command}), {})
+                    self.assertIsNone(self.gate.check_pre_tool_use_locked({
+                        "conversationId": agy_sid, "cwd": str(self.root),
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": command}},
+                    }, self.state_dir))
+
+    def test_batch2_embedded_parentheses_preserve_calls_and_substitutions(self):
+        commands = (
+            "[System.Text.UTF8Encoding]::new($false)",
+            "foo()", "foo(bar(baz))", "echo $(git status)",
+            "cat <(git status)", "cat >(git status)", 'echo "(git push origin main)"',
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self.gate._split_shell_clauses(command), [command])
+                self.assertNotEqual(self.gate._classify_run_command(command), "blocked_always")
+        self.assertEqual(self.gate._split_shell_clauses("((git status; git push origin main))"),
+                         ["git status", "git push origin main"])
+
+    def test_batch2_compaction_pending_survives_unrelated_and_unparsed_rows(self):
+        self.call("PostCompact", trigger="auto")
+        _append_jsonl(self.transcript, {"type": "compacted", "payload": {"window_id": "batch2-window"}})
+        self.call("PreToolUse", tool_name="read_file")
+        _append_jsonl(self.transcript, {"type": "response_item", "payload": {"output": "ordinary output"}})
+        _append_jsonl(self.transcript, {"type": "session_meta", "payload": {"id": self.sid}})
+        _append_jsonl(self.transcript, {"type": "response_item", "payload": {"text": "turn_context"}})
+        _append_jsonl(self.transcript, ["turn_context"])
+        _append_jsonl(self.transcript, {"type": "turn_context", "payload": None})
+        with self.transcript.open("ab") as stream:
+            stream.write(b'{"type":"turn_context",bad}\n')
+        self.call("PreToolUse", tool_name="read_file")
+        ledger = self.state()["compactionLedger"]
+        self.assertEqual(ledger["files"][self.gate._path_key(self.transcript)]["pendingRecord"], "window:batch2-window")
+        _append_jsonl(self.transcript, {"type": "turn_context", "payload": {"turn_id": "turn-1"}})
+        self.call("PostCompact", trigger="auto")
+        state = self.state()
+        record = state["compactionLedger"]["records"]["window:batch2-window"]
+        self.assertEqual((record["turn"], record["turnSource"]), ("turn-1", "following_turn_context"))
+        self.assertEqual(state["compactionCount"], 1)
+        self.assertEqual(state["compactionRecordCount"], 1)
+        self.assertEqual(state["compactionFallbackCount"], 0)
+        self.assertEqual(state["compactionLedger"]["files"][self.gate._path_key(self.transcript)]["pendingRecord"], "")
+
+    def test_batch2_compaction_pending_ends_at_turn_completion_or_next_record(self):
+        for boundary in ("task_complete", "turn_complete", "turn_aborted", "compacted"):
+            with self.subTest(boundary=boundary):
+                transcript = self.root / (boundary + ".jsonl")
+                ledger = {"files": {}, "records": {}, "observations": {}}
+                _append_jsonl(transcript, {"type": "compacted", "payload": {"window_id": "first"}})
+                if boundary == "compacted":
+                    event = {"type": "compacted", "payload": {"window_id": "second"}}
+                else:
+                    event = {"type": "event_msg", "payload": {"type": boundary, "turn_id": "old"}}
+                _append_jsonl(transcript, event)
+                _append_jsonl(transcript, {"type": "turn_context", "payload": {"turn_id": "next"}})
+                self.assertIsNone(self.gate._scan_codex_compactions(transcript, ledger))
+                self.assertEqual(ledger["records"]["window:first"]["turn"], "")
+                if boundary == "compacted":
+                    self.assertEqual(ledger["records"]["window:second"]["turnSource"], "following_turn_context")
+                self.assertEqual(ledger["files"][self.gate._path_key(transcript)]["pendingRecord"], "")
+
+    def test_batch2_mirrored_compactions_keep_confirmed_turn_ownership(self):
+        for source in ("record", "following_turn_context"):
+            with self.subTest(source=source):
+                ledger = {"files": {}, "records": {}, "observations": {}}
+                first = self.root / (source + "-first.jsonl")
+                second = self.root / (source + "-mirror.jsonl")
+                fields = {"window_id": "shared"}
+                if source == "record":
+                    fields["turn_id"] = "confirmed"
+                _append_jsonl(first, {"type": "compacted", "payload": fields})
+                _append_jsonl(first, {"type": "turn_context", "payload": {"turn_id": "confirmed"}})
+                self.assertIsNone(self.gate._scan_codex_compactions(first, ledger))
+                _append_jsonl(second, {"type": "compacted", "payload": {"window_id": "shared"}})
+                _append_jsonl(second, {"type": "turn_context", "payload": {"turn_id": "unrelated"}})
+                self.assertIsNone(self.gate._scan_codex_compactions(second, ledger))
+                self.assertEqual(len(ledger["records"]), 1)
+                self.assertEqual(ledger["records"]["window:shared"]["turn"], "confirmed")
+                self.assertEqual(ledger["records"]["window:shared"]["turnSource"], source)
+                self.assertEqual(ledger["files"][self.gate._path_key(second)]["pendingRecord"], "")
+
+    def test_batch2_rewritten_codex_files_remove_only_their_offset_records(self):
+        for replacement in (False, True):
+            with self.subTest(replacement=replacement):
+                transcript = self.root / ("rewrite-" + str(replacement) + ".jsonl")
+                other = self.root / ("other-" + str(replacement) + ".jsonl")
+                ledger = {"files": {}, "records": {}, "observations": {}}
+                for message in ("old-one", "old-two"):
+                    _append_jsonl(transcript, {"type": "compacted", "payload": {"message": message, "turn_id": "old"}})
+                _append_jsonl(transcript, {"type": "compacted", "payload": {"window_id": "retained", "turn_id": "old"}})
+                _append_jsonl(other, {"type": "compacted", "payload": {"message": "other", "turn_id": "other"}})
+                self.assertIsNone(self.gate._scan_codex_compactions(transcript, ledger))
+                self.assertIsNone(self.gate._scan_codex_compactions(other, ledger))
+                old_keys = {key for key, rec in ledger["records"].items()
+                            if key.startswith("record:") and rec["path"] == str(transcript)}
+                other_keys = set(ledger["records"]) - old_keys
+                if replacement:
+                    rewritten = transcript.with_name("replacement.jsonl")
+                    rewritten.write_text("", encoding="utf-8")
+                    _append_jsonl(rewritten, {"type": "compacted", "payload": {"message": "new", "turn_id": "new"}})
+                    old_identity = [transcript.stat().st_dev, transcript.stat().st_ino]
+                    os.replace(rewritten, transcript)
+                    self.assertNotEqual([transcript.stat().st_dev, transcript.stat().st_ino], old_identity)
+                else:
+                    transcript.write_text("", encoding="utf-8")
+                    self.assertIsNone(self.gate._scan_codex_compactions(transcript, ledger))
+                    self.assertTrue(old_keys.isdisjoint(ledger["records"]))
+                    _append_jsonl(transcript, {"type": "compacted", "payload": {"message": "new", "turn_id": "new"}})
+                self.assertIsNone(self.gate._scan_codex_compactions(transcript, ledger))
+                self.assertTrue(old_keys.isdisjoint(ledger["records"]))
+                self.assertTrue(other_keys.issubset(ledger["records"]))
+                self.assertEqual(len(ledger["records"]), len(other_keys) + 1)
+
+    def test_batch2_new_user_turn_resets_stop_correction_once(self):
+        self.call("UserPromptSubmit", mode="enforce", prompt="请整理交接并停机")
+        self.assertEqual(self.call("Stop", mode="enforce", last_assistant_message="尚未交接")["decision"], "block")
+        self.assertFalse(self.call("Stop", mode="enforce", last_assistant_message="仍未交接")["continue"])
+        self.assertTrue(self.state()["stopCorrectionRequested"])
+        self.call("UserPromptSubmit", mode="enforce", turn_id="next-user", prompt="核对本轮未完成事项")
+        self.assertFalse(self.state()["stopCorrectionRequested"])
+        self.assertEqual(self.call("Stop", mode="enforce", last_assistant_message="缺少提示词")["decision"], "block")
+        self.call("UserPromptSubmit", mode="enforce", turn_id="next-user", prompt="核对本轮未完成事项")
+        self.assertTrue(self.state()["stopCorrectionRequested"])
+        self.assertFalse(self.call("Stop", mode="enforce", last_assistant_message="仍缺少提示词")["continue"])
+
+    def test_batch2_advisory_downgrade_clears_drain_and_freeze(self):
+        self.call("UserPromptSubmit", mode="enforce", prompt="请整理交接并停机")
+        for phase in ("drain", "freeze"):
+            with self.subTest(phase=phase):
+                state = self.state()
+                state["phase"] = phase
+                self.gate.save_gate_state(self.state_dir, self.sid, state)
+                self.assertEqual(self.call("PreToolUse", tool_name="spawn_agent"), {})
+                self.assertEqual(self.state()["phase"], "advisory")
+                self.call("UserPromptSubmit", turn_id=phase, prompt="请整理交接并停机")
+                self.assertEqual(self.state()["phase"], "advisory")
+                self.assertEqual(self.call("Stop", last_assistant_message="尚未交接"), {})
+
+    def test_batch2_unchanged_readonly_agy_tools_do_not_save_gate_state(self):
+        for phase in ("drain", "freeze"):
+            cid = "agy-readonly-" + phase
+            state = self.gate.default_gate_state(cid)
+            state["phase"] = phase
+            self.gate.save_gate_state(self.state_dir, cid, state)
+            with mock.patch.object(self.gate, "save_gate_state", wraps=self.gate.save_gate_state) as save:
+                calls = [(name, {}) for name in sorted(self.gate.AGY_INSPECTION_TOOLS)]
+                calls += [(name, {"Path": str(self.root / "source.py")}) for name in ("read_file", "view_file")]
+                for name, args in calls:
+                    with self.subTest(phase=phase, tool=name):
+                        self.assertIsNone(self.gate.check_pre_tool_use_locked({
+                            "conversationId": cid, "toolCall": {"name": name, "args": args},
+                        }, self.state_dir))
+                save.assert_not_called()
+                image = self.gate.check_pre_tool_use_locked({
+                    "conversationId": cid, "toolCall": {"name": "read_file", "args": {"Path": "image.png"}},
+                }, self.state_dir)
+                self.assertEqual(image["decision"], "deny")
+                save.assert_called_once()
+            self.assertEqual(self.gate.load_gate_state(self.state_dir, cid)["imageReadCallCount"], 1)
+
+    def test_batch2_compaction_metadata_schema_normalizes_legacy_none(self):
+        cid = "agy-schema-none"
+        expected = {"scannedTranscriptIdentity": [], "scannedTranscriptAnchor": "",
+                    "scannedTranscriptMtimeNs": -1, "archiveComplete": False, "lastExplicitCompact": []}
+        state = session_context_loader._default_compaction_state(cid)
+        for key, value in expected.items():
+            self.assertEqual(state[key], value)
+            state[key] = None
+        state.update(scannedByteOffset=123, lastInjectedCheckpointStep=17, hasExplicitUserInput=True)
+        path = self.root / "legacy-compaction.json"
+        path.write_text(json.dumps(state), encoding="utf-8")
+        with mock.patch.object(session_context_loader, "log_event") as log:
+            loaded = session_context_loader._load_compaction_state(path, cid)
+        log.assert_not_called()
+        for key, value in expected.items():
+            self.assertEqual(loaded[key], value)
+        self.assertEqual(loaded["scannedByteOffset"], 123)
+        self.assertEqual(loaded["lastInjectedCheckpointStep"], 17)
+        self.assertTrue(loaded["hasExplicitUserInput"])
+
+    def test_batch2_empty_transcript_cursor_stabilizes_after_truncate_and_replace(self):
+        for kind in ("initial", "truncate", "replace"):
+            with self.subTest(kind=kind):
+                transcript = self.root / kind / "transcript.jsonl"
+                transcript.parent.mkdir()
+                transcript.write_text("", encoding="utf-8")
+                state = session_context_loader._default_compaction_state("agy-empty-" + kind)
+                if kind != "initial":
+                    _append_jsonl(transcript, {"step_index": 99, "type": "CHECKPOINT"})
+                    self.assertTrue(session_context_loader._scan_transcript_incrementally(transcript, state))
+                    state["lastInjectedCheckpointStep"] = 99
+                    if kind == "replace":
+                        replacement = transcript.with_name("empty.jsonl")
+                        replacement.write_text("", encoding="utf-8")
+                        os.replace(replacement, transcript)
+                    else:
+                        transcript.write_text("", encoding="utf-8")
+                self.assertTrue(session_context_loader._scan_transcript_incrementally(transcript, state))
+                opened = transcript.stat()
+                self.assertEqual(state["scannedByteOffset"], 0)
+                self.assertEqual(state["scannedTranscriptName"], transcript.name)
+                self.assertEqual(state["scannedTranscriptIdentity"], [opened.st_dev, opened.st_ino])
+                self.assertEqual(state["scannedTranscriptAnchor"], hashlib.sha256(b"").hexdigest())
+                self.assertEqual(state["scannedTranscriptMtimeNs"], opened.st_mtime_ns)
+                self.assertEqual(state["lastInjectedCheckpointStep"], -1)
+                before = dict(state)
+                self.assertFalse(session_context_loader._scan_transcript_incrementally(transcript, state))
+                self.assertEqual(state, before)
+
+    def test_batch2_new_inode_reinjects_checkpoint_with_smaller_step_number(self):
+        cid = "agy-new-inode"
+        transcript = self.root / "transcript.jsonl"
+        payload = {"conversationId": cid, "transcriptPath": str(transcript)}
+        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 0, "content": "旧轨迹"})
+        _append_jsonl(transcript, {"type": "CHECKPOINT", "step_index": 99})
+        self.assertEqual(len(session_context_loader.handle_pre_invocation(payload)["injectSteps"]), 1)
+        old_identity = [transcript.stat().st_dev, transcript.stat().st_ino]
+        replacement = transcript.with_name("new-transcript.jsonl")
+        _append_jsonl(replacement, {"type": "USER_INPUT", "step_index": 0, "content": "新轨迹的完整用户指令"})
+        _append_jsonl(replacement, {"type": "CHECKPOINT", "step_index": 2})
+        os.replace(replacement, transcript)
+        self.assertNotEqual([transcript.stat().st_dev, transcript.stat().st_ino], old_identity)
+        injected = session_context_loader.handle_pre_invocation(payload)["injectSteps"]
+        self.assertEqual(len(injected), 1)
+        self.assertIn("CHECKPOINT step #2", injected[0]["systemMessage"]["systemMessage"])
+        self.assertIn("新轨迹的完整用户指令", injected[0]["systemMessage"]["systemMessage"])
+        self.assertEqual(session_context_loader.handle_pre_invocation(payload)["injectSteps"], [])
+
+    def test_batch2_subagent_task_preserves_literal_system_noise_and_chinese_goal_cancel(self):
+        content = "请审查源码中的 <EPHEMERAL_MESSAGE> 与 <TASK_NOTIFICATION> 字面量。\n保留完整任务书。"
+        raw = "<SYSTEM_MESSAGE>\n[Message] sender=coordinator content=" + content + "\n</SYSTEM_MESSAGE>"
+        self.assertEqual(user_words.clean_user_content(raw, "SYSTEM_MESSAGE"), content)
+        self.assertEqual(user_words.clean_user_content(raw.replace("sender=coordinator", "sender=system"), "SYSTEM_MESSAGE"), "")
+        self.assertEqual(user_words.clean_user_content("<EPHEMERAL_MESSAGE>系统通知", "SYSTEM_MESSAGE"), "")
+        transcript = self.root / "subagent.jsonl"
+        _append_jsonl(transcript, {"type": "SYSTEM_MESSAGE", "step_index": 1, "content": raw})
+        archive = user_words.extract_agy_archive(str(transcript))
+        self.assertEqual([word["content"] for word in archive["words"]], [content])
+        self.assertEqual(archive["words"][0]["kind"], "subagent_message")
+        for text in ("取消/goal继续整理", "请停止goal继续核对", "关闭 /GOAL后交接"):
+            with self.subTest(cancel=text):
+                self.assertIs(user_words.agy_goal_command(text), False)
+        for text in ("取消/goalkeeper", "取消/goal2", "取消/goal_next", "取消/goal-next"):
+            with self.subTest(non_command=text):
+                self.assertIsNone(user_words.agy_goal_command(text))
+
+    def test_batch2_unidentified_question_only_applies_to_the_first_adjacent_result(self):
+        for kind in ("answer", "error", "new_planner"):
+            with self.subTest(kind=kind):
+                transcript = self.root / ("question-" + kind + ".jsonl")
+                _append_jsonl(transcript, {"type": "PLANNER_RESPONSE", "step_index": 1,
+                                          "tool_calls": [{"name": "ask_question"}]})
+                if kind == "new_planner":
+                    _append_jsonl(transcript, {"type": "PLANNER_RESPONSE", "step_index": 2, "content": "开始读取日志"})
+                else:
+                    result = {"type": "GENERIC", "step_index": 2, "content": "User selected: 待核实"}
+                    if kind == "error":
+                        result["error"] = "tool failed"
+                    _append_jsonl(transcript, result)
+                _append_jsonl(transcript, {"type": "GENERIC", "step_index": 3, "content": "普通日志输出"})
+                _append_jsonl(transcript, {"type": "PLANNER_RESPONSE", "step_index": 4, "content": "继续核对"})
+                _append_jsonl(transcript, {"type": "GENERIC", "step_index": 5, "content": "另一条普通输出"})
+                archive = user_words.extract_agy_archive(str(transcript))
+                self.assertEqual(archive["unverified_answers"], [2] if kind == "answer" else [])
+                self.assertEqual(archive["words"], [])
+
+    @unittest.skipUnless(os.name == "nt", "仅 Windows 使用 msvcrt 字节范围锁")
+    def test_batch2_windows_session_lock_explicitly_unlocks_on_normal_and_exceptional_exit(self):
+        import msvcrt
+
+        for raises in (False, True):
+            with self.subTest(raises=raises), mock.patch.object(msvcrt, "locking", wraps=msvcrt.locking) as locking:
+                if raises:
+                    with self.assertRaisesRegex(RuntimeError, "transaction failed"):
+                        with user_words.session_state_lock(self.state_dir, "explicit-unlock"):
+                            raise RuntimeError("transaction failed")
+                else:
+                    with user_words.session_state_lock(self.state_dir, "explicit-unlock"):
+                        pass
+                self.assertEqual([call.args[1:] for call in locking.call_args_list],
+                                 [(msvcrt.LK_NBLCK, 1), (msvcrt.LK_UNLCK, 1)])
+
+    def test_batch2_chinese_adjacent_timestamps_normalize_without_losing_numeric_progress(self):
+        import reply_repeat_guard
+
+        base = reply_repeat_guard.normalize_reply_text("当前时间后台仍在运行，请稍候")
+        for stamp in ("06:12:34", "06:12:35", "2026-11-14T06:12:34Z", "2026-11-14T06:12:35.123+08:00"):
+            with self.subTest(stamp=stamp):
+                self.assertEqual(reply_repeat_guard.normalize_reply_text("当前时间" + stamp + "后台仍在运行，请稍候"), base)
+        first = reply_repeat_guard.normalize_reply_text("当前时间06:12:34后台仍在运行，迭代100步，残差1e-5")
+        second = reply_repeat_guard.normalize_reply_text("当前时间06:12:35后台仍在运行，迭代101步，残差1e-6")
+        self.assertEqual(reply_repeat_guard._extract_number_tokens(first), ["100", "1e-5"])
+        self.assertEqual(reply_repeat_guard._extract_number_tokens(second), ["101", "1e-6"])
+        self.assertFalse(reply_repeat_guard.are_replies_homogeneous(first, second))
+
+    def test_batch2_stop_uses_reconciled_goal_cancellation_instead_of_old_prompt(self):
+        import reply_repeat_guard
+
+        reply = ("已验证：现有离线测试通过。\nGit 工作区：保留当前修改。\n未完成：真实宿主验收。\n"
+                 "新对话提示词\n```text\n请读取用户原话和当前源码，核对工作区后继续真实宿主验收。\n```")
+        for cancel_type in ("PLANNER_RESPONSE", "USER_INPUT"):
+            with self.subTest(cancel_type=cancel_type):
+                cid = "agy-stop-goal-" + cancel_type
+                transcript = self.root / (cid + ".jsonl")
+                first_input = "/goal 整理当前任务"
+                _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 0, "content": first_input})
+                cancel = "已收尾。\n<!-- GOAL_CANCELLED -->" if cancel_type == "PLANNER_RESPONSE" else "取消/goal继续整理"
+                _append_jsonl(transcript, {"type": cancel_type, "step_index": 1, "content": cancel})
+                _append_jsonl(transcript, {"type": "PLANNER_RESPONSE", "step_index": 2, "content": reply})
+                payload = {"conversationId": cid, "transcriptPath": str(transcript), "lastUserInput": first_input,
+                           "terminationReason": "model_stop"}
+                session_context_loader.handle_pre_invocation(payload)
+                state = self.gate.load_gate_state(self.state_dir, cid)
+                self.assertFalse(state["isGoalActive"])
+                state["phase"] = "freeze"
+                self.gate.save_gate_state(self.state_dir, cid, state)
+                self.assertEqual(reply_repeat_guard.handle_stop_repeat_guard(payload), {"decision": "allow"})
+                self.assertFalse(self.gate.load_gate_state(self.state_dir, cid)["isGoalActive"])
+
+    def test_batch2_stop_retains_goal_prompt_fallback_without_transcript_state(self):
+        import reply_repeat_guard
+
+        cid = "agy-stop-no-transcript"
+        state = self.gate.default_gate_state(cid)
+        state["phase"] = "freeze"
+        self.gate.save_gate_state(self.state_dir, cid, state)
+        result = reply_repeat_guard.handle_stop_repeat_guard({
+            "conversationId": cid, "lastUserInput": "/goal 继续整理", "terminationReason": "model_stop",
+        })
+        self.assertEqual(result["decision"], "continue")
+        self.assertIn("GOAL_CANCELLED", result["reason"])
+
+    def test_batch2_latest_handoff_reply_over_tail_window_is_read_completely(self):
+        import reply_repeat_guard
+
+        reply = ("已验证：当前回归测试通过。\nGit 工作区：保留修改。\n未完成：真实宿主核验。\n"
+                 + "x" * (2 * reply_repeat_guard.TAIL_SCAN_BYTES + 31)
+                 + "\n新对话提示词\n```text\n请先核对用户原话和工作区，继续完成真实宿主核验。\n```")
+        for has_user in (False, True):
+            for ending in (b"", b"\n", b"\n\n"):
+                with self.subTest(has_user=has_user, ending=ending):
+                    transcript = self.root / ("long-" + str(has_user) + "-" + str(len(ending)) + ".jsonl")
+                    expected_turn = "turn_0_initial"
+                    if has_user:
+                        content = "整理交接"
+                        _append_jsonl(transcript, {"type": "USER_INPUT", "step_index": 3, "content": content})
+                        expected_turn = "turn_3_" + hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+                    _append_jsonl(transcript, {"type": "PLANNER_RESPONSE", "step_index": 7, "content": reply})
+                    transcript.write_bytes(transcript.read_bytes().rstrip(b"\n") + ending)
+                    self.assertGreater(transcript.stat().st_size, reply_repeat_guard.TAIL_SCAN_BYTES)
+                    self.assertEqual(reply_repeat_guard.extract_current_turn_latest_reply(str(transcript)),
+                                     (expected_turn, 7, reply))
 
 
 if __name__ == "__main__":

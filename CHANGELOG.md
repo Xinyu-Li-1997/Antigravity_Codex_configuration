@@ -4,6 +4,18 @@
 
 ---
 
+## [1.7.3] - 2026-11-14
+
+完成双端全量文件回归检查、边界 Debug 修复、性能优化与全仓文档润色清淤脱敏，并将阶段收口双端把关制度化写入核心规范：
+
+- **阶段收口双端全量把关写入核心规范（`R3.1.4` 与根目录 `AGENTS.md`）**：明确双端协作项目在里程碑收口、合并或发版前按全量文件分工闭环——由 Codex 无头工作流承担全仓代码回归检查、Debug 排错、死代码／性能优化与验证门禁测试；由反重力承担全仓文档书面语润色、冗余清淤精简与隐私凭据脱敏把关，经总控逐行复核差异与运行证据后收口。
+- **AST 边界守卫 Python 3.9 兼容与关键字／解包参数全覆盖（`status_guard.py`）**：将 `ast.Match` 改为 `getattr` 动态兼容保护，消除 Python 3.9 下 `AttributeError` 导致的静默放行旁路；补齐 `Path.rename`／`replace`、`os.remove`／`unlink`／`mkdir`／`makedirs`／`rmdir`／`removedirs`／`rename`／`replace`、`shutil.copy*`／`move`／`rmtree`、`np.save*`、`open(file=..., mode=...)` 及 `run_workflow` 中 `agent(**kwargs)` 的显式关键字参数与字典解包路径核验，兼容 UTF-8 BOM 工作流脚本并清理冗余未用函数；新增 `ast.parse(..., feature_version=(3, 9))` 全仓语法门禁测试。
+- **长会话交接子壳分组拦截与压缩／恢复游标加固（`handoff_gate.py`、`session_context_loader.py`、`user_words.py`、`reply_repeat_guard.py`）**：`_split_shell_clauses` 支持切分引号外的 `( ... )` 子壳分组（保留 `$(...)` 命令替换与函数调用内嵌括号），阻断收口期 `(git push ...)` 绕过；修复 Codex `compacted` 与 `turn_context` 间夹杂普通事件行时 `pendingRecord` 提前清空、新用户回合未重置 `stopCorrectionRequested` 及降回 `advisory` 后的状态残留；补齐压缩游标元数据 Schema 与空文件／新 inode 重写自愈；修复子代理任务书提及系统标签字面量被误滤、中文紧邻 `/goal` 取消与时间戳归一化、Windows 文件锁显式解锁及超 `256 KiB` 交接尾行逆向完整读取。
+- **编排器防空门禁、特殊文件防阻塞与 `verification_executed` 显式标记（`cae_harness.py`）**：拦截空串或纯空白 `--verify-cmd`，在 `gate` 与 `code` 任务回执中显式标注 `verification_executed`（无 `--verify-cmd` 的编码任务标注 `false` 并附未验证提示）；`snapshot_files` 与 `collect_target_files` 合并为单次 `lstat` 并拦截／跳过 FIFO、socket 等非常规特殊文件防打开挂死；确保 `assess` 纯只读零删除历史额度事件文件，`audit` 事后快照异常时保留已完成审计结果；`_windows_env` 校验变量名并优先走 `powershell.exe` 安全读取。
+- **安装器跨平台兼容性加固与全仓清淤脱敏（`install.py`、`install.ps1`）**：`install.ps1` 改用标准流句柄直接继承与 `CommandLineToArgvW` 参数转义，兼顾无换行交互提示即时显示与 PowerShell 5.1 原生 `stderr`／退出码无损透传；`install.py` 区分 Windows 云盘重解析点与目录联接、放行 POSIX 系统根级 `/var`／`/tmp`／`/etc -> /private/*` 标准别名、支持引号包裹的 Windows `PATH` 项与含 `#` 字符串的回退 TOML 数组解析，并在插件升级时自动清理过时空目录；清理 `README.md` 残留对话措辞，全仓回归测试由 160 项扩充至 220 项。
+
+---
+
 ## [1.7.2] - 2026-11-14
 
 全面适配 Google Antigravity App `v2.32.0` 与 CLI `v1.5.8`，补齐动态工作流边界审查，并明确双端协作中优先交由 Codex 端无头工作流攻坚的分工规范：

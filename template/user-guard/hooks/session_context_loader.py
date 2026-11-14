@@ -67,9 +67,14 @@ def _default_compaction_state(conversation_id: str) -> Dict[str, Any]:
         "conversationId": conversation_id,
         "scannedByteOffset": 0,
         "scannedTranscriptName": "",
+        "scannedTranscriptIdentity": [],
+        "scannedTranscriptAnchor": "",
+        "scannedTranscriptMtimeNs": -1,
         "latestCheckpointStep": -1,
         "lastInjectedCheckpointStep": -1,
         "explicitResumeInjected": False,
+        "archiveComplete": False,
+        "lastExplicitCompact": [],
         "hasExplicitUserInput": False,
         "checkpointSteps": [],
         "mediaStepCount": 0,
@@ -106,6 +111,10 @@ def _load_compaction_state(state_file: Path, conversation_id: str) -> Dict[str, 
             merged.update(data)
             if int(data.get("telemetryVersion", 1)) < default["telemetryVersion"]:
                 for key in default.keys() - {"lastInjectedCheckpointStep", "explicitResumeInjected"}:
+                    merged[key] = default[key]
+            for key in ("scannedTranscriptIdentity", "scannedTranscriptAnchor", "scannedTranscriptMtimeNs",
+                        "archiveComplete", "lastExplicitCompact"):
+                if merged[key] is None:
                     merged[key] = default[key]
             for key in default:
                 if type(merged[key]) is not type(default[key]):
@@ -262,8 +271,8 @@ def _scan_transcript_incrementally(
             stream.seek(max(0, offset - 128))
             scanned_tail = stream.read(min(128, offset))
             anchor = hashlib.sha256(scanned_tail).hexdigest()
-            rewritten = (file_size < offset or (offset and state.get("scannedTranscriptAnchor") not in (None, anchor))
-                         or (file_size == offset and state.get("scannedTranscriptMtimeNs") not in (None, opened.st_mtime_ns)))
+            rewritten = (file_size < offset or (offset and state.get("scannedTranscriptAnchor") not in (None, "", anchor))
+                         or (file_size == offset and state.get("scannedTranscriptMtimeNs") not in (None, -1, opened.st_mtime_ns)))
             if rewritten:
                 state.update(_default_compaction_state(state["conversationId"]))
                 state.pop("pendingArchive", None)
@@ -271,6 +280,15 @@ def _scan_transcript_incrementally(
                 scanned_tail = b""
                 changed = True
             if file_size == offset:
+                metadata = {
+                    "scannedTranscriptName": transcript_path.name,
+                    "scannedTranscriptIdentity": identity,
+                    "scannedTranscriptAnchor": hashlib.sha256(scanned_tail).hexdigest(),
+                    "scannedTranscriptMtimeNs": opened.st_mtime_ns,
+                }
+                if any(state.get(key) != value for key, value in metadata.items()):
+                    state.update(metadata)
+                    changed = True
                 return _reconcile_agy_controls(transcript_path, state, []) or changed
             stream.seek(offset)
             # 逐行读取固定大小的文件快照。保留未完成尾行的起点，下轮从原位置重读；
@@ -545,7 +563,7 @@ def _handle_context_locked(conversation_id: str, event_name: str, explicit_sourc
         )
     except (ValueError, TypeError, OSError) as exc:
         log_event(f"{event_name}:handoff_gate_error", conversation_id, f"交接门禁状态异常，继续原话恢复（{exc}）")
-        gate_res = {"injectMessage": None, "phase": "normal", "stateChanged": False}
+        gate_res = {"phase": "normal", "advisoryNotice": None, "mandateMessage": None}
 
     trigger_reason: Optional[str] = None
     pending = state.get("pendingArchive")

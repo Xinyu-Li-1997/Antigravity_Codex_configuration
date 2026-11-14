@@ -336,12 +336,21 @@ def _wsl_path(path, windows=True):
 
 
 def _windows_env(var_name):
-    cmd_exe = shutil.which('cmd.exe')
-    if not cmd_exe:
-        raise HarnessError('未发现 cmd.exe，无法解析 Windows 环境变量')
-    parent = Path(cmd_exe).parent
-    value = _local_command(['cmd.exe', '/d', '/c', 'echo', f'%{var_name}%'], cwd=str(parent) if parent.is_dir() else None)
-    if not value or value.startswith('%'):
+    var_name = str(var_name)
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', var_name):
+        raise HarnessError(f'Windows 环境变量名不合法: {var_name}')
+    powershell_exe = shutil.which('powershell.exe')
+    if powershell_exe:
+        command = [powershell_exe, '-NoProfile', '-NonInteractive', '-Command',
+                   f"[Environment]::GetEnvironmentVariable('{var_name}')"]
+    else:
+        cmd_exe = shutil.which('cmd.exe')
+        if not cmd_exe:
+            raise HarnessError('未发现 powershell.exe 或 cmd.exe，无法解析 Windows 环境变量')
+        command = [cmd_exe, '/d', '/c', 'echo', f'%{var_name}%']
+    parent = Path(command[0]).parent
+    value = _local_command(command, cwd=str(parent) if parent.is_dir() else None)
+    if not value or (not powershell_exe and value == f'%{var_name}%'):
         raise HarnessError(f'无法解析 Windows 环境变量 {var_name}')
     return value
 
@@ -465,9 +474,10 @@ def choose_engine(backends, caller, explicit=''):
     return explicit
 
 
-def _is_link(path):
-    attributes = getattr(path.lstat(), 'st_file_attributes', 0)
-    return path.is_symlink() or bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+def _is_link(path, *, st=None):
+    st = path.lstat() if st is None else st
+    attributes = getattr(st, 'st_file_attributes', 0) or 0
+    return stat.S_ISLNK(st.st_mode) or bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def _ps_literal(text):
@@ -1343,7 +1353,8 @@ def _refresh_agy_listing(info, batch, *, refresh_model_cache, record_quota=True)
         raise HarnessError('未发现 agy，无法查询模型')
     first = info
     while True:
-        _enforce_preflight_quota({'agy': info}, ('agy:default',), batch=batch)
+        _enforce_preflight_quota({'agy': info}, ('agy:default',), batch=batch,
+                                 cleanup_expired=refresh_model_cache)
         result = _run_agy_listing(info)
         detail = ((result.stderr or '') + '\n' + (result.stdout or '')).strip()
         models = _parse_agy_models(result.stdout) if result.returncode == 0 else []
@@ -1440,7 +1451,7 @@ def probe_backends(codex_input_budget=None, agy_input_budget=None, discover_mode
         info['budget_model'] = prof['model']
         info['safe_input_budget_tokens'] = prof['capacity']['input_budget_tokens']
         info['budget_source'] = prof['capacity']['budget_source']
-        cooldown = _load_active_quota_cooldown(name, info, cleanup_expired=False)
+        cooldown = _load_active_quota_cooldown(name, info, cleanup_expired=refresh_model_cache)
         info['quota_status'] = 'exhausted_cached' if cooldown else 'unknown_until_called'
         info['quota_cooldown'] = cooldown
     return result_map
@@ -1705,7 +1716,7 @@ def _quota_user_choices(prefix, cooldown):
     }
 
 
-def _enforce_preflight_quota(backends, specs, retry_quota=False, *, batch=None):
+def _enforce_preflight_quota(backends, specs, retry_quota=False, *, batch=None, cleanup_expired=True):
     batch = batch or _QuotaBatch(retry_quota)
     for spec in specs:
         if not spec:
@@ -1714,7 +1725,7 @@ def _enforce_preflight_quota(backends, specs, retry_quota=False, *, batch=None):
         info = backends.get(prefix, {})
         key = _quota_scope(prefix, info)
         with QUOTA_LOCK:
-            files = _read_quota_cooldowns(prefix, info, cleanup_expired=True)
+            files = _read_quota_cooldowns(prefix, info, cleanup_expired=cleanup_expired)
             active = _active_quota_record(prefix, info, files)
             if batch.retry and key not in batch.initial_cooldown:
                 persisted = {_quota_identity(record) for _path, record in files}
@@ -2379,31 +2390,42 @@ def _quota_startup_only(stdout):
     return True
 
 
-def _backend_diagnostics(result):
-    parts = [result.stderr or '']
+def _backend_diagnostics(result, *, structured_only=False):
+    parts = [] if structured_only else [result.stderr or '']
+
+    def error_details(event, depth=0):
+        details = {key: event[key] for key in (
+            'event', 'type', 'status', 'finished_reason', 'is_error', 'error', 'message',
+            'code', 'reason', 'short_error', 'detail', 'details') if key in event}
+        is_error = (event.get('is_error') or event.get('error')
+                    or str(event.get('status', '')).lower() in (
+                        'error', 'failed', 'partial', 'incomplete', 'invalid', 'waiting', 'running',
+                        'timeout', 'cancelled', 'canceled', 'interrupted')
+                    or str(event.get('finished_reason', '')).lower() in (
+                        'error', 'print_timeout', 'interrupted', 'cancelled', 'canceled'))
+        nested = event.get('result')
+        if isinstance(nested, dict) and depth < 8:
+            nested_details, nested_error = error_details(nested, depth + 1)
+            if nested_details:
+                details['result'] = nested_details
+            is_error = is_error or nested_error
+        return details, is_error
+
     for line in (result.stdout or '').splitlines():
         if not line.strip():
             continue
         try:
             event = json.loads(line)
         except ValueError:
-            parts.append(line)
+            if not structured_only:
+                parts.append(line)
             continue
         if isinstance(event, dict):
             kind = event.get('event', event.get('type'))
-            if kind == 'result':
-                is_error = (event.get('is_error') or event.get('error')
-                            or str(event.get('status', '')).lower() in (
-                                'error', 'failed', 'partial', 'incomplete', 'invalid', 'waiting', 'running',
-                                'timeout', 'cancelled', 'canceled', 'interrupted')
-                            or str(event.get('finished_reason', '')).lower() in (
-                                'error', 'print_timeout', 'interrupted', 'cancelled', 'canceled'))
-                if not is_error:
-                    continue
-                event = {key: event[key] for key in (
-                    'event', 'type', 'status', 'finished_reason', 'is_error', 'error', 'message') if key in event}
             if kind in ('error', 'result', 'turn.failed'):
-                parts.append(json.dumps(event, ensure_ascii=False))
+                details, is_error = error_details(event)
+                if kind != 'result' or is_error:
+                    parts.append(json.dumps(details, ensure_ascii=False))
     return '\n'.join(part for part in parts if part).strip()
 
 
@@ -2530,7 +2552,8 @@ def invoke_engine(spec, target_dir, prompt, backends, schema, readonly=True, tim
                 raise HarnessError('agy 返回终止错误诊断', 'failed', returncode=0, stderr=detail[-2000:])
         if result.returncode:
             detail = _backend_diagnostics(result)
-            if _is_quota_exhausted(detail):
+            structured = _backend_diagnostics(result, structured_only=True)
+            if _is_quota_exhausted(structured or detail):
                 cooldown = _record_quota_exhausted(prefix, info, detail, batch=batch)
                 raise HarnessError(f'{prefix} 额度不足或已达用量上限，已停止并记录冷却状态',
                                    'quota_exhausted', preflight_blocked=False, returncode=result.returncode,
@@ -2622,14 +2645,17 @@ def snapshot_files(root):
                 continue
             rel = path.relative_to(root).as_posix()
             try:
-                if _is_link(path):
+                st = path.lstat()
+                if _is_link(path, st=st):
                     result[rel] = 'symlink:' + os.readlink(path)
+                elif not stat.S_ISREG(st.st_mode):
+                    raise HarnessError(f'工作区包含非常规特殊文件，无法安全快照: {rel}', snapshot_path=rel)
                 else:
                     digest = hashlib.sha256()
                     with path.open('rb') as stream:
                         for block in iter(lambda: stream.read(1024 * 1024), b''):
                             digest.update(block)
-                    result[rel] = digest.hexdigest() + ':' + str(stat.S_IMODE(path.stat().st_mode))
+                    result[rel] = digest.hexdigest() + ':' + str(stat.S_IMODE(st.st_mode))
             except OSError as exc:
                 raise HarnessError(f'无法核对文件 {rel}: {exc}', snapshot_path=rel) from exc
     return result
@@ -2718,7 +2744,11 @@ def collect_target_files(target, skipped_files=None):
             skipped.append({'file': rel, 'reason': 'symbolic_link'})
             continue
         try:
-            size = path.stat().st_size
+            st = path.lstat()
+            if not stat.S_ISREG(st.st_mode):
+                skipped.append({'file': rel, 'reason': 'special_file'})
+                continue
+            size = st.st_size
             with path.open('rb') as stream:
                 stream.read(1)
         except OSError as exc:
@@ -2924,6 +2954,9 @@ def merge_blind_findings(left_findings, right_findings, left_engine, right_engin
 
 def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_fn=None, max_rounds=3,
                           caller='caller', timeout_sec=600, write_scope=None):
+    if not str(verify_cmd).strip():
+        raise HarnessError('--verify-cmd 不能为空白命令')
+
     def default_verify(command, directory):
         result = run_process(command, directory, timeout_sec=timeout_sec, shell=True)
         return result.returncode, (result.stdout + '\n' + result.stderr).strip()
@@ -2960,7 +2993,7 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
                   f'严禁在目标工作目录外创建、修改或删除任何文件或目录（含严禁向目录外执行 git worktree add）。\n'
                   f'{task_desc}\n验收命令为 {verify_cmd}。不得通过放宽验收要求取得通过。'
                   f'Git 提交与推送由当前总控负责。不要调用本编排器或改变其他会话。\n上一轮反馈:\n{last_error[-3500:]}')
-        entry = {'round': number, 'passed': False, 'verify_exit_code': None}
+        entry = {'round': number, 'passed': False, 'verify_exit_code': None, 'verification_executed': False}
         emit_event('gate_round_started', round=number, caller=caller)
         worker_ok = False
         try:
@@ -2990,6 +3023,7 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
             worker_ok = False
         if worker_ok:
             try:
+                entry['verification_executed'] = True
                 code, output = verifier(verify_cmd, target_dir)
                 entry.update(verify_exit_code=code, verify_output_tail=output[-2000:], passed=code == 0)
                 status = 'ok' if code == 0 else 'verification_failed'
@@ -3023,6 +3057,7 @@ def run_physics_gate_loop(target_dir, task_desc, verify_cmd, worker_fn, verify_f
         status = 'failed'
     return {'status': status, 'gate_passed': status == 'ok', 'circuit_breaker_triggered': status != 'ok',
             'rounds_used': len(history), 'verify_cmd': verify_cmd, 'history': history,
+            'verification_executed': any(item.get('verification_executed') for item in history),
             'caller': caller, 'handoff_to_caller': True, 'changed_files': changes,
             'worker_changed_files': sorted(worker_changes), 'verification_changed_files': sorted(verification_changes),
             'scope_violations': sorted(violations), 'scope_check': 'unverified' if scope_failure else 'post_worker_snapshot',
@@ -3161,7 +3196,8 @@ def _gate_can_replay(result, before, root):
             or result.get('verification_changed_files') or result.get('rounds_used') != 1):
         return False
     entry = result['history'][0]
-    if entry.get('verify_exit_code') is not None or not _quota_can_replay(entry, entry.get('invocation', {})):
+    if (entry.get('verification_executed') or entry.get('verify_exit_code') is not None
+            or not _quota_can_replay(entry, entry.get('invocation', {}))):
         return False
     scope = _safe_changes_report(before, root, [], True)
     return scope['scope_verified'] and not scope['changed_files']
@@ -3274,6 +3310,8 @@ def cmd_audit(args):
         engines = (kept[0] if kept else fb_engine, None)
         try:
             _prepare_execution(backends, engines, batch, dry_run=args.dry_run)
+            if not _workspace_unchanged(fallback_before, root):
+                raise HarnessError('回退预检后工作区发生变化或无法核对，已停止执行')
         except HarnessError as fb_exc:
             return _print({'status': fb_exc.status, **meta, 'error': str(fb_exc), 'requested_engines': list(engines), **fb_exc.details})
     profiles = {}
@@ -3339,7 +3377,7 @@ def cmd_audit(args):
             except Exception as exc:
                 errors.append({**common, 'status': getattr(exc, 'status', 'failed'),
                                'error': str(exc), **getattr(exc, 'details', {})})
-    scope = _changes_report(before, root, [], True)
+    scope = _safe_changes_report(before, root, [], True)
     quota_err = next((err for err in errors if err.get('status') == 'quota_exhausted'), None)
     if scope['scope_violations']:
         status = 'scope_violation'
@@ -3352,6 +3390,11 @@ def cmd_audit(args):
         status = 'quota_exhausted' if 'quota_exhausted' in statuses else (next(iter(statuses)) if len(statuses) == 1 else 'failed')
     else:
         status = 'partial' if errors or plan['skipped_files'] or any(unit['unread_files'] for unit in completed) else 'ok'
+    scope_error = {}
+    if not scope['scope_verified']:
+        if status not in ('quota_exhausted', 'cancelled', 'scope_violation'):
+            status = 'failed'
+        scope_error['error'] = scope['scope_error']
     quota_meta = {k: quota_err[k] for k in ('quota_backend', 'quota_execution_side', 'quota_cooldown',
                                           'quota_fuse_triggered', 'user_confirmation_required', 'user_choices')
                   if quota_err and k in quota_err}
@@ -3363,10 +3406,13 @@ def cmd_audit(args):
                    'received_count': len(completed), 'total_units': len(tasks), 'errors': errors,
                    'reading_coverage_verified': False,
                    'consensus_count': len(merged['consensus_findings']), 'single_source_count': len(merged['single_source_findings']),
-                   **merged, **scope, **quota_meta, 'verification_notice': '当前总控需核实原始文件与证据后采纳发现。'})
+                   **merged, **scope, **scope_error, **quota_meta,
+                   'verification_notice': '当前总控需核实原始文件与证据后采纳发现。'})
 
 
 def cmd_gate(args):
+    if not str(args.verify_cmd).strip():
+        raise HarnessError('--verify-cmd 不能为空白命令')
     requested_target, root = _target(args)
     text = _task_text(args)
     backends = _args_backends(args)
@@ -3380,7 +3426,7 @@ def cmd_gate(args):
     batch = _QuotaBatch(args.retry_quota)
     meta = {'caller': caller, 'handoff_to_caller': True, 'engine': engine, 'worker_engine': engine,
             'requested_tier': args.tier, 'selected_tier': tier, 'tier_reason': tier_reason,
-            'target': str(root), 'requested_target': str(requested_target)}
+            'target': str(root), 'requested_target': str(requested_target), 'verification_executed': False}
     fallback_before = snapshot_files(root) if getattr(args, 'fallback_on_quota', False) and not args.dry_run else None
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
@@ -3396,6 +3442,8 @@ def cmd_gate(args):
         meta.update(engine=engine, worker_engine=engine)
         try:
             _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
+            if not _workspace_unchanged(fallback_before, root):
+                raise HarnessError('回退预检后工作区发生变化或无法核对，已停止执行')
         except HarnessError as fb_exc:
             return _print({'status': fb_exc.status, **meta, 'error': str(fb_exc), **fb_exc.details})
     profile = _planned_profile(args, backends, engine, tier, tier_reason, text, 'gate', est_tokens)
@@ -3415,6 +3463,8 @@ def cmd_gate(args):
 
 
 def cmd_task(args):
+    if args.kind == 'code' and args.verify_cmd is not None and not str(args.verify_cmd).strip():
+        raise HarnessError('--verify-cmd 不能为空白命令')
     requested_target, root = _target(args)
     text = _task_text(args)
     caller = resolve_caller(args.caller)
@@ -3439,6 +3489,8 @@ def cmd_task(args):
                'requested_tier': args.tier, 'selected_tier': tier, 'tier_reason': tier_reason,
                'target': str(root), 'requested_target': str(requested_target), 'base_commit': base,
                'readonly': readonly, 'write_scope': scopes}
+    if not readonly:
+        payload['verification_executed'] = False
     fallback_before = snapshot_files(root) if getattr(args, 'fallback_on_quota', False) and not args.dry_run else None
     try:
         _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
@@ -3455,6 +3507,8 @@ def cmd_task(args):
         payload['engine'] = engine
         try:
             _prepare_execution(backends, (engine,), batch, dry_run=args.dry_run)
+            if not _workspace_unchanged(fallback_before, root):
+                raise HarnessError('回退预检后工作区发生变化或无法核对，已停止执行')
         except HarnessError as fb_exc:
             return _print({'status': fb_exc.status, **payload, 'result': {}, 'changed_files': [], 'scope_violations': [],
                            'error': str(fb_exc), **fb_exc.details})
@@ -3472,6 +3526,8 @@ def cmd_task(args):
             return _print({'status': exc.status, **payload, 'result': {}, 'changed_files': [],
                            'scope_violations': [], 'error': str(exc), **exc.details})
         return _print({**payload, **result})
+    if not readonly:
+        payload['verification_notice'] = '未提供 --verify-cmd，本次代码修改未经宿主机命令实测验证，请总控运行验证后再验收。'
     before = snapshot_files(root)
     rel_hint = f'（相对路径: {rel_single_file}）' if rel_single_file else ''
     stage_files = [rel_single_file] if (readonly and rel_single_file) else None

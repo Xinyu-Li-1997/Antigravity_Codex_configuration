@@ -7,6 +7,7 @@ import io
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1827,6 +1828,366 @@ else:
                 harness.invoke_engine('agy:default', self.root, 'review', engines, harness.TASK_JSON_SCHEMA)
             self.assertEqual(caught.exception.status, 'failed')
             self.assertIsNone(harness._load_active_quota_cooldown('agy', engines['agy']))
+
+    def test_blank_verify_commands_rejected_before_cli_preflight(self):
+        for command in ('', '   ', '\t\r\n'):
+            for subcommand in ('gate', 'task'):
+                for dry_run in (False, True):
+                    tokens = [subcommand, '--target', str(self.root), '--task', '修改代码', '--verify-cmd', command]
+                    if subcommand == 'task':
+                        tokens.extend(['--kind', 'code'])
+                    if dry_run:
+                        tokens.append('--dry-run')
+                    handler = harness.cmd_gate if subcommand == 'gate' else harness.cmd_task
+                    with self.subTest(command=command, subcommand=subcommand, dry_run=dry_run), \
+                         patch.object(harness, '_target') as target, \
+                         patch.object(harness, '_args_backends') as probe, \
+                         patch.object(harness, 'run_process') as runner:
+                        with self.assertRaisesRegex(harness.HarnessError, '^--verify-cmd 不能为空白命令$'):
+                            handler(self.args(*tokens))
+                        target.assert_not_called()
+                        probe.assert_not_called()
+                        runner.assert_not_called()
+
+    def test_blank_verify_commands_rejected_before_gate_worker(self):
+        for command in ('', '   ', '\t\n'):
+            worker, verifier = Mock(), Mock(return_value=(0, 'ok'))
+            with self.subTest(command=command), patch.object(harness, 'snapshot_files') as snapshot:
+                with self.assertRaisesRegex(harness.HarnessError, '^--verify-cmd 不能为空白命令$'):
+                    harness.run_physics_gate_loop(self.root, '修改代码', command, worker, verifier)
+                snapshot.assert_not_called()
+            worker.assert_not_called()
+            verifier.assert_not_called()
+
+    def test_special_files_rejected_by_snapshot_and_skipped_by_collection(self):
+        special = self.root / 'special.py'
+        special.write_text('placeholder', encoding='utf-8')
+        real_lstat = Path.lstat
+        for mode in (stat.S_IFIFO, stat.S_IFSOCK, stat.S_IFCHR, stat.S_IFBLK):
+            fake_stat = os.stat_result((mode | 0o600, 0, 0, 1, 0, 0, 1024, 0, 0, 0))
+
+            def lstat(path, *args, **kwargs):
+                return fake_stat if path == special else real_lstat(path, *args, **kwargs)
+
+            with self.subTest(mode=mode), patch.object(Path, 'lstat', autospec=True, side_effect=lstat) as stats, \
+                 patch.object(Path, 'open', side_effect=AssertionError('特殊文件不得打开')) as open_file:
+                with self.assertRaisesRegex(harness.HarnessError, '工作区包含非常规特殊文件，无法安全快照: special.py') as caught:
+                    harness.snapshot_files(self.root)
+                self.assertEqual(caught.exception.details['snapshot_path'], 'special.py')
+                self.assertEqual(sum(call.args[0] == special for call in stats.call_args_list), 1)
+                skipped = []
+                self.assertEqual(harness.collect_target_files(self.root, skipped), [])
+                self.assertEqual(skipped, [{'file': 'special.py', 'reason': 'special_file'}])
+                open_file.assert_not_called()
+
+    def test_snapshot_reuses_one_lstat_for_regular_files_and_reparse_points(self):
+        source = self.root / 'a.py'
+        data = b'value = 1\n'
+        source.write_bytes(data)
+        real_lstat = Path.lstat
+        for reparse in (False, True):
+            fake_stat = Mock(st_mode=stat.S_IFREG | 0o640,
+                             st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT if reparse else 0)
+
+            def lstat(path, *args, **kwargs):
+                return fake_stat if path == source else real_lstat(path, *args, **kwargs)
+
+            with self.subTest(reparse=reparse), patch.object(Path, 'lstat', autospec=True, side_effect=lstat) as stats, \
+                 patch.object(harness.os, 'readlink', return_value='destination') as readlink:
+                report = harness.snapshot_files(self.root)
+                self.assertEqual(sum(call.args[0] == source for call in stats.call_args_list), 1)
+                if reparse:
+                    self.assertEqual(report['a.py'], 'symlink:destination')
+                    readlink.assert_called_once_with(source)
+                else:
+                    self.assertEqual(report['a.py'], harness.hashlib.sha256(data).hexdigest() + ':' + str(0o640))
+                    readlink.assert_not_called()
+
+    def test_assess_preserves_expired_events_and_acknowledgements_even_with_discovery(self):
+        homes = {name: self.root / name for name in ('codex', 'agy')}
+        for name, home in homes.items():
+            info = {'config_home': str(home), 'windows_interop': False}
+            events = harness._quota_events_dir(harness._quota_state_path(name, info))
+            (events / 'acknowledged').mkdir(parents=True)
+            expired = {'backend': name, 'execution_side': harness._execution_side(info),
+                       'exhausted': True, 'cooldown_until_epoch': 1.0}
+            contents = json.dumps(expired, indent=2) + '\n'
+            (events / ('a' * 32 + '.json')).write_text(contents, encoding='utf-8')
+            (events / 'acknowledged' / harness._quota_ack_name(expired)).write_text(contents, encoding='utf-8')
+        (homes['codex'] / 'models_cache.json').write_text(json.dumps({'models': backends()['codex']['models']}), encoding='utf-8')
+        cache = homes['agy'] / 'antigravity-cli' / 'cache' / 'cae_models_cache.json'
+        cache.write_text('{"models": [{"slug": "cached-high"}]}', encoding='utf-8')
+        before = harness.snapshot_files(self.root)
+        for discover in (False, True):
+            response = subprocess.CompletedProcess(['agy', 'models'], 0, 'gemini-7-pro-high\tGemini Pro (High)\n', '')
+            tokens = ['assess', '--caller', 'codex'] + (['--discover-models'] if discover else [])
+            with self.subTest(discover=discover), patch.dict(os.environ, {}, clear=True), \
+                 patch.object(harness, '_find_binary', side_effect=lambda name: 'fixture-' + name), \
+                 patch.object(harness, '_codex_home', return_value=(homes['codex'], False)), \
+                 patch.object(harness, '_agy_home', return_value=(homes['agy'], False)), \
+                 patch.object(harness, '_run_agy_listing', return_value=response) as listing, \
+                 patch.object(Path, 'unlink', side_effect=AssertionError('assess 不得删除缓存')) as unlink:
+                code, report = self.capture(harness.cmd_assess, self.args(*tokens))
+                unlink.assert_not_called()
+            self.assertEqual(code, 0)
+            self.assertEqual(listing.call_count, int(discover))
+            self.assertEqual(harness.snapshot_files(self.root), before)
+            self.assertTrue(all(info['quota_cooldown'] is None for info in report['backends'].values()))
+
+    def test_audit_snapshot_failure_retains_completed_units_and_all_findings(self):
+        (self.root / 'a.py').write_text('x = 1\n' * 50, encoding='utf-8')
+        common = {'file': 'a.py', 'line_start': 2, 'line_end': 2, 'severity': 'high',
+                  'category': 'conservation', 'description': '守恒残差异常', 'evidence': 'residual != 0'}
+        single = {**common, 'line_start': 40, 'line_end': 40, 'description': '边界通量异常'}
+
+        def audit(engine, *args, **kwargs):
+            return {**AUDIT, 'summary': engine, 'findings': [common, single] if engine.startswith('codex:') else [common]}
+
+        args = self.args('audit', '--target', str(self.root), '--caller', 'antigravity',
+                         '--left', 'codex:default', '--right', 'agy:default')
+        denied = harness.HarnessError('事后文件不可读', snapshot_path='a.py')
+        with patch.object(harness, '_args_backends', return_value=backends()), \
+             patch.object(harness, 'invoke_readonly_engine', side_effect=audit), \
+             patch.object(harness, 'snapshot_files', side_effect=[{}, denied]) as snapshot:
+            code, report = self.capture(harness.cmd_audit, args)
+        self.assertEqual(code, 1)
+        self.assertEqual(snapshot.call_count, 2)
+        self.assertEqual(report['status'], 'failed')
+        self.assertIs(report['scope_verified'], False)
+        self.assertEqual(report['error'], '事后文件不可读')
+        self.assertEqual(report['scope_error_path'], 'a.py')
+        self.assertEqual(report['completed_count'], 2)
+        self.assertEqual(report['received_count'], 2)
+        self.assertEqual(len(report['completed_units']), 2)
+        self.assertTrue(all(unit['read_files'] == ['a.py'] and not unit['unread_files'] for unit in report['completed_units']))
+        self.assertEqual(report['consensus_count'], 1)
+        self.assertEqual(report['single_source_count'], 1)
+        self.assertEqual(report['consensus_findings'][0]['left_finding'], common)
+        self.assertEqual(report['consensus_findings'][0]['right_finding'], common)
+        self.assertEqual(report['single_source_findings'][0]['description'], single['description'])
+
+    def test_audit_snapshot_failure_preserves_terminal_failure_statuses(self):
+        (self.root / 'a.py').write_text('x = 1\n', encoding='utf-8')
+        args = self.args('audit', '--target', str(self.root), '--caller', 'antigravity', '--single')
+        for status in ('quota_exhausted', 'cancelled', 'scope_violation'):
+            with self.subTest(status=status), patch.object(harness, '_args_backends', return_value=backends()), \
+                 patch.object(harness, 'invoke_readonly_engine', side_effect=harness.HarnessError('worker stopped', status)), \
+                 patch.object(harness, 'snapshot_files', side_effect=[{}, PermissionError('snapshot denied')]):
+                code, report = self.capture(harness.cmd_audit, args)
+            self.assertEqual(code, harness.EXIT_CODES[status])
+            self.assertEqual(report['status'], status)
+            self.assertIs(report['scope_verified'], False)
+            self.assertEqual(report['error'], 'snapshot denied')
+
+    def test_preflight_fallback_stops_when_second_preparation_changes_workspace(self):
+        for subcommand in ('audit', 'gate', 'task'):
+            workspace = self.root / subcommand
+            workspace.mkdir()
+            (workspace / 'a.py').write_text('x = 1\n', encoding='utf-8')
+            calls = []
+
+            def prepare(engines, specs, batch, **kwargs):
+                calls.append(specs)
+                if len(calls) == 1:
+                    raise harness.HarnessError('quota', 'quota_exhausted', quota_backend='codex', preflight_blocked=True)
+                (workspace / 'unexpected.py').write_text('changed during refresh', encoding='utf-8')
+
+            tokens = [subcommand, '--target', str(workspace), '--caller', 'antigravity', '--fallback-on-quota']
+            if subcommand != 'audit':
+                tokens.extend(['--task', '修改代码', '--verify-cmd', 'verify'])
+            if subcommand == 'task':
+                tokens.extend(['--kind', 'code'])
+            handler = {'audit': harness.cmd_audit, 'gate': harness.cmd_gate, 'task': harness.cmd_task}[subcommand]
+            with self.subTest(subcommand=subcommand), patch.object(harness, '_args_backends', return_value=backends()), \
+                 patch.object(harness, '_prepare_execution', side_effect=prepare), \
+                 patch.object(harness, 'invoke_readonly_engine') as auditor, \
+                 patch.object(harness, 'invoke_edit_worker') as worker, \
+                 patch.object(harness, 'invoke_engine') as invoke, patch.object(harness, 'run_process') as runner:
+                code, report = self.capture(handler, self.args(*tokens))
+            self.assertEqual(code, 1)
+            self.assertEqual(report['status'], 'failed')
+            self.assertIn('回退预检后工作区发生变化或无法核对', report['error'])
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(any(spec and spec.startswith('agy:') for spec in calls[1]))
+            auditor.assert_not_called()
+            worker.assert_not_called()
+            invoke.assert_not_called()
+            runner.assert_not_called()
+            if subcommand != 'audit':
+                self.assertIs(report['verification_executed'], False)
+
+    def test_windows_env_validates_names_before_querying_and_prefers_powershell(self):
+        for name in ('', '1BAD', 'TEMP&whoami', 'TEMP|echo', "TEMP'", 'TEMP\n'):
+            with self.subTest(name=name), patch.object(harness.shutil, 'which') as which, \
+                 patch.object(harness, '_local_command') as query:
+                with self.assertRaises(harness.HarnessError):
+                    harness._windows_env(name)
+                which.assert_not_called()
+                query.assert_not_called()
+        powershell = str(self.root / 'powershell.exe')
+        for value in ('C:\\folder & name|literal%value%', '%literal-start'):
+            with self.subTest(value=value), patch.object(harness.shutil, 'which', return_value=powershell) as which, \
+                 patch.object(harness, '_local_command', return_value=value) as query:
+                self.assertEqual(harness._windows_env('TEMP'), value)
+                which.assert_called_once_with('powershell.exe')
+                query.assert_called_once_with([powershell, '-NoProfile', '-NonInteractive', '-Command',
+                                               "[Environment]::GetEnvironmentVariable('TEMP')"], cwd=str(self.root))
+
+    def test_windows_env_cmd_fallback_and_undefined_values(self):
+        cmd_exe = str(self.root / 'cmd.exe')
+        for value in ('C:\\temp', '%TEMP%', ''):
+            with self.subTest(value=value), \
+                 patch.object(harness.shutil, 'which', side_effect=lambda name: cmd_exe if name == 'cmd.exe' else None), \
+                 patch.object(harness, '_local_command', return_value=value) as query:
+                if value == 'C:\\temp':
+                    self.assertEqual(harness._windows_env('TEMP'), value)
+                else:
+                    with self.assertRaises(harness.HarnessError):
+                        harness._windows_env('TEMP')
+                query.assert_called_once_with([cmd_exe, '/d', '/c', 'echo', '%TEMP%'], cwd=str(self.root))
+        with patch.object(harness.shutil, 'which', return_value='powershell.exe'), \
+             patch.object(harness, '_local_command', return_value=''), self.assertRaises(harness.HarnessError):
+            harness._windows_env('UNDEFINED')
+
+    def test_nested_structured_quota_errors_are_detected_for_all_error_events(self):
+        error = {'message': 'usage limit reached', 'code': 'insufficient_quota'}
+        events = (
+            {'event': 'result', 'result': {'status': 'ERROR', 'error': error}},
+            {'event': 'error', 'result': {'error': error}},
+            {'type': 'turn.failed', 'error': {'result': error}},
+        )
+        for index, event in enumerate(events):
+            engines = backends()
+            engines['agy']['config_home'] = str(self.root / ('quota-' + str(index)))
+            proc = subprocess.CompletedProcess([], 1, json.dumps({'event': 'init'}) + '\n' + json.dumps(event), 'warning: optional cache missing')
+            detail = harness._backend_diagnostics(proc)
+            self.assertIn('usage limit reached', detail)
+            self.assertIn('insufficient_quota', detail)
+            with self.subTest(event=event), patch.object(harness, 'run_process', return_value=proc), \
+                 self.assertRaises(harness.HarnessError) as caught:
+                harness.invoke_engine('agy:default', self.root, '审查', engines, harness.TASK_JSON_SCHEMA)
+            self.assertEqual(caught.exception.status, 'quota_exhausted')
+            self.assertIsNotNone(harness._load_active_quota_cooldown('agy', engines['agy'], cleanup_expired=False))
+
+    def test_structured_nonquota_errors_override_unrelated_quota_warning_text(self):
+        for kind in ('error', 'result', 'turn.failed'):
+            event = {'event': kind, 'result': {'status': 'ERROR', 'error': {'message': 'connection reset'},
+                                             'structured_output': {**TASK, 'content': 'usage limit reached'}}}
+            output = 'report mentions usage limit reached\n' + json.dumps(event)
+            proc = subprocess.CompletedProcess([], 1, output, 'warning: documentation mentions usage limit')
+            with self.subTest(kind=kind), patch.object(harness, 'run_process', return_value=proc), \
+                 patch.object(harness, '_record_quota_exhausted') as record, self.assertRaises(harness.HarnessError) as caught:
+                harness.invoke_engine('agy:default', self.root, '审查', backends(), harness.TASK_JSON_SCHEMA)
+            self.assertEqual(caught.exception.status, 'failed')
+            record.assert_not_called()
+        for index, (stdout, stderr) in enumerate((('', 'usage limit reached'), ('usage limit reached', ''))):
+            proc = subprocess.CompletedProcess([], 1, stdout, stderr)
+            engines = backends()
+            engines['agy']['config_home'] = str(self.root / ('unstructured-' + str(index)))
+            with self.subTest(stdout=stdout, stderr=stderr), patch.object(harness, 'run_process', return_value=proc), \
+                 self.assertRaises(harness.HarnessError) as caught:
+                harness.invoke_engine('agy:default', self.root, '审查', engines, harness.TASK_JSON_SCHEMA)
+            self.assertEqual(caught.exception.status, 'quota_exhausted')
+            self.assertIs(caught.exception.details['preflight_blocked'], False)
+
+    def test_code_task_without_verify_command_explicitly_reports_unverified(self):
+        args = self.args('task', '--target', str(self.root), '--caller', 'antigravity', '--kind', 'code', '--task', '修改代码')
+        with patch.object(harness, '_args_backends', return_value=backends()), \
+             patch.object(harness, 'invoke_engine', return_value=TASK) as worker, \
+             patch.object(harness, 'run_process') as verifier:
+            code, report = self.capture(harness.cmd_task, args)
+        self.assertEqual(code, 0)
+        self.assertEqual(report['result'], TASK)
+        self.assertIs(report['verification_executed'], False)
+        self.assertEqual(report['verification_notice'], '未提供 --verify-cmd，本次代码修改未经宿主机命令实测验证，请总控运行验证后再验收。')
+        worker.assert_called_once()
+        verifier.assert_not_called()
+
+    def test_readonly_tasks_do_not_receive_code_gate_notices(self):
+        for kind in ('math', 'direction', 'review', 'polish'):
+            args = self.args('task', '--target', str(self.root), '--caller', 'antigravity', '--kind', kind, '--task', '只读核对')
+            with self.subTest(kind=kind), patch.object(harness, '_args_backends', return_value=backends()), \
+                 patch.object(harness, 'invoke_engine', return_value=TASK):
+                code, report = self.capture(harness.cmd_task, args)
+            self.assertEqual(code, 0)
+            self.assertNotIn('verification_executed', report)
+            self.assertNotIn('verification_notice', report)
+
+    def test_gate_and_code_task_report_real_verifier_execution_on_success_and_failure(self):
+        for subcommand in ('gate', 'task'):
+            for exit_code in (0, 1):
+                marker = self.root / ('verified_' + subcommand + str(exit_code) + '.txt')
+                command = (f'"{sys.executable}" -B -c "from pathlib import Path; '
+                           f"Path('{marker.name}').write_text('executed', encoding='utf-8'); raise SystemExit({exit_code})\"")
+                tokens = [subcommand, '--target', str(self.root), '--caller', 'antigravity', '--task', '修改代码',
+                          '--verify-cmd', command, '--max-rounds', '1']
+                if subcommand == 'task':
+                    tokens.extend(['--kind', 'code'])
+                handler = harness.cmd_gate if subcommand == 'gate' else harness.cmd_task
+                with self.subTest(subcommand=subcommand, exit_code=exit_code), \
+                     patch.object(harness, '_args_backends', return_value=backends()), \
+                     patch.object(harness, 'invoke_edit_worker', return_value='代码修改完成'):
+                    code, report = self.capture(handler, self.args(*tokens))
+                self.assertEqual(code, 0 if exit_code == 0 else harness.EXIT_CODES['verification_failed'])
+                self.assertEqual(marker.read_text(encoding='utf-8'), 'executed')
+                self.assertIs(report['verification_executed'], True)
+                self.assertIs(report['history'][0]['verification_executed'], True)
+                self.assertEqual(report['history'][0]['verify_exit_code'], exit_code)
+                self.assertEqual(report['gate_passed'], exit_code == 0)
+                self.assertNotIn('verification_notice', report)
+
+    def test_gate_and_code_task_report_no_verification_before_worker_success(self):
+        for subcommand in ('gate', 'task'):
+            for phase in ('dry_run', 'preflight', 'fallback_preflight', 'worker'):
+                tokens = [subcommand, '--target', str(self.root), '--caller', 'antigravity', '--task', '修改代码',
+                          '--verify-cmd', 'verify', '--max-rounds', '1']
+                if subcommand == 'task':
+                    tokens.extend(['--kind', 'code'])
+                if phase == 'dry_run':
+                    tokens.append('--dry-run')
+                if phase == 'fallback_preflight':
+                    tokens.append('--fallback-on-quota')
+                handler = harness.cmd_gate if subcommand == 'gate' else harness.cmd_task
+                failure = harness.HarnessError('preflight failed')
+                preparation = ([harness.HarnessError('quota', 'quota_exhausted', quota_backend='codex'), failure]
+                               if phase == 'fallback_preflight' else failure if phase == 'preflight' else None)
+                with self.subTest(subcommand=subcommand, phase=phase), \
+                     patch.object(harness, '_args_backends', return_value=backends()), \
+                     patch.object(harness, '_prepare_execution', side_effect=preparation), \
+                     patch.object(harness, 'invoke_edit_worker', side_effect=harness.HarnessError('worker failed')) as worker, \
+                     patch.object(harness, 'run_process') as verifier:
+                    code, report = self.capture(handler, self.args(*tokens))
+                self.assertEqual(code, 0 if phase == 'dry_run' else 1)
+                self.assertIs(report['verification_executed'], False)
+                verifier.assert_not_called()
+                if phase == 'worker':
+                    worker.assert_called_once()
+                    self.assertIs(report['history'][0]['verification_executed'], False)
+                    self.assertFalse(report['gate_passed'])
+                else:
+                    worker.assert_not_called()
+
+    def test_gate_verification_flag_survives_verifier_errors_and_snapshot_failures(self):
+        before = harness.snapshot_files(self.root)
+        for error in (RuntimeError('verifier failed'), harness.HarnessError('quota during verification', 'quota_exhausted')):
+            verifier = Mock(side_effect=error)
+            with self.subTest(error=str(error)):
+                result = harness.run_physics_gate_loop(self.root, '修改代码', 'verify', Mock(return_value='done'), verifier, max_rounds=1)
+            verifier.assert_called_once()
+            self.assertIs(result['verification_executed'], True)
+            self.assertIs(result['history'][0]['verification_executed'], True)
+            self.assertIsNone(result['history'][0]['verify_exit_code'])
+            self.assertFalse(result['gate_passed'])
+            self.assertFalse(harness._gate_can_replay(result, before, self.root))
+        for snapshots, expected in (([PermissionError('before denied')], False),
+                                    ([{}, PermissionError('worker denied')], False),
+                                    ([{}, {}, PermissionError('verifier denied')], True)):
+            with self.subTest(expected=expected, snapshots=len(snapshots)), \
+                 patch.object(harness, 'snapshot_files', side_effect=snapshots):
+                result = harness.run_physics_gate_loop(self.root, '修改代码', 'verify', Mock(return_value='done'), Mock(return_value=(0, 'ok')))
+            self.assertEqual(result['status'], 'failed')
+            self.assertIs(result['verification_executed'], expected)
+            self.assertFalse(result['scope_verified'])
 
 
 if __name__ == '__main__':

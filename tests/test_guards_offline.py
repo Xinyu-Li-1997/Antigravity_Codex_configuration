@@ -1345,6 +1345,362 @@ class TestGuardsOffline(unittest.TestCase):
             result = status_guard.handle_pre_tool_use({**base, "toolCall": {"tool_name": tool, "args": {"Cwd": "sub", key: script}}})
             self.assertEqual(result["decision"], "allow")
 
+    def test_19_ast_python39_compatibility_and_match_captures(self):
+        project = self.tmp_root / "compat-project"
+        project.mkdir()
+        keys = [status_guard._normalize_cross_env_lexical(str(project))]
+
+        def scan(script):
+            return status_guard._scan_inline_python_code(script, str(project), keys, keys, False)
+
+        with unittest.mock.patch.object(status_guard, "_AST_MATCH_TYPES", ()), \
+                unittest.mock.patch.object(status_guard, "_AST_TRY_TYPES", (status_guard.ast.Try,)):
+            for script in ("open('../outside/x', 'w')", "try:\n    open('../outside/x', 'w')\nexcept Exception:\n    pass"):
+                self.assertIsNotNone(scan(script))
+            self.assertIsNone(scan("open('../outside/input', 'r')"))
+        # 语法兼容检查不依赖本机恰好安装 Python 3.9。
+        for path in (Path(status_guard.__file__), Path(__file__)):
+            status_guard.ast.parse(path.read_text(encoding="utf-8-sig"), feature_version=(3, 9))
+        if hasattr(status_guard.ast, "Match"):
+            for pattern, guard in (("p", ""), ("[*p]", ""), ("{'key': _, **p}", ""),
+                                   ("{'key': p}", " if open(p, 'w')")):
+                script = "p = 'inside'\nmatch unknown:\n    case " + pattern + guard + ":\n        open(p, 'w')"
+                with self.subTest(pattern=pattern, guard=guard):
+                    self.assertIsNotNone(scan(script))
+            self.assertIsNone(scan("p = 'inside'\nmatch unknown:\n    case _:\n        open(p, 'w')"))
+        if hasattr(status_guard.ast, "TryStar"):
+            self.assertIsNotNone(scan("p = 'inside'\ntry:\n    pass\nexcept* Exception as p:\n    open(p, 'w')"))
+
+    def test_20_ast_string_replace_path_targets_and_links(self):
+        project = self.tmp_root / "path-project"
+        project.mkdir()
+        base = {"conversationId": "batch1-path", "cwd": str(project), "workspacePaths": [str(project)]}
+        bad = (
+            "Path('inside').replace('../outside/x')", "Path('inside').replace(target='../outside/x')",
+            "Path('inside').rename(target='../outside/x')", "Path('../outside/x').rename('inside')",
+            "Path('../outside/link').symlink_to('inside')", "Path('../outside/link').hardlink_to('inside')",
+            "Path('inside').rename(*targets)", "Path('inside').replace('inside2', **options)",
+            "Path('inside').rename()",
+        )
+        safe = (
+            "s = unknown_string(); s.replace('a', 'b')", "s = unknown_string(); s.replace('a', 'b', 1)",
+            "s = unknown_string(); s.replace(old='a', new='b')", "s = unknown_string(); s.replace('a', new='b', count=1)",
+            "Path('inside').rename(target='inside2')", "Path('inside').replace('inside2')",
+            "Path('inside-link').symlink_to('../outside/input')", "Path('inside-link').hardlink_to('../outside/input')",
+        )
+        for script, expected in [(s, "force_ask") for s in bad] + [(s, "allow") for s in safe]:
+            script = "from pathlib import Path\n" + script
+            for tool, args in (("run_workflow", {"Script": script}),
+                               ("run_command", {"CommandLine": "@'\n" + script + "\n'@ | python -B -"})):
+                with self.subTest(script=script, tool=tool):
+                    self.assertEqual(status_guard.handle_pre_tool_use({**base, "toolCall": {"name": tool, "args": args}})["decision"], expected)
+
+    def test_21_ast_module_aliases_keywords_and_unpacked_write_arguments(self):
+        project = self.tmp_root / "module-project"
+        project.mkdir()
+        keys = [status_guard._normalize_cross_env_lexical(str(project))]
+
+        def scan(script):
+            return status_guard._scan_inline_python_code(script, str(project), keys, keys, False)
+
+        cases = [("os", name, "path='../outside/x'") for name in
+                 ("chdir", "remove", "unlink", "rmdir", "removedirs", "mkdir", "makedirs", "truncate")]
+        cases += [("os", name, args) for name in ("rename", "replace", "renames")
+                  for args in ("src='inside', dst='../outside/x'", "src='../outside/x', dst='inside'")]
+        cases += [("os", name, "src='inside', dst='../outside/link'") for name in ("symlink", "link")]
+        cases += [("shutil", "rmtree", "path='../outside/x'"),
+                  ("shutil", "move", "src='../outside/x', dst='inside'"),
+                  ("shutil", "move", "src='inside', dst='../outside/x'"),
+                  ("shutil", "make_archive", "base_name='../outside/x', format='zip'"),
+                  ("shutil", "unpack_archive", "filename='input.zip', extract_dir='../outside/x'")]
+        cases += [("shutil", name, "src='inside', dst='../outside/x'") for name in ("copy", "copy2", "copyfile", "copytree")]
+        for module, name, args in cases:
+            for header, fn in ((f"import {module} as m", "m." + name),
+                               (f"from {module} import {name} as f", "f")):
+                for call_args in (args, "*unknown_args", "**unknown_options"):
+                    script = header + "\n" + fn + "(" + call_args + ")"
+                    with self.subTest(script=script):
+                        self.assertIsNotNone(scan(script))
+                inside = header + "\n" + fn + "(" + args.replace("../outside/", "inside/") + ")"
+                self.assertIsNone(scan(inside), inside)
+        for header, fn in (("import os", "os.open"), ("import os as m", "m.open"),
+                           ("from os import open as f", "f"), ("from os import open", "open")):
+            for args in ("'../outside/x', os.O_WRONLY | os.O_CREAT", "path='../outside/x', flags=1",
+                         "*unknown_args", "path='inside', **unknown_options"):
+                self.assertIsNotNone(scan(header + "\n" + fn + "(" + args + ")"), (header, args))
+            for args in ("'../outside/x', 0", "path='../outside/x', flags=0"):
+                self.assertIsNone(scan(header + "\n" + fn + "(" + args + ")"), (header, args))
+        for script in ("open(file='../outside/x', mode='w')", "open(*unknown_args)",
+                       "open('../outside/x', *unknown_modes)", "open(file='inside', **unknown_options)"):
+            self.assertIsNotNone(scan(script), script)
+        for script in ("open(file='../outside/x', mode='rb')", "flags=0\nimport os\nos.open('../outside/x', flags)",
+                       "import shutil\nshutil.copyfile(src='../outside/input', dst='inside')",
+                       "import os\nos.link(src='../outside/input', dst='inside')",
+                       "import shutil\nshutil.unpack_archive('input.zip')"):
+            self.assertIsNone(scan(script), script)
+        for value in (status_guard._AstModule("os"), status_guard._AstCallable("os.open")):
+            self.assertNotIsInstance(value, str)
+            expr = status_guard.ast.parse("m / 'inside'", mode="eval").body
+            self.assertIn(status_guard._AST_DYNAMIC, status_guard._eval_ast_path_candidates(expr, {"m": frozenset((value,))}))
+
+    def test_22_ast_tempfile_custom_dirs_defaults_and_aliases(self):
+        project = self.tmp_root / "temp-project"
+        project.mkdir()
+        keys = [status_guard._normalize_cross_env_lexical(str(project))]
+
+        def scan(script):
+            return status_guard._scan_inline_python_code(script, str(project), keys, keys, False)
+
+        for name, index in (("mkdtemp", 2), ("TemporaryDirectory", 2), ("mkstemp", 2), ("NamedTemporaryFile", 6)):
+            for header, fn in (("import tempfile as t", "t." + name),
+                               (f"from tempfile import {name} as make", "make")):
+                prefix = "'w+', -1, None, None, '', 'tmp', " if index == 6 else "'', 'tmp', "
+                for args in ("dir='../outside'", prefix + "'../outside'", "*unknown_args", "**unknown_options"):
+                    script = header + "\n" + fn + "(" + args + ")"
+                    with self.subTest(script=script):
+                        self.assertIsNotNone(scan(script))
+                for args in ("", "dir=None", "dir='inside'", prefix + "'inside'"):
+                    script = header + "\n" + fn + "(" + args + ")"
+                    self.assertIsNone(scan(script), script)
+                expr = status_guard.ast.parse(fn + "(dir='../outside')", mode="eval").body
+                bindings = {"t": frozenset((status_guard._AstModule("tempfile"),)),
+                            "make": frozenset((status_guard._AstCallable("tempfile." + name),))}
+                self.assertEqual(status_guard._eval_ast_path_candidates(expr, bindings), frozenset(("../outside",)))
+                for args in ("dir=None", "*unknown_args", "**unknown_options"):
+                    expr = status_guard.ast.parse(fn + "(" + args + ")", mode="eval").body
+                    values = status_guard._eval_ast_path_candidates(expr, bindings)
+                    if args == "dir=None":
+                        self.assertTrue(all(isinstance(v, status_guard._AstTempPath) for v in values))
+                    else:
+                        self.assertIn(status_guard._AST_DYNAMIC, values)
+        for header, fn in (("import tempfile as t", "t.gettempdir"),
+                           ("from tempfile import gettempdir as where", "where")):
+            self.assertIsNone(scan(header + "\nfrom pathlib import Path\nPath(" + fn + "()).joinpath('x').write_text('x')"))
+        self.assertIsNone(scan("import tempfile\np = tempfile.mkdtemp()\nopen(p + '/x', 'w')"))
+        self.assertIsNotNone(scan("import tempfile\np = tempfile.mkdtemp(dir='../outside')\nopen(p + '/x', 'w')"))
+
+    def test_23_ast_lambda_decorators_handlers_and_comprehension_scopes(self):
+        project = self.tmp_root / "scope-project"
+        project.mkdir()
+        base = {"conversationId": "batch1-scope", "cwd": str(project), "workspacePaths": [str(project)]}
+        bad = ["(lambda p: open(p, 'w'))('../outside/x')", "f = lambda p: open(p, 'w')\nf('../outside/x')",
+               "p = 'inside'\ntry:\n    pass\nexcept Exception as p:\n    open(p, 'w')"]
+        bad += ["@decorate(open('../outside/x', 'w'))\n" + definition for definition in
+                ("def f():\n    pass", "async def f():\n    pass", "class C:\n    pass")]
+        bad += ["p = 'inside'\n" + comp for comp in (
+            "[open(p, 'w') for p in paths]", "{open(p, 'w') for p in paths}",
+            "{p: open(p, 'w') for p in paths}", "(open(p, 'w') for p in paths)",
+            "[p for p in paths if open(p, 'w')]", "[q for p in paths for q in open(p, 'w')]",
+        )]
+        safe = ("(lambda p: open(p, 'w'))('inside')", "f = lambda p='inside': open(p, 'w')\nf()",
+                "p = 'inside'\n[p for p in paths]\nopen(p, 'w')",
+                "p = 'inside'\n{p: p for p in paths}\nopen(p, 'w')",
+                "p = 'inside'\n[p for p in open(p, 'r')]\nopen(p, 'w')")
+        for script, expected in [(s, "force_ask") for s in bad] + [(s, "allow") for s in safe]:
+            for tool, args in (("run_workflow", {"Script": script}),
+                               ("run_command", {"CommandLine": "@'\n" + script + "\n'@ | python -B -"})):
+                with self.subTest(script=script, tool=tool):
+                    self.assertEqual(status_guard.handle_pre_tool_use({**base, "toolCall": {"name": tool, "args": args}})["decision"], expected)
+
+    def test_24_ast_scientific_exports_keyword_and_unpacking_targets(self):
+        project = self.tmp_root / "export-project"
+        project.mkdir()
+        keys = [status_guard._normalize_cross_env_lexical(str(project))]
+
+        def scan(script):
+            return status_guard._scan_inline_python_code(script, str(project), keys, keys, False)
+
+        calls = [("fig.savefig", "fname"), ("df.to_excel", "excel_writer")]
+        calls += [("df." + name, keyword) for name in ("to_csv", "to_parquet", "to_feather", "to_pickle")
+                  for keyword in ("path_or_buf", "path")]
+        calls += [("np." + name, keyword) for name in ("save", "savez", "savez_compressed", "savetxt")
+                  for keyword in ("file", "fname")]
+        for fn, keyword in calls:
+            for args in ("'../outside/x'", keyword + "='../outside/x'", "*unknown_args", "**unknown_options"):
+                script = "import numpy as np\n" + fn + "(" + args + ")"
+                self.assertIsNotNone(scan(script), script)
+            self.assertIsNone(scan("import numpy as np\n" + fn + "(" + keyword + "='inside')"), fn)
+        self.assertIsNotNone(scan("import numpy as arrays\narrays.save(file='../outside/x', arr=data)"))
+        self.assertIsNone(scan("df.to_csv()\ndf.to_parquet(path=None)"))
+
+    def test_25_ast_subprocess_keywords_depth_and_all_cwd_candidates(self):
+        project = self.tmp_root / "process-project"
+        project.mkdir()
+        (project / "sub").mkdir()
+        keys = [status_guard._normalize_cross_env_lexical(str(project))]
+
+        def scan(script, depth=0):
+            return status_guard._scan_inline_python_code(script, str(project), keys, keys, False, depth)
+
+        for name in ("run", "Popen", "call", "check_call", "check_output"):
+            for header, fn in (("import subprocess as sp", "sp." + name),
+                               (f"from subprocess import {name} as launch", "launch")):
+                for args in ("args='touch ../outside/x'", "command='touch ../outside/x'", "args=['touch', '../outside/x']",
+                             "args='git status', cwd='../outside'", "*unknown_args", "**unknown_options"):
+                    script = header + "\n" + fn + "(" + args + ")"
+                    self.assertIsNotNone(scan(script), script)
+                self.assertIsNone(scan(header + "\n" + fn + "(args='git status', cwd='sub')"))
+        for script in ("import os as system\nsystem.system(command='touch ../outside/x')",
+                       "from os import system as launch\nlaunch(command='touch ../outside/x')",
+                       "import subprocess\nsubprocess.run(args='touch ../outside/x')"):
+            self.assertIsNotNone(scan(script, depth=2), script)
+        safe = "import subprocess\nsubprocess.run(args='git status', cwd='.' if condition else 'sub')"
+        with unittest.mock.patch.object(status_guard, "_detect_command_external_mutation",
+                                        wraps=status_guard._detect_command_external_mutation) as detect:
+            self.assertIsNone(scan(safe))
+            self.assertEqual({Path(call.args[1]).resolve() for call in detect.call_args_list}, {project, project / "sub"})
+        self.assertIsNotNone(scan(safe.replace("git status", "touch ../outside/x")))
+        self.assertIsNotNone(scan("import subprocess\nsubprocess.run(args='git status', cwd=unknown_cwd)"))
+        self.assertIsNone(scan("import subprocess\nsubprocess.run(args='git status', cwd=None)"))
+
+    def test_26_workflow_unpacking_all_cwds_bom_and_single_parse(self):
+        project = self.tmp_root / "workflow-batch1"
+        project.mkdir()
+        (project / "sub").mkdir()
+        keys = [status_guard._normalize_cross_env_lexical(str(project))]
+
+        def scan(script):
+            return status_guard._scan_workflow_python_code(script, str(project), keys, keys, False)
+
+        for script in ("call_tool(*unknown_args)", "call_tool('write_file', {'Path': 'inside'}, **unknown_options)",
+                       "call_tool(name='write_file', args={'Path': 'inside'}, *unknown_args)",
+                       "call_tool(**{'name': 'write_file', 'args': {'Path': '../outside/x'}})",
+                       "call_tool(*('write_file', {'Path': '../outside/x'}))",
+                       "agent(**unknown_options)", "agent(**{'cwd': '../outside'})", "agent(**{'Cwd': '../outside'})",
+                       "agent(**{'cwd': 'inside', **unknown_options})"):
+            self.assertIsNotNone(scan(script), script)
+        for script in ("call_tool(**{'name': 'write_file', 'args': {'Path': 'inside'}})",
+                       "call_tool(*('write_file', {'Path': 'inside'}))", "agent(**{'cwd': 'inside'})",
+                       "agent(**{'description': 'review'})"):
+            self.assertIsNone(scan(script), script)
+        script = "import os\nif condition:\n    os.chdir('sub')\ncall_tool('run_command', {'CommandLine': 'git status'})"
+        with unittest.mock.patch.object(status_guard, "_detect_command_external_mutation",
+                                        wraps=status_guard._detect_command_external_mutation) as detect:
+            self.assertIsNone(scan(script))
+            self.assertEqual({Path(call.args[1]).resolve() for call in detect.call_args_list}, {project, project / "sub"})
+        self.assertIsNotNone(scan(script.replace("git status", "touch ../outside/x")))
+        with unittest.mock.patch.object(status_guard.ast, "parse", wraps=status_guard.ast.parse) as parse:
+            self.assertIsNone(scan("print(1)"))
+            self.assertEqual(parse.call_count, 1)
+        script_path = project / "bom.py"
+        base = {"conversationId": "batch1-bom", "cwd": str(project), "workspacePaths": [str(project)]}
+        for source, expected in (("print(1)", "allow"), ("open('../outside/x', 'w')", "force_ask")):
+            script_path.write_text(source, encoding="utf-8-sig")
+            result = status_guard.handle_pre_tool_use({**base, "toolCall": {"name": "run_workflow", "args": {"ScriptPath": str(script_path)}}})
+            self.assertEqual(result["decision"], expected)
+
+    def test_27_cd_host_paths_and_known_home_variables(self):
+        project = self.tmp_root / "cd-project"
+        project.mkdir()
+        (project / "sub").mkdir()
+        base = {"conversationId": "batch1-cd", "cwd": str(project), "workspacePaths": [str(project)]}
+
+        def command(text):
+            return status_guard.handle_pre_tool_use({**base, "toolCall": {"name": "run_command", "args": {"CommandLine": text}}})["decision"]
+
+        self.assertEqual(command("cd sub && touch ok.txt"), "allow")
+        self.assertEqual(command("cd sub && touch ../../outside/bad.txt"), "force_ask")
+        for cd in ("chdir", "set-location"):
+            self.assertEqual(command(cd + " sub; touch ok.txt"), "allow")
+            self.assertEqual(command(cd + " sub; touch ../../outside/bad.txt"), "force_ask")
+        fake_home = self.tmp_root / "home"
+        with unittest.mock.patch.object(Path, "home", return_value=fake_home), \
+                unittest.mock.patch.dict(os.environ, {"USERPROFILE": str(fake_home)}):
+            for home in ("$HOME", "~", "%USERPROFILE%", "$env:USERPROFILE"):
+                self.assertEqual(command("cd " + home + " && touch bad.txt"), "force_ask", home)
+        if os.name == "nt":
+            mounted = status_guard._normalize_cross_env_lexical(str(project / "sub"))
+            self.assertEqual(status_guard._resolve_nearest_existing("ok.txt", mounted), project / "sub" / "ok.txt")
+            self.assertEqual(status_guard._resolve_nearest_existing(mounted + "/ok.txt", str(project)), project / "sub" / "ok.txt")
+            self.assertEqual(status_guard._host_path_string(mounted)[:2].upper(), project.drive.upper())
+        else:
+            self.assertEqual(status_guard._host_path_string("X:/Projects/work"), "/mnt/x/Projects/work")
+
+    def test_28_installer_modes_value_flags_and_script_path_words(self):
+        project = self.tmp_root / "installer-project"
+        project.mkdir()
+        base = {"conversationId": "batch1-installer", "cwd": str(project), "workspacePaths": [str(project)]}
+        bad = (
+            "python install.py --app both --target-dir inside --no-zotero",
+            "python install.py --app antigravity --codex-home inside --no-zotero",
+            "python /git/install.py", "python install.py --zotero-cmd --dry-run",
+            "python install.py --zotero-cmd=--dry-run", "python install.py --app --probe-apps",
+            "python install.py --app codex --codex-home inside", "python install.py --app unknown --target-dir inside --no-zotero",
+            "python install.py --app both --codex-home inside --no-zotero",
+            "python install.py --app codex --target-dir inside --no-zotero", "python install.py --zotero-cmd cat",
+            "python install.py --zotero-cmd py_compile", "python install.py --codex-home= --no-zotero",
+            "python install.py --codex-home inside --codex-skills-dir= --no-zotero",
+        )
+        bad += tuple("python install.py " + flag + " --dry-run" for flag in (
+            "--target-dir", "--codex-home", "--codex-skills-dir", "--codex-handoff-mode", "--codex-handoff-compactions"))
+        safe = (
+            "python install.py --dry-run", "python install.py --probe-apps", "python -m py_compile install.py",
+            "python install.py --target-dir inside --no-zotero", "python install.py --codex-skills-dir inside --no-zotero",
+            "python install.py --app auto --codex-home inside --no-zotero",
+            "python install.py --app antigravity --target-dir inside --no-zotero",
+            "python install.py --app codex --codex-skills-dir inside --no-zotero",
+            "python install.py --app both --target-dir inside --codex-home inside --no-zotero",
+            "python install.py --app both --target-dir inside --codex-skills-dir inside --no-zotero",
+        )
+        for text, expected in [(s, "force_ask") for s in bad] + [(s, "allow") for s in safe]:
+            with self.subTest(command=text):
+                result = status_guard.handle_pre_tool_use({**base, "toolCall": {"name": "run_command", "args": {"CommandLine": text}}})
+                self.assertEqual(result["decision"], expected)
+
+    def test_29_polling_readonly_clauses_search_options_and_shell_wrappers(self):
+        for text in ("./solver && tail -n 20 run.log", "tail -n 20 run.log && ./solver", "cat run.log | ./solver",
+                     'rg "solver.log" src/', 'grep "solver.log" src/', 'sls -Encoding utf8 "solver.log" src/',
+                     'bash -lc "./solver && tail -n 20 run.log"', "cat results", "cat result"):
+            with self.subTest(command=text):
+                self.assertEqual(status_guard.parse_run_command_evidence(text), (None, False, text))
+        cases = [("grep \"INFO|ERROR\" output.txt", "output.txt"), ("bash -lc 'grep \"INFO|ERROR\" output.txt'", "output.txt"),
+                 ('powershell -ExecutionPolicy Bypass -WindowStyle Hidden -Command "tail -n 20 run.log"', "run.log"),
+                 ('pwsh -ep Bypass -w Hidden -Command "tail -n 20 run.log"', "run.log"),
+                 ('tail -n 20 run.log | grep "INFO|ERROR"', "run.log")]
+        cases += [("rg " + flag + ' "solver.log" ERROR output.txt', "output.txt") for flag in
+                  ("-g", "--glob", "-t", "--type", "-A", "-B", "-C", "-m")]
+        cases += [("rg " + flag + ' "solver.log" output.txt', "output.txt") for flag in ("-e", "--regexp", "-f", "--file")]
+        cases += [('Select-String -Pattern "solver.log" -Path output.txt', "output.txt"),
+                  ('sls -Pattern:"solver.log" output.txt', "output.txt"),
+                  ('rg --regexp="solver.log" output.txt', "output.txt")]
+        for text, target in cases:
+            with self.subTest(command=text):
+                self.assertEqual(status_guard.parse_run_command_evidence(text), (target, False, text))
+        self.assertTrue(status_guard.is_evidence_file("results.json"))
+        self.assertFalse(status_guard.is_evidence_file("results"))
+        self.assertFalse(status_guard.is_evidence_file("result"))
+
+    def test_30_relative_command_cwd_polling_uses_payload_or_workspace(self):
+        project = self.tmp_root / "poll-project"
+        project.mkdir()
+        (project / "sub").mkdir()
+        root_log = project / "run.log"
+        sub_log = project / "sub" / "run.log"
+        root_log.write_text("root\n", encoding="utf-8")
+        sub_log.write_text("sub\n", encoding="utf-8")
+        for with_payload_cwd in (True, False):
+            base = {"conversationId": "batch1-poll-" + str(with_payload_cwd), "workspacePaths": [str(project)]}
+            if with_payload_cwd:
+                base["cwd"] = str(project)
+            args = {"Cwd": "sub", "CommandLine": "tail -n 20 run.log"}
+            payload = {**base, "toolCall": {"name": "run_command", "args": args}}
+            self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "allow")
+            self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "deny")
+            root_log.write_text("changed root\n" + str(with_payload_cwd), encoding="utf-8")
+            self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "deny")
+            sub_log.write_text("changed sub\n" + str(with_payload_cwd), encoding="utf-8")
+            self.assertEqual(status_guard.handle_pre_tool_use(payload)["decision"], "allow")
+            for text in ('./solver && tail -n 20 run.log', 'rg "solver.log" src/'):
+                other = {**base, "toolCall": {"name": "run_command", "args": {"Cwd": "sub", "CommandLine": text}}}
+                self.assertEqual(status_guard.handle_pre_tool_use(other)["decision"], "allow")
+                self.assertEqual(status_guard.handle_pre_tool_use(other)["decision"], "allow")
+            for tool, args in (("run_command", {"Cwd": "sub", "CommandLine": "git status"}),
+                               ("run_workflow", {"Cwd": "sub", "Script": "print(1)"})):
+                with unittest.mock.patch.object(status_guard, "_check_polling_locked", return_value={"decision": "allow"}) as polling:
+                    result = status_guard.handle_pre_tool_use({**base, "toolCall": {"name": tool, "args": args}})
+                    self.assertEqual(result["decision"], "allow")
+                    self.assertEqual(Path(polling.call_args.args[3]), project / "sub")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

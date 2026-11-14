@@ -42,7 +42,7 @@ TOOL_TIMING_HEADER_RE = re.compile(
 
 MARKDOWN_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
 GOAL_START_RE = re.compile(r"^/goal(?:\s|$)", re.IGNORECASE)
-GOAL_CANCEL_RE = re.compile(r"^(?:请)?(?:取消|停止|结束|关闭)\s*/?goal\b", re.IGNORECASE)
+GOAL_CANCEL_RE = re.compile(r"^(?:请)?(?:取消|停止|结束|关闭)\s*/?goal(?![A-Za-z0-9_-])", re.IGNORECASE)
 
 # Codex Rollout 会话记录解析与归档 (供 --client codex 在 compact/resume 时调用)
 
@@ -180,6 +180,7 @@ def session_state_lock(state_dir: Path, session_id: str, timeout_sec: float = 1.
     fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     deadline = time.monotonic() + timeout_sec
     token = uuid.uuid4().hex.encode("ascii")
+    locked = False
     try:
         opened = os.fstat(fd)
         anchor = path.lstat()
@@ -197,6 +198,7 @@ def session_state_lock(state_dir: Path, session_id: str, timeout_sec: float = 1.
                     import fcntl
 
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
                 break
             except OSError as exc:
                 if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
@@ -216,6 +218,10 @@ def session_state_lock(state_dir: Path, session_id: str, timeout_sec: float = 1.
                 if os.read(fd, len(token)) == token:
                     os.ftruncate(fd, 1)
     finally:
+        if os.name == "nt" and locked:
+            with contextlib.suppress(OSError):
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         os.close(fd)
 
 
@@ -306,9 +312,6 @@ def clean_user_content(raw_content: str, step_type: str = "USER_INPUT") -> str:
         return text
 
     if step_type == "SYSTEM_MESSAGE":
-        for noise in SYSTEM_NOISE_PATTERNS:
-            if noise in text:
-                return ""
         # 仅提取非 system 发送的跨代理任务消息（如父代理派发给子代理的指令）
         msg_match = re.search(r"\[Message\][^\n]*?\bsender=([^\s]+)[^\n]*?\bcontent=", text)
         if msg_match:
@@ -319,6 +322,9 @@ def clean_user_content(raw_content: str, step_type: str = "USER_INPUT") -> str:
             close_idx = text.rfind("</SYSTEM_MESSAGE>", content_start)
             body = text[content_start:close_idx] if close_idx != -1 else text[content_start:]
             return body.strip()
+        for noise in SYSTEM_NOISE_PATTERNS:
+            if noise in text:
+                return ""
         return ""
 
     return ""
@@ -530,6 +536,7 @@ def extract_agy_archive(
                 is_content_truncated = isinstance(truncated_fields, list) and "content" in truncated_fields
 
                 if step_type == "PLANNER_RESPONSE":
+                    unidentified_questions.clear()
                     calls = step.get("tool_calls")
                     if isinstance(calls, list):
                         for call in calls:
@@ -548,10 +555,14 @@ def extract_agy_archive(
                     call_id = _tool_call_id(tool_result) or _tool_call_id(step)
                     named_ask = (tool_result.get("tool_name") or tool_result.get("name")) == "ask_question"
                     question = pending_questions.pop(call_id, None)
+                    waiting = {pos for pos in unidentified_questions if pos < step_index} | {
+                        pos for pos, _ in pending_questions.values()
+                    }
+                    if not call_id:
+                        unidentified_questions.clear()
                     if step.get("error") or tool_result.get("error"):
                         continue
                     if question is None:
-                        waiting = unidentified_questions | {pos for pos, _ in pending_questions.values()}
                         if (not call_id and waiting) or named_ask:
                             ambiguous_outputs[step_index] = waiting if not named_ask else waiting | {step_index}
                         continue
